@@ -20,7 +20,7 @@ type DatabaseInstance struct {
 	Name     string
 	Tables   map[string]*Table
 	BasePath string
-	mu       sync.RWMutex
+	mu       sync.RWMutex // nolint:unused // Reserved for future thread-safe operations
 }
 
 // NewDatabaseInstance creates a new database instance

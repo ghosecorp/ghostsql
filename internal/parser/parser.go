@@ -40,6 +40,16 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseUse()
 	case TOKEN_SHOW:
 		return p.parseShow()
+	case TOKEN_UPDATE:
+		return p.parseUpdate()
+	case TOKEN_DELETE:
+		return p.parseDelete()
+	case TOKEN_DROP:
+		return p.parseDrop()
+	case TOKEN_TRUNCATE:
+		return p.parseTruncate()
+	case TOKEN_ALTER:
+		return p.parseAlter()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
@@ -56,6 +66,199 @@ func (p *Parser) parseCreate() (Statement, error) {
 	default:
 		return nil, fmt.Errorf("expected DATABASE or TABLE after CREATE")
 	}
+}
+
+func (p *Parser) parseUpdate() (*UpdateStmt, error) {
+	stmt := &UpdateStmt{
+		Updates: make(map[string]interface{}),
+	}
+
+	p.nextToken() // consume UPDATE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_SET {
+		return nil, fmt.Errorf("expected SET")
+	}
+	p.nextToken()
+
+	// Parse SET column = value, column = value
+	for {
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected column name")
+		}
+		colName := p.current.Literal
+		p.nextToken()
+
+		if p.current.Type != TOKEN_EQUALS {
+			return nil, fmt.Errorf("expected =")
+		}
+		p.nextToken()
+
+		var value interface{}
+		switch p.current.Type {
+		case TOKEN_NUMBER:
+			// Check if it's a float or int
+			if strings.Contains(p.current.Literal, ".") {
+				num, _ := strconv.ParseFloat(p.current.Literal, 64)
+				value = num
+			} else {
+				num, _ := strconv.Atoi(p.current.Literal)
+				value = num
+			}
+		case TOKEN_STRING:
+			value = p.current.Literal
+		default:
+			return nil, fmt.Errorf("expected value")
+		}
+		stmt.Updates[colName] = value
+		p.nextToken()
+
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+			continue
+		}
+		break
+	}
+
+	// Parse WHERE clause
+	if p.current.Type == TOKEN_WHERE {
+		p.nextToken()
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = where
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDelete() (*DeleteStmt, error) {
+	stmt := &DeleteStmt{}
+
+	p.nextToken() // consume DELETE
+
+	if p.current.Type != TOKEN_FROM {
+		return nil, fmt.Errorf("expected FROM")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	// Parse WHERE clause
+	if p.current.Type == TOKEN_WHERE {
+		p.nextToken()
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = where
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDrop() (Statement, error) {
+	p.nextToken() // consume DROP
+
+	switch p.current.Type {
+	case TOKEN_TABLE:
+		return p.parseDropTable()
+	case TOKEN_DATABASE:
+		return p.parseDropDatabase()
+	default:
+		return nil, fmt.Errorf("expected TABLE or DATABASE after DROP")
+	}
+}
+
+func (p *Parser) parseDropTable() (*DropTableStmt, error) {
+	stmt := &DropTableStmt{}
+
+	p.nextToken() // consume TABLE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDropDatabase() (*DropDatabaseStmt, error) {
+	stmt := &DropDatabaseStmt{}
+
+	p.nextToken() // consume DATABASE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected database name")
+	}
+	stmt.DatabaseName = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
+}
+
+func (p *Parser) parseTruncate() (*TruncateStmt, error) {
+	stmt := &TruncateStmt{}
+
+	p.nextToken() // consume TRUNCATE
+
+	if p.current.Type == TOKEN_TABLE {
+		p.nextToken() // consume TABLE (optional)
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
+}
+
+func (p *Parser) parseAlter() (*AlterTableStmt, error) {
+	stmt := &AlterTableStmt{}
+
+	p.nextToken() // consume ALTER
+
+	if p.current.Type != TOKEN_TABLE {
+		return nil, fmt.Errorf("expected TABLE after ALTER")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_ADD {
+		return nil, fmt.Errorf("expected ADD (only ADD COLUMN supported for now)")
+	}
+	p.nextToken()
+
+	if p.current.Type == TOKEN_COLUMN {
+		p.nextToken() // consume COLUMN (optional)
+	}
+
+	stmt.Action = "ADD_COLUMN"
+	col, err := p.parseColumnDef()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Column = &col
+
+	return stmt, nil
 }
 
 func (p *Parser) parseCreateDatabase() (*CreateDatabaseStmt, error) {
@@ -309,12 +512,18 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		var val interface{}
 		switch p.current.Type {
 		case TOKEN_NUMBER:
-			num, _ := strconv.Atoi(p.current.Literal)
-			val = num
+			// Check if it's a float or int
+			if strings.Contains(p.current.Literal, ".") {
+				num, _ := strconv.ParseFloat(p.current.Literal, 64)
+				val = num
+			} else {
+				num, _ := strconv.Atoi(p.current.Literal)
+				val = num
+			}
 		case TOKEN_STRING:
 			val = p.current.Literal
 		default:
-			return nil, fmt.Errorf("unexpected value type")
+			return nil, fmt.Errorf("unexpected value type: %s (literal: %s)", p.current.Type, p.current.Literal)
 		}
 		values = append(values, val)
 		p.nextToken()
@@ -373,6 +582,65 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Where = where
 	}
 
+	// Parse ORDER BY
+	if p.current.Type == TOKEN_ORDER {
+		p.nextToken()
+		if p.current.Type != TOKEN_BY {
+			return nil, fmt.Errorf("expected BY after ORDER")
+		}
+		p.nextToken()
+
+		for {
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected column name in ORDER BY")
+			}
+
+			orderBy := OrderByClause{
+				Column:     p.current.Literal,
+				Descending: false,
+			}
+			p.nextToken()
+
+			// Check for DESC
+			if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
+				orderBy.Descending = true
+				p.nextToken()
+			} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ASC" {
+				p.nextToken()
+			}
+
+			stmt.OrderBy = append(stmt.OrderBy, orderBy)
+
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+				continue
+			}
+			break
+		}
+	}
+
+	// Parse LIMIT
+	if p.current.Type == TOKEN_LIMIT {
+		p.nextToken()
+		if p.current.Type != TOKEN_NUMBER {
+			return nil, fmt.Errorf("expected number after LIMIT")
+		}
+		limit, _ := strconv.Atoi(p.current.Literal)
+		stmt.Limit = limit
+		p.nextToken()
+	}
+
+	// Parse OFFSET
+	if p.current.Type == TOKEN_OFFSET {
+		p.nextToken()
+		if p.current.Type != TOKEN_NUMBER {
+			return nil, fmt.Errorf("expected number after OFFSET")
+		}
+		offset, _ := strconv.Atoi(p.current.Literal)
+		stmt.Offset = offset
+		p.nextToken()
+	}
+
 	return stmt, nil
 }
 
@@ -400,6 +668,8 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 		where.Operator = ">="
 	case TOKEN_NE:
 		where.Operator = "!="
+	case TOKEN_LIKE:
+		where.Operator = "LIKE"
 	default:
 		return nil, fmt.Errorf("expected comparison operator, got %s", p.current.Type)
 	}
@@ -408,14 +678,38 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 	// Parse value
 	switch p.current.Type {
 	case TOKEN_NUMBER:
-		num, _ := strconv.Atoi(p.current.Literal)
-		where.Value = num
+		// Check if it's a float or int
+		if strings.Contains(p.current.Literal, ".") {
+			num, _ := strconv.ParseFloat(p.current.Literal, 64)
+			where.Value = num
+		} else {
+			num, _ := strconv.Atoi(p.current.Literal)
+			where.Value = num
+		}
 	case TOKEN_STRING:
 		where.Value = p.current.Literal
 	default:
 		return nil, fmt.Errorf("expected value in WHERE")
 	}
 	p.nextToken()
+
+	// Parse AND/OR (simplified - single level only for now)
+	switch p.current.Type {
+	case TOKEN_AND:
+		p.nextToken()
+		and, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		where.And = and
+	case TOKEN_OR:
+		p.nextToken()
+		or, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		where.Or = or
+	}
 
 	return where, nil
 }

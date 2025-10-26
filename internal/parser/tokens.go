@@ -24,6 +24,21 @@ const (
 	TOKEN_FROM
 	TOKEN_WHERE
 	TOKEN_METADATA
+	TOKEN_UPDATE
+	TOKEN_SET
+	TOKEN_DELETE
+	TOKEN_DROP
+	TOKEN_ALTER
+	TOKEN_ADD
+	TOKEN_COLUMN
+	TOKEN_TRUNCATE
+	TOKEN_ORDER
+	TOKEN_BY
+	TOKEN_LIMIT
+	TOKEN_OFFSET
+	TOKEN_AND
+	TOKEN_OR
+	TOKEN_LIKE
 
 	// Literals
 	TOKEN_IDENT
@@ -44,6 +59,7 @@ const (
 	TOKEN_LE
 	TOKEN_GE
 	TOKEN_NE
+	TOKEN_PERCENT
 )
 
 type Token struct {
@@ -72,6 +88,21 @@ func (t TokenType) String() string {
 		TOKEN_FROM:      "FROM",
 		TOKEN_WHERE:     "WHERE",
 		TOKEN_METADATA:  "METADATA",
+		TOKEN_UPDATE:    "UPDATE",
+		TOKEN_SET:       "SET",
+		TOKEN_DELETE:    "DELETE",
+		TOKEN_DROP:      "DROP",
+		TOKEN_ALTER:     "ALTER",
+		TOKEN_ADD:       "ADD",
+		TOKEN_COLUMN:    "COLUMN",
+		TOKEN_TRUNCATE:  "TRUNCATE",
+		TOKEN_ORDER:     "ORDER",
+		TOKEN_BY:        "BY",
+		TOKEN_LIMIT:     "LIMIT",
+		TOKEN_OFFSET:    "OFFSET",
+		TOKEN_AND:       "AND",
+		TOKEN_OR:        "OR",
+		TOKEN_LIKE:      "LIKE",
 		TOKEN_IDENT:     "IDENT",
 		TOKEN_NUMBER:    "NUMBER",
 		TOKEN_STRING:    "STRING",
@@ -88,6 +119,7 @@ func (t TokenType) String() string {
 		TOKEN_LE:        "LE",
 		TOKEN_GE:        "GE",
 		TOKEN_NE:        "NE",
+		TOKEN_PERCENT:   "PERCENT",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -111,6 +143,21 @@ var keywords = map[string]TokenType{
 	"FROM":      TOKEN_FROM,
 	"WHERE":     TOKEN_WHERE,
 	"METADATA":  TOKEN_METADATA,
+	"UPDATE":    TOKEN_UPDATE,
+	"SET":       TOKEN_SET,
+	"DELETE":    TOKEN_DELETE,
+	"DROP":      TOKEN_DROP,
+	"ALTER":     TOKEN_ALTER,
+	"ADD":       TOKEN_ADD,
+	"COLUMN":    TOKEN_COLUMN,
+	"TRUNCATE":  TOKEN_TRUNCATE,
+	"ORDER":     TOKEN_ORDER,
+	"BY":        TOKEN_BY,
+	"LIMIT":     TOKEN_LIMIT,
+	"OFFSET":    TOKEN_OFFSET,
+	"AND":       TOKEN_AND,
+	"OR":        TOKEN_OR,
+	"LIKE":      TOKEN_LIKE,
 }
 
 func LookupKeyword(ident string) TokenType {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/ghosecorp/ghostsql/internal/metadata"
@@ -146,6 +147,8 @@ func evaluateWhere(row Row, where *WhereClause) bool {
 		return compare(val, where.Value) > 0
 	case ">=":
 		return compare(val, where.Value) >= 0
+	case "LIKE":
+		return matchLike(val, where.Value)
 	default:
 		return false
 	}
@@ -221,4 +224,147 @@ func (t *Table) LoadFromPages() error {
 	}
 
 	return nil
+}
+
+// Update updates rows matching the WHERE clause
+func (t *Table) Update(updates map[string]interface{}, where *WhereClause) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	updatedCount := 0
+
+	for i := range t.Rows {
+		if where != nil && !evaluateWhere(t.Rows[i], where) {
+			continue
+		}
+
+		// Update the row
+		for colName, newValue := range updates {
+			t.Rows[i][colName] = newValue
+		}
+		updatedCount++
+	}
+
+	return updatedCount, nil
+}
+
+// Delete deletes rows matching the WHERE clause
+func (t *Table) Delete(where *WhereClause) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if where == nil {
+		// Delete all rows
+		count := len(t.Rows)
+		t.Rows = make([]Row, 0)
+		return count, nil
+	}
+
+	// Filter out rows that match the WHERE clause
+	newRows := make([]Row, 0)
+	deletedCount := 0
+
+	for _, row := range t.Rows {
+		if evaluateWhere(row, where) {
+			deletedCount++
+		} else {
+			newRows = append(newRows, row)
+		}
+	}
+
+	t.Rows = newRows
+	return deletedCount, nil
+}
+
+// Truncate removes all rows from the table
+func (t *Table) Truncate() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.Rows = make([]Row, 0)
+	t.Pages = make([]*SlottedPage, 0)
+	return nil
+}
+
+// AddColumn adds a new column to the table
+func (t *Table) AddColumn(col Column) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Check if column already exists
+	for _, existingCol := range t.Columns {
+		if existingCol.Name == col.Name {
+			return fmt.Errorf("column %s already exists", col.Name)
+		}
+	}
+
+	// Add column to schema
+	t.Columns = append(t.Columns, col)
+
+	// Add NULL values to existing rows
+	for i := range t.Rows {
+		t.Rows[i][col.Name] = nil
+	}
+
+	return nil
+}
+
+// matchLike performs SQL LIKE pattern matching
+// Supports % (any characters) and _ (single character)
+func matchLike(value, pattern interface{}) bool {
+	valStr := fmt.Sprintf("%v", value)
+	patStr := fmt.Sprintf("%v", pattern)
+
+	return matchLikePattern(valStr, patStr)
+}
+
+// matchLikePattern implements the LIKE pattern matching algorithm
+func matchLikePattern(str, pattern string) bool {
+	// Convert to lowercase for case-insensitive matching (like PostgreSQL's ILIKE)
+	// Remove this for case-sensitive LIKE
+	str = strings.ToLower(str)
+	pattern = strings.ToLower(pattern)
+
+	return matchLikeRecursive(str, pattern, 0, 0)
+}
+
+// matchLikeRecursive recursively matches string against pattern
+func matchLikeRecursive(str, pattern string, sIdx, pIdx int) bool {
+	// Base cases
+	if pIdx == len(pattern) {
+		return sIdx == len(str)
+	}
+
+	if sIdx == len(str) {
+		// Check if remaining pattern is all %
+		for i := pIdx; i < len(pattern); i++ {
+			if pattern[i] != '%' {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Handle pattern characters
+	if pattern[pIdx] == '%' {
+		// Try matching zero or more characters
+		// First try skipping the % (matching zero characters)
+		if matchLikeRecursive(str, pattern, sIdx, pIdx+1) {
+			return true
+		}
+		// Try matching one more character and continue with %
+		return matchLikeRecursive(str, pattern, sIdx+1, pIdx)
+	}
+
+	if pattern[pIdx] == '_' {
+		// Match exactly one character
+		return matchLikeRecursive(str, pattern, sIdx+1, pIdx+1)
+	}
+
+	// Regular character match
+	if pattern[pIdx] == str[sIdx] {
+		return matchLikeRecursive(str, pattern, sIdx+1, pIdx+1)
+	}
+
+	return false
 }

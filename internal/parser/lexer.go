@@ -1,4 +1,4 @@
-// internal/parser/lexer.go
+// internal/parser/lexer.go << 'EOF'
 package parser
 
 import (
@@ -110,7 +110,7 @@ func (l *Lexer) NextToken() Token {
 		if unicode.IsLetter(rune(ch)) {
 			token.Literal = l.readIdentifier()
 			token.Type = LookupKeyword(strings.ToUpper(token.Literal))
-		} else if unicode.IsDigit(rune(ch)) {
+		} else if unicode.IsDigit(rune(ch)) || (ch == '-' && unicode.IsDigit(rune(l.peek()))) {
 			token.Type = TOKEN_NUMBER
 			token.Literal = l.readNumber()
 		} else {
@@ -119,6 +119,7 @@ func (l *Lexer) NextToken() Token {
 			l.advance()
 		}
 	}
+
 	return token
 }
 
@@ -156,9 +157,26 @@ func (l *Lexer) readIdentifier() string {
 
 func (l *Lexer) readNumber() string {
 	start := l.pos
+
+	// Handle negative sign
+	if l.input[l.pos] == '-' {
+		l.advance()
+	}
+
+	// Read integer part
 	for l.pos < len(l.input) && unicode.IsDigit(rune(l.input[l.pos])) {
 		l.advance()
 	}
+
+	// Check for decimal point
+	if l.pos < len(l.input) && l.input[l.pos] == '.' {
+		l.advance()
+		// Read decimal part
+		for l.pos < len(l.input) && unicode.IsDigit(rune(l.input[l.pos])) {
+			l.advance()
+		}
+	}
+
 	return l.input[start:l.pos]
 }
 
