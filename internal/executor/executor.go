@@ -62,11 +62,16 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// Create table
 	table := storage.NewTable(stmt.TableName, columns, tableMeta)
 
-	// Store in database (we'll add this to database struct)
+	// Store in database
 	if e.db.Tables == nil {
 		e.db.Tables = make(map[string]*storage.Table)
 	}
 	e.db.Tables[stmt.TableName] = table
+
+	// Persist to disk
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
 
 	return &Result{
 		Message: fmt.Sprintf("CREATE TABLE %s", stmt.TableName),
@@ -99,6 +104,11 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		if err := table.Insert(row); err != nil {
 			return nil, err
 		}
+	}
+
+	// Persist to disk after insert
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
 	return &Result{

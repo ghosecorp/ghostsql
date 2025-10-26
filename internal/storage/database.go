@@ -41,7 +41,14 @@ func Initialize() (*Database, error) {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
+	// Load existing tables from disk
+	logger.Info("Loading tables from disk...")
+	if err := db.LoadAllTables(); err != nil {
+		logger.Error("Failed to load tables: %v", err)
+	}
+
 	logger.Info("Database initialized at: %s", dd.RootPath)
+	logger.Info("Loaded %d table(s)", len(db.Tables))
 	return db, nil
 }
 
@@ -68,6 +75,12 @@ func (db *Database) acquireLock() error {
 // Shutdown cleanly shuts down the database
 func (db *Database) Shutdown() error {
 	db.Logger.Info("Shutting down database...")
+
+	// Save all tables to disk
+	db.Logger.Info("Saving tables to disk...")
+	if err := db.SaveAllTables(); err != nil {
+		db.Logger.Error("Failed to save tables: %v", err)
+	}
 
 	// Remove lock file
 	if err := os.Remove(db.LockFile); err != nil {
