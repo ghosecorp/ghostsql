@@ -1,3 +1,4 @@
+// internal/parser/lexer.go
 package parser
 
 import (
@@ -23,10 +24,12 @@ func NewLexer(input string) *Lexer {
 
 func (l *Lexer) NextToken() Token {
 	l.skipWhitespace()
+
 	if l.pos >= len(l.input) {
 		return Token{Type: TOKEN_EOF, Line: l.line, Column: l.column}
 	}
-	ch := rune(l.input[l.pos]) // Convert to rune
+
+	ch := l.input[l.pos]
 	token := Token{Line: l.line, Column: l.column}
 
 	switch ch {
@@ -62,14 +65,52 @@ func (l *Lexer) NextToken() Token {
 		token.Type = TOKEN_EQUALS
 		token.Literal = "="
 		l.advance()
+	case '<':
+		if l.peek() == '=' {
+			token.Type = TOKEN_LE
+			token.Literal = "<="
+			l.advance()
+			l.advance()
+		} else if l.peek() == '>' {
+			token.Type = TOKEN_NE
+			token.Literal = "<>"
+			l.advance()
+			l.advance()
+		} else {
+			token.Type = TOKEN_LT
+			token.Literal = "<"
+			l.advance()
+		}
+	case '>':
+		if l.peek() == '=' {
+			token.Type = TOKEN_GE
+			token.Literal = ">="
+			l.advance()
+			l.advance()
+		} else {
+			token.Type = TOKEN_GT
+			token.Literal = ">"
+			l.advance()
+		}
+	case '!':
+		if l.peek() == '=' {
+			token.Type = TOKEN_NE
+			token.Literal = "!="
+			l.advance()
+			l.advance()
+		} else {
+			token.Type = TOKEN_ILLEGAL
+			token.Literal = "!"
+			l.advance()
+		}
 	case '\'', '"':
 		token.Type = TOKEN_STRING
-		token.Literal = l.readString(byte(ch)) // Convert back to byte for readString
+		token.Literal = l.readString(ch)
 	default:
-		if unicode.IsLetter(ch) { // Now ch is a rune
+		if unicode.IsLetter(rune(ch)) {
 			token.Literal = l.readIdentifier()
 			token.Type = LookupKeyword(strings.ToUpper(token.Literal))
-		} else if unicode.IsDigit(ch) { // Now ch is a rune
+		} else if unicode.IsDigit(rune(ch)) {
 			token.Type = TOKEN_NUMBER
 			token.Literal = l.readNumber()
 		} else {
@@ -79,6 +120,13 @@ func (l *Lexer) NextToken() Token {
 		}
 	}
 	return token
+}
+
+func (l *Lexer) peek() byte {
+	if l.pos+1 >= len(l.input) {
+		return 0
+	}
+	return l.input[l.pos+1]
 }
 
 func (l *Lexer) skipWhitespace() {

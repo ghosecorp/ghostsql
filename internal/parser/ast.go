@@ -42,7 +42,7 @@ type SelectStmt struct {
 
 func (s *SelectStmt) StatementNode() {}
 
-// WhereClause represents WHERE condition (simplified)
+// WhereClause represents WHERE condition
 type WhereClause struct {
 	Column   string
 	Operator string

@@ -1,3 +1,4 @@
+// internal/parser/parser.go
 package parser
 
 import (
@@ -136,6 +137,8 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		col.Type = storage.TypeBigInt
 	case "TEXT":
 		col.Type = storage.TypeText
+	case "VARCHAR":
+		col.Type = storage.TypeVarChar
 	case "FLOAT":
 		col.Type = storage.TypeFloat
 	case "BOOLEAN":
@@ -255,5 +258,59 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	stmt.TableName = p.current.Literal
 	p.nextToken()
 
+	// Parse WHERE clause
+	if p.current.Type == TOKEN_WHERE {
+		p.nextToken()
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = where
+	}
+
 	return stmt, nil
+}
+
+func (p *Parser) parseWhere() (*WhereClause, error) {
+	where := &WhereClause{}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected column name in WHERE")
+	}
+
+	where.Column = p.current.Literal
+	p.nextToken()
+
+	// Parse operator
+	switch p.current.Type {
+	case TOKEN_EQUALS:
+		where.Operator = "="
+	case TOKEN_LT:
+		where.Operator = "<"
+	case TOKEN_GT:
+		where.Operator = ">"
+	case TOKEN_LE:
+		where.Operator = "<="
+	case TOKEN_GE:
+		where.Operator = ">="
+	case TOKEN_NE:
+		where.Operator = "!="
+	default:
+		return nil, fmt.Errorf("expected comparison operator, got %s", p.current.Type)
+	}
+	p.nextToken()
+
+	// Parse value
+	switch p.current.Type {
+	case TOKEN_NUMBER:
+		num, _ := strconv.Atoi(p.current.Literal)
+		where.Value = num
+	case TOKEN_STRING:
+		where.Value = p.current.Literal
+	default:
+		return nil, fmt.Errorf("expected value in WHERE")
+	}
+	p.nextToken()
+
+	return where, nil
 }

@@ -50,7 +50,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	var tableMeta *metadata.Metadata
 	if len(stmt.Metadata) >= 2 {
 		var id [16]byte
-		copy(id[:], stmt.TableName) // Simple ID for now
+		copy(id[:], stmt.TableName)
 		tableMeta = metadata.NewMetadata(
 			metadata.ObjTypeTable,
 			id,
@@ -122,7 +122,17 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	rows, err := table.Select(stmt.Columns)
+	// Convert parser WhereClause to storage WhereClause
+	var where *storage.WhereClause
+	if stmt.Where != nil {
+		where = &storage.WhereClause{
+			Column:   stmt.Where.Column,
+			Operator: stmt.Where.Operator,
+			Value:    stmt.Where.Value,
+		}
+	}
+
+	rows, err := table.Select(stmt.Columns, where)
 	if err != nil {
 		return nil, err
 	}

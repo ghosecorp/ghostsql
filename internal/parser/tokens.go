@@ -1,3 +1,4 @@
+// internal/parser/tokens.go
 package parser
 
 type TokenType int
@@ -32,6 +33,11 @@ const (
 	TOKEN_RBRACKET
 	TOKEN_ASTERISK
 	TOKEN_EQUALS
+	TOKEN_LT // <
+	TOKEN_GT // >
+	TOKEN_LE // <=
+	TOKEN_GE // >=
+	TOKEN_NE // !=
 )
 
 type Token struct {
@@ -65,6 +71,11 @@ func (t TokenType) String() string {
 		TOKEN_RBRACKET:  "RBRACKET",
 		TOKEN_ASTERISK:  "ASTERISK",
 		TOKEN_EQUALS:    "EQUALS",
+		TOKEN_LT:        "LT",
+		TOKEN_GT:        "GT",
+		TOKEN_LE:        "LE",
+		TOKEN_GE:        "GE",
+		TOKEN_NE:        "NE",
 	}
 	if name, ok := names[t]; ok {
 		return name
