@@ -1,0 +1,21 @@
+# Binaries
+bin/
+ghostsql-server
+ghostsql-client
+*.exe
+
+# Data directory (runtime)
+data/
+
+# Test files
+*.test
+*.out
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
