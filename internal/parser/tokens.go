@@ -39,6 +39,9 @@ const (
 	TOKEN_AND
 	TOKEN_OR
 	TOKEN_LIKE
+	TOKEN_COMMENT
+	TOKEN_ON
+	TOKEN_IS
 
 	// Literals
 	TOKEN_IDENT
@@ -103,6 +106,9 @@ func (t TokenType) String() string {
 		TOKEN_AND:       "AND",
 		TOKEN_OR:        "OR",
 		TOKEN_LIKE:      "LIKE",
+		TOKEN_COMMENT:   "COMMENT",
+		TOKEN_ON:        "ON",
+		TOKEN_IS:        "IS",
 		TOKEN_IDENT:     "IDENT",
 		TOKEN_NUMBER:    "NUMBER",
 		TOKEN_STRING:    "STRING",
@@ -158,6 +164,9 @@ var keywords = map[string]TokenType{
 	"AND":       TOKEN_AND,
 	"OR":        TOKEN_OR,
 	"LIKE":      TOKEN_LIKE,
+	"COMMENT":   TOKEN_COMMENT,
+	"ON":        TOKEN_ON,
+	"IS":        TOKEN_IS,
 }
 
 func LookupKeyword(ident string) TokenType {

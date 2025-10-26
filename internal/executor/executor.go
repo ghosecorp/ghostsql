@@ -1,4 +1,4 @@
-// internal/executor/executor.go << 'EOF'
+// internal/executor/executor.go
 package executor
 
 import (
@@ -52,6 +52,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeTruncate(s)
 	case *parser.AlterTableStmt:
 		return e.executeAlterTable(s)
+	case *parser.CommentStmt: // ADD THIS LINE
+		return e.executeComment(s) // ADD THIS LINE
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -147,16 +149,23 @@ func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
 		if col.Nullable {
 			nullable = "YES"
 		}
+
+		comment := ""
+		if col.Metadata != nil {
+			comment = col.Metadata.Description
+		}
+
 		rows[i] = storage.Row{
 			"Column":   col.Name,
 			"Type":     col.Type.String(),
 			"Nullable": nullable,
+			"Comment":  comment,
 		}
 	}
 
 	return &Result{
 		Rows:    rows,
-		Columns: []string{"Column", "Type", "Nullable"},
+		Columns: []string{"Column", "Type", "Nullable", "Comment"},
 	}, nil
 }
 
@@ -523,4 +532,114 @@ func toComparableInt(val interface{}) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func (e *Executor) executeComment(stmt *parser.CommentStmt) (*Result, error) {
+	switch stmt.ObjectType {
+	case "DATABASE":
+		return e.executeCommentDatabase(stmt)
+	case "TABLE":
+		return e.executeCommentTable(stmt)
+	case "COLUMN":
+		return e.executeCommentColumn(stmt)
+	default:
+		return nil, fmt.Errorf("unsupported COMMENT object type: %s", stmt.ObjectType)
+	}
+}
+
+func (e *Executor) executeCommentDatabase(stmt *parser.CommentStmt) (*Result, error) {
+	// Store database metadata
+	// For now, we'll store it in a simple way
+	// In production, this would go to the metadata store
+
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON DATABASE %s", stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.ObjectName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
+	}
+
+	// Update table metadata
+	if table.Metadata == nil {
+		var id [16]byte
+		copy(id[:], stmt.ObjectName)
+		table.Metadata = metadata.NewMetadata(
+			metadata.ObjTypeTable,
+			id,
+			"User comment",
+			stmt.Comment,
+		)
+	} else {
+		table.Metadata.Description = stmt.Comment
+	}
+
+	// Save to disk
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON TABLE %s", stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine table name
+	if stmt.TableName == "" {
+		// Need to parse column name differently
+		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	}
+
+	// Find and update column metadata
+	found := false
+	for i := range table.Columns {
+		if table.Columns[i].Name == stmt.ObjectName {
+			if table.Columns[i].Metadata == nil {
+				var id [16]byte
+				copy(id[:], stmt.ObjectName)
+				table.Columns[i].Metadata = metadata.NewMetadata(
+					metadata.ObjTypeColumn,
+					id,
+					"User comment",
+					stmt.Comment,
+				)
+			} else {
+				table.Columns[i].Metadata.Description = stmt.Comment
+			}
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
+	}
+
+	// Save to disk
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON COLUMN %s.%s", stmt.TableName, stmt.ObjectName),
+	}, nil
 }

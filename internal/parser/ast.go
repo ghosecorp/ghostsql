@@ -130,3 +130,22 @@ type OrderByClause struct {
 	Column     string
 	Descending bool
 }
+
+// CommentStmt represents COMMENT ON for setting metadata
+type CommentStmt struct {
+	ObjectType string // "DATABASE", "TABLE", "COLUMN"
+	ObjectName string
+	TableName  string // For columns
+	Comment    string
+}
+
+func (s *CommentStmt) StatementNode() {}
+
+// ShowMetadataStmt represents showing metadata
+type ShowMetadataStmt struct {
+	ObjectType string // "DATABASE", "TABLE", "COLUMN"
+	ObjectName string
+	TableName  string // For columns
+}
+
+func (s *ShowMetadataStmt) StatementNode() {}

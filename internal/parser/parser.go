@@ -50,6 +50,8 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseTruncate()
 	case TOKEN_ALTER:
 		return p.parseAlter()
+	case TOKEN_COMMENT:
+		return p.parseComment()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
@@ -712,4 +714,79 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 	}
 
 	return where, nil
+}
+
+func (p *Parser) parseComment() (*CommentStmt, error) {
+	stmt := &CommentStmt{}
+
+	p.nextToken() // consume COMMENT
+
+	if p.current.Type != TOKEN_ON {
+		return nil, fmt.Errorf("expected ON after COMMENT")
+	}
+	p.nextToken()
+
+	// Parse object type
+	switch p.current.Type {
+	case TOKEN_DATABASE:
+		stmt.ObjectType = "DATABASE"
+		p.nextToken()
+
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected database name")
+		}
+		stmt.ObjectName = p.current.Literal
+		p.nextToken()
+
+	case TOKEN_TABLE:
+		stmt.ObjectType = "TABLE"
+		p.nextToken()
+
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected table name")
+		}
+		stmt.ObjectName = p.current.Literal
+		p.nextToken()
+
+	case TOKEN_COLUMN:
+		stmt.ObjectType = "COLUMN"
+		p.nextToken()
+
+		// Format: COMMENT ON COLUMN table.column IS 'comment'
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected table name")
+		}
+		stmt.TableName = p.current.Literal
+		p.nextToken()
+
+		// Expect a dot
+		if p.current.Type != TOKEN_IDENT || p.current.Literal != "." {
+			// Try without dot for now
+			stmt.ObjectName = stmt.TableName
+			stmt.TableName = ""
+		} else {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected column name")
+			}
+			stmt.ObjectName = p.current.Literal
+			p.nextToken()
+		}
+
+	default:
+		return nil, fmt.Errorf("expected DATABASE, TABLE, or COLUMN after ON")
+	}
+
+	if p.current.Type != TOKEN_IS {
+		return nil, fmt.Errorf("expected IS")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_STRING {
+		return nil, fmt.Errorf("expected comment string")
+	}
+	stmt.Comment = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
 }
