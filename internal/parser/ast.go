@@ -1,3 +1,4 @@
+// internal/parser/ast.go << 'EOF'
 package parser
 
 import "github.com/ghosecorp/ghostsql/internal/storage"
@@ -7,11 +8,34 @@ type Statement interface {
 	StatementNode()
 }
 
+// CreateDatabaseStmt represents CREATE DATABASE
+type CreateDatabaseStmt struct {
+	DatabaseName string
+	Metadata     []string
+}
+
+func (s *CreateDatabaseStmt) StatementNode() {}
+
+// UseDatabaseStmt represents USE database
+type UseDatabaseStmt struct {
+	DatabaseName string
+}
+
+func (s *UseDatabaseStmt) StatementNode() {}
+
+// ShowStmt represents SHOW commands
+type ShowStmt struct {
+	ShowType  string // "DATABASES", "TABLES", "COLUMNS"
+	TableName string // For SHOW COLUMNS
+}
+
+func (s *ShowStmt) StatementNode() {}
+
 // CreateTableStmt represents CREATE TABLE statement
 type CreateTableStmt struct {
 	TableName string
 	Columns   []ColumnDef
-	Metadata  []string // [0]=purpose, [1]=description
+	Metadata  []string
 }
 
 func (s *CreateTableStmt) StatementNode() {}

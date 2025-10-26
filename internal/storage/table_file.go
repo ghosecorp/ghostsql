@@ -200,3 +200,140 @@ func (db *Database) LoadTableBinary(tableName string) (*Table, error) {
 	db.Logger.Info("Loaded table %s from binary format (%d rows, %d pages)", tableName, len(table.Rows), len(table.Pages))
 	return table, nil
 }
+
+func (db *Database) loadTableBinaryFromPath(tablePath string, tableName string) (*Table, error) {
+	file, err := os.Open(tablePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open table file: %w", err)
+	}
+	defer file.Close()
+
+	// Read header
+	header := make([]byte, 64)
+	if _, err := file.Read(header); err != nil {
+		return nil, fmt.Errorf("failed to read header: %w", err)
+	}
+
+	// Verify magic
+	magic := string(header[0:4])
+	if magic != TableFileMagic {
+		return nil, fmt.Errorf("invalid table file magic: %s", magic)
+	}
+
+	version := binary.LittleEndian.Uint32(header[4:8])
+	if version != TableFileVersion {
+		return nil, fmt.Errorf("unsupported table file version: %d", version)
+	}
+
+	numColumns := binary.LittleEndian.Uint16(header[8:10])
+	numPages := binary.LittleEndian.Uint32(header[10:14])
+
+	// Read schema
+	columns := make([]Column, numColumns)
+	for i := uint16(0); i < numColumns; i++ {
+		var nameLen uint16
+		if err := binary.Read(file, binary.LittleEndian, &nameLen); err != nil {
+			return nil, err
+		}
+
+		nameBytes := make([]byte, nameLen)
+		if _, err := file.Read(nameBytes); err != nil {
+			return nil, err
+		}
+		columns[i].Name = string(nameBytes)
+
+		var colType uint8
+		if err := binary.Read(file, binary.LittleEndian, &colType); err != nil {
+			return nil, err
+		}
+		columns[i].Type = DataType(colType)
+
+		var nullable uint8
+		if err := binary.Read(file, binary.LittleEndian, &nullable); err != nil {
+			return nil, err
+		}
+		columns[i].Nullable = nullable == 1
+	}
+
+	table := &Table{
+		Name:    tableName,
+		Columns: columns,
+		Pages:   make([]*SlottedPage, 0, numPages),
+		Rows:    make([]Row, 0),
+	}
+
+	// Read pages
+	for i := uint32(0); i < numPages; i++ {
+		var pageData [PageSize]byte
+		if _, err := file.Read(pageData[:]); err != nil {
+			return nil, fmt.Errorf("failed to read page %d: %w", i, err)
+		}
+
+		page := LoadSlottedPage(pageData)
+		table.Pages = append(table.Pages, page)
+	}
+
+	// Reconstruct rows
+	if err := table.LoadFromPages(); err != nil {
+		return nil, fmt.Errorf("failed to load rows from pages: %w", err)
+	}
+
+	return table, nil
+}
+
+// saveTableBinaryToPath saves a table to a specific path
+func (db *Database) saveTableBinaryToPath(table *Table, tablePath string) error {
+	dir := filepath.Dir(tablePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	file, err := os.Create(tablePath)
+	if err != nil {
+		return fmt.Errorf("failed to create table file: %w", err)
+	}
+	defer file.Close()
+
+	// Write header
+	header := make([]byte, 64)
+	copy(header[0:4], TableFileMagic)
+	binary.LittleEndian.PutUint32(header[4:8], TableFileVersion)
+	binary.LittleEndian.PutUint16(header[8:10], uint16(len(table.Columns)))
+	binary.LittleEndian.PutUint32(header[10:14], uint32(len(table.Pages)))
+
+	if _, err := file.Write(header); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Write schema
+	for _, col := range table.Columns {
+		nameBytes := []byte(col.Name)
+		if err := binary.Write(file, binary.LittleEndian, uint16(len(nameBytes))); err != nil {
+			return err
+		}
+		if _, err := file.Write(nameBytes); err != nil {
+			return err
+		}
+
+		if err := binary.Write(file, binary.LittleEndian, uint8(col.Type)); err != nil {
+			return err
+		}
+
+		nullable := uint8(0)
+		if col.Nullable {
+			nullable = 1
+		}
+		if err := binary.Write(file, binary.LittleEndian, nullable); err != nil {
+			return err
+		}
+	}
+
+	// Write pages
+	for _, page := range table.Pages {
+		if _, err := file.Write(page.Data[:]); err != nil {
+			return fmt.Errorf("failed to write page: %w", err)
+		}
+	}
+
+	return nil
+}

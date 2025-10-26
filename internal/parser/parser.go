@@ -31,25 +31,133 @@ func (p *Parser) nextToken() {
 func (p *Parser) Parse() (Statement, error) {
 	switch p.current.Type {
 	case TOKEN_CREATE:
-		return p.parseCreateTable()
+		return p.parseCreate()
 	case TOKEN_INSERT:
 		return p.parseInsert()
 	case TOKEN_SELECT:
 		return p.parseSelect()
+	case TOKEN_USE:
+		return p.parseUse()
+	case TOKEN_SHOW:
+		return p.parseShow()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
 }
 
+func (p *Parser) parseCreate() (Statement, error) {
+	p.nextToken() // consume CREATE
+
+	switch p.current.Type {
+	case TOKEN_DATABASE:
+		return p.parseCreateDatabase()
+	case TOKEN_TABLE:
+		return p.parseCreateTable()
+	default:
+		return nil, fmt.Errorf("expected DATABASE or TABLE after CREATE")
+	}
+}
+
+func (p *Parser) parseCreateDatabase() (*CreateDatabaseStmt, error) {
+	stmt := &CreateDatabaseStmt{}
+
+	p.nextToken() // consume DATABASE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected database name")
+	}
+
+	stmt.DatabaseName = p.current.Literal
+	p.nextToken()
+
+	// Check for METADATA
+	if p.current.Type == TOKEN_METADATA {
+		p.nextToken()
+		if p.current.Type != TOKEN_LBRACKET {
+			return nil, fmt.Errorf("expected [ after METADATA")
+		}
+		p.nextToken()
+
+		if p.current.Type != TOKEN_STRING {
+			return nil, fmt.Errorf("expected string for purpose")
+		}
+		stmt.Metadata = append(stmt.Metadata, p.current.Literal)
+		p.nextToken()
+
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+			if p.current.Type != TOKEN_STRING {
+				return nil, fmt.Errorf("expected string for description")
+			}
+			stmt.Metadata = append(stmt.Metadata, p.current.Literal)
+			p.nextToken()
+		}
+
+		if p.current.Type != TOKEN_RBRACKET {
+			return nil, fmt.Errorf("expected ]")
+		}
+		p.nextToken()
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseUse() (*UseDatabaseStmt, error) {
+	stmt := &UseDatabaseStmt{}
+
+	p.nextToken() // consume USE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected database name")
+	}
+
+	stmt.DatabaseName = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
+}
+
+func (p *Parser) parseShow() (*ShowStmt, error) {
+	stmt := &ShowStmt{}
+
+	p.nextToken() // consume SHOW
+
+	switch p.current.Type {
+	case TOKEN_DATABASES:
+		stmt.ShowType = "DATABASES"
+		p.nextToken()
+
+	case TOKEN_TABLES:
+		stmt.ShowType = "TABLES"
+		p.nextToken()
+
+	case TOKEN_COLUMNS:
+		stmt.ShowType = "COLUMNS"
+		p.nextToken()
+
+		if p.current.Type != TOKEN_FROM {
+			return nil, fmt.Errorf("expected FROM after SHOW COLUMNS")
+		}
+		p.nextToken()
+
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected table name")
+		}
+		stmt.TableName = p.current.Literal
+		p.nextToken()
+
+	default:
+		return nil, fmt.Errorf("expected DATABASES, TABLES, or COLUMNS after SHOW")
+	}
+
+	return stmt, nil
+}
+
 func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 	stmt := &CreateTableStmt{}
 
-	p.nextToken() // consume CREATE
-	if p.current.Type != TOKEN_TABLE {
-		return nil, fmt.Errorf("expected TABLE, got %s", p.current.Type)
-	}
-
 	p.nextToken() // consume TABLE
+
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected table name, got %s", p.current.Type)
 	}
@@ -88,7 +196,6 @@ func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 		}
 		p.nextToken()
 
-		// Read purpose
 		if p.current.Type != TOKEN_STRING {
 			return nil, fmt.Errorf("expected string for purpose")
 		}
@@ -97,7 +204,6 @@ func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
-			// Read description
 			if p.current.Type != TOKEN_STRING {
 				return nil, fmt.Errorf("expected string for description")
 			}
@@ -124,7 +230,6 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	col.Name = p.current.Literal
 	p.nextToken()
 
-	// Parse type
 	if p.current.Type != TOKEN_IDENT {
 		return col, fmt.Errorf("expected column type")
 	}

@@ -1,3 +1,4 @@
+// internal/executor/executor.go << 'EOF'
 package executor
 
 import (
@@ -24,6 +25,12 @@ type Result struct {
 
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	switch s := stmt.(type) {
+	case *parser.CreateDatabaseStmt:
+		return e.executeCreateDatabase(s)
+	case *parser.UseDatabaseStmt:
+		return e.executeUseDatabase(s)
+	case *parser.ShowStmt:
+		return e.executeShow(s)
 	case *parser.CreateTableStmt:
 		return e.executeCreateTable(s)
 	case *parser.InsertStmt:
@@ -35,7 +42,115 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	}
 }
 
+func (e *Executor) executeCreateDatabase(stmt *parser.CreateDatabaseStmt) (*Result, error) {
+	if err := e.db.CreateDatabase(stmt.DatabaseName); err != nil {
+		return nil, err
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("CREATE DATABASE %s", stmt.DatabaseName),
+	}, nil
+}
+
+func (e *Executor) executeUseDatabase(stmt *parser.UseDatabaseStmt) (*Result, error) {
+	if err := e.db.UseDatabase(stmt.DatabaseName); err != nil {
+		return nil, err
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("Database changed to %s", stmt.DatabaseName),
+	}, nil
+}
+
+func (e *Executor) executeShow(stmt *parser.ShowStmt) (*Result, error) {
+	switch stmt.ShowType {
+	case "DATABASES":
+		return e.executeShowDatabases()
+	case "TABLES":
+		return e.executeShowTables()
+	case "COLUMNS":
+		return e.executeShowColumns(stmt.TableName)
+	default:
+		return nil, fmt.Errorf("unsupported SHOW type: %s", stmt.ShowType)
+	}
+}
+
+func (e *Executor) executeShowDatabases() (*Result, error) {
+	databases := e.db.ListDatabases()
+
+	rows := make([]storage.Row, len(databases))
+	for i, dbName := range databases {
+		current := ""
+		if dbName == e.db.CurrentDatabase {
+			current = "*"
+		}
+		rows[i] = storage.Row{
+			"Database": dbName,
+			"Current":  current,
+		}
+	}
+
+	return &Result{
+		Rows:    rows,
+		Columns: []string{"Database", "Current"},
+	}, nil
+}
+
+func (e *Executor) executeShowTables() (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	rows := make([]storage.Row, 0, len(dbInstance.Tables))
+	for tableName := range dbInstance.Tables {
+		rows = append(rows, storage.Row{
+			"Table": tableName,
+		})
+	}
+
+	return &Result{
+		Rows:    rows,
+		Columns: []string{"Table"},
+	}, nil
+}
+
+func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	rows := make([]storage.Row, len(table.Columns))
+	for i, col := range table.Columns {
+		nullable := "NO"
+		if col.Nullable {
+			nullable = "YES"
+		}
+		rows[i] = storage.Row{
+			"Column":   col.Name,
+			"Type":     col.Type.String(),
+			"Nullable": nullable,
+		}
+	}
+
+	return &Result{
+		Rows:    rows,
+		Columns: []string{"Column", "Type", "Nullable"},
+	}, nil
+}
+
 func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
 	// Convert column definitions
 	columns := make([]storage.Column, len(stmt.Columns))
 	for i, colDef := range stmt.Columns {
@@ -61,12 +176,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 
 	// Create table
 	table := storage.NewTable(stmt.TableName, columns, tableMeta)
-
-	// Store in database
-	if e.db.Tables == nil {
-		e.db.Tables = make(map[string]*storage.Table)
-	}
-	e.db.Tables[stmt.TableName] = table
+	dbInstance.Tables[stmt.TableName] = table
 
 	// Persist to disk
 	if err := e.db.SaveTableToDisk(table); err != nil {
@@ -79,7 +189,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 }
 
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
-	table, exists := e.db.Tables[stmt.TableName]
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -87,7 +202,6 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	for _, values := range stmt.Values {
 		row := make(storage.Row)
 
-		// If columns specified, use them; otherwise use table order
 		colNames := stmt.Columns
 		if len(colNames) == 0 {
 			colNames = table.GetColumnNames()
@@ -106,7 +220,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		}
 	}
 
-	// Persist to disk after insert
+	// Persist to disk
 	if err := e.db.SaveTableToDisk(table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
@@ -117,12 +231,16 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
-	table, exists := e.db.Tables[stmt.TableName]
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	// Convert parser WhereClause to storage WhereClause
 	var where *storage.WhereClause
 	if stmt.Where != nil {
 		where = &storage.WhereClause{
