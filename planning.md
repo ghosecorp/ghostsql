@@ -64,6 +64,12 @@
    - `CROSS JOIN`
    - *Why: Relational queries*
 
+10. **LIKE FOR STRING**[3]
+   - `'%some_letters'`
+   - `some_letters%`
+   - `%some_letters%`
+   - *Why: To Search tables using strings in a better way*
+
 ### **Phase 4: Metadata Enhancement (Week 6)**
 **Priority: MEDIUM** - Unique GhostSQL feature
 
