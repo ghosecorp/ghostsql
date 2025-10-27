@@ -44,6 +44,7 @@ func (s *CreateTableStmt) StatementNode() {}
 type ColumnDef struct {
 	Name     string
 	Type     storage.DataType
+	Length   int // For VARCHAR(n) or VECTOR(n)
 	Nullable bool
 	Metadata []string
 }

@@ -444,37 +444,106 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	}
 
 	typeName := strings.ToUpper(p.current.Literal)
+
 	switch typeName {
 	case "INT":
 		col.Type = storage.TypeInt
+		p.nextToken()
+
 	case "BIGINT":
 		col.Type = storage.TypeBigInt
+		p.nextToken()
+
 	case "TEXT":
 		col.Type = storage.TypeText
+		p.nextToken()
+
 	case "VARCHAR":
 		col.Type = storage.TypeVarChar
+		col.Length = 255 // default
+		p.nextToken()
+
+		// Parse optional length VARCHAR(n)
+		if p.current.Type == TOKEN_LPAREN {
+			p.nextToken()
+			if p.current.Type != TOKEN_NUMBER {
+				return col, fmt.Errorf("expected number for VARCHAR length")
+			}
+			length, _ := strconv.Atoi(p.current.Literal)
+			col.Length = length
+			p.nextToken()
+
+			if p.current.Type != TOKEN_RPAREN {
+				return col, fmt.Errorf("expected )")
+			}
+			p.nextToken()
+		}
+
 	case "FLOAT":
 		col.Type = storage.TypeFloat
+		p.nextToken()
+
 	case "BOOLEAN":
 		col.Type = storage.TypeBoolean
+		p.nextToken()
+
 	case "VECTOR":
 		col.Type = storage.TypeVector
-		// Optional: parse dimension VECTOR(384)
+		col.Length = 0 // dimensions
 		p.nextToken()
+
+		// Parse optional dimensions VECTOR(384)
 		if p.current.Type == TOKEN_LPAREN {
-			// Skip dimension for now, just consume it
-			p.nextToken() // consume (
-			p.nextToken() // consume number
-			p.nextToken() // consume )
-		} else {
-			// Put back the token we just consumed
-			return col, nil
+			p.nextToken()
+			if p.current.Type == TOKEN_NUMBER {
+				length, _ := strconv.Atoi(p.current.Literal)
+				col.Length = length
+				p.nextToken()
+			}
+			if p.current.Type != TOKEN_RPAREN {
+				return col, fmt.Errorf("expected )")
+			}
+			p.nextToken()
 		}
+
 	default:
 		return col, fmt.Errorf("unknown type: %s", typeName)
 	}
 
-	p.nextToken()
+	// Parse optional column constraints (NOT NULL, PRIMARY KEY, etc.)
+	// For now, we'll skip any additional keywords we don't recognize
+	// This allows the parser to continue to the next column or end of column list
+	for {
+		// Check if we've hit a comma (next column) or right paren (end of columns)
+		if p.current.Type == TOKEN_COMMA || p.current.Type == TOKEN_RPAREN {
+			break
+		}
+
+		// Check for EOF
+		if p.current.Type == TOKEN_EOF {
+			break
+		}
+
+		// Skip constraint keywords we don't yet support
+		// This includes NOT, NULL, PRIMARY, KEY, DEFAULT, AUTO_INCREMENT, etc.
+		if p.current.Type == TOKEN_IDENT {
+			keyword := strings.ToUpper(p.current.Literal)
+			switch keyword {
+			case "NOT", "NULL", "PRIMARY", "KEY", "DEFAULT", "AUTO_INCREMENT",
+				"UNIQUE", "CHECK", "REFERENCES", "FOREIGN":
+				// Skip these constraint keywords
+				p.nextToken()
+			default:
+				// Unknown token - might be an error, but let's be lenient
+				return col, fmt.Errorf("unexpected token after column type: %s", p.current.Literal)
+			}
+		} else {
+			// Some other token type we don't expect
+			// Could be an error, but let's break and let the caller handle it
+			break
+		}
+	}
+
 	return col, nil
 }
 

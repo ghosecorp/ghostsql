@@ -10,10 +10,12 @@ import (
 
 // Column represents a table column definition
 type Column struct {
-	Name     string
-	Type     DataType
-	Nullable bool
-	Metadata *metadata.Metadata
+	Name      string
+	Type      DataType
+	Length    int // For VARCHAR(n)
+	Nullable  bool
+	IsPrimary bool // For PRIMARY KEY
+	Metadata  *metadata.Metadata
 }
 
 // Row represents a single row of data

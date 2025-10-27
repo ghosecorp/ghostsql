@@ -184,6 +184,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		columns[i] = storage.Column{
 			Name:     colDef.Name,
 			Type:     colDef.Type,
+			Length:   colDef.Length,
 			Nullable: colDef.Nullable,
 		}
 	}
@@ -238,17 +239,27 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		for i, colName := range colNames {
 			val := values[i]
 
-			// Check if this column is a VECTOR type
-			var colType storage.DataType
+			// Find column definition
+			var colDef storage.Column
 			for _, col := range table.Columns {
 				if col.Name == colName {
-					colType = col.Type
+					colDef = col
 					break
 				}
 			}
 
+			// Check VARCHAR length
+			if colDef.Type == storage.TypeVarChar && colDef.Length > 0 {
+				if strVal, ok := val.(string); ok {
+					if len(strVal) > colDef.Length {
+						return nil, fmt.Errorf("value too long for column %s (max %d, got %d)",
+							colName, colDef.Length, len(strVal))
+					}
+				}
+			}
+
 			// Parse vector if needed
-			if colType == storage.TypeVector {
+			if colDef.Type == storage.TypeVector {
 				if strVal, ok := val.(string); ok {
 					vec, err := storage.ParseVector(strVal)
 					if err != nil {
