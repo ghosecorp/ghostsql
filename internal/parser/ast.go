@@ -42,11 +42,13 @@ func (s *CreateTableStmt) StatementNode() {}
 
 // ColumnDef represents a column definition
 type ColumnDef struct {
-	Name     string
-	Type     storage.DataType
-	Length   int // For VARCHAR(n) or VECTOR(n)
-	Nullable bool
-	Metadata []string
+	Name       string
+	Type       storage.DataType
+	Length     int
+	Nullable   bool
+	IsPrimary  bool // PRIMARY KEY
+	IsUnique   bool // UNIQUE
+	DefaultVal interface{}
 }
 
 // InsertStmt represents INSERT INTO

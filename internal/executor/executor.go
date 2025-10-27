@@ -182,10 +182,13 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	columns := make([]storage.Column, len(stmt.Columns))
 	for i, colDef := range stmt.Columns {
 		columns[i] = storage.Column{
-			Name:     colDef.Name,
-			Type:     colDef.Type,
-			Length:   colDef.Length,
-			Nullable: colDef.Nullable,
+			Name:       colDef.Name,
+			Type:       colDef.Type,
+			Length:     colDef.Length,
+			Nullable:   colDef.Nullable,
+			IsPrimary:  colDef.IsPrimary,  // ADD THIS LINE
+			IsUnique:   colDef.IsUnique,   // ADD THIS LINE
+			DefaultVal: colDef.DefaultVal, // ADD THIS LINE
 		}
 	}
 
@@ -270,6 +273,34 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 			}
 
 			row[colName] = val
+		}
+
+		// Validate NOT NULL constraints
+		for _, col := range table.Columns {
+			if !col.Nullable {
+				val, exists := row[col.Name]
+				if !exists || val == nil {
+					return nil, fmt.Errorf("column %s cannot be NULL", col.Name)
+				}
+			}
+		}
+
+		// Check PRIMARY KEY uniqueness
+		for _, col := range table.Columns {
+			if col.IsPrimary {
+				newVal := row[col.Name]
+				if newVal == nil {
+					return nil, fmt.Errorf("PRIMARY KEY column %s cannot be NULL", col.Name)
+				}
+
+				for _, existingRow := range table.Rows {
+					existingVal := existingRow[col.Name]
+					// Use compare function for proper comparison
+					if compareValues(newVal, existingVal) == 0 {
+						return nil, fmt.Errorf("duplicate value for PRIMARY KEY column %s: %v", col.Name, newVal)
+					}
+				}
+			}
 		}
 
 		if err := table.Insert(row); err != nil {

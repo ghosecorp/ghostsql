@@ -433,14 +433,14 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	col := ColumnDef{Nullable: true}
 
 	if p.current.Type != TOKEN_IDENT {
-		return col, fmt.Errorf("expected column name")
+		return col, fmt.Errorf("expected column name, got %s (literal: '%s')", p.current.Type, p.current.Literal)
 	}
 
 	col.Name = p.current.Literal
 	p.nextToken()
 
 	if p.current.Type != TOKEN_IDENT {
-		return col, fmt.Errorf("expected column type")
+		return col, fmt.Errorf("expected column type after %s, got %s (literal: '%s')", col.Name, p.current.Type, p.current.Literal)
 	}
 
 	typeName := strings.ToUpper(p.current.Literal)
@@ -510,36 +510,85 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		return col, fmt.Errorf("unknown type: %s", typeName)
 	}
 
-	// Parse optional column constraints (NOT NULL, PRIMARY KEY, etc.)
-	// For now, we'll skip any additional keywords we don't recognize
-	// This allows the parser to continue to the next column or end of column list
+	// After parsing the type, parse constraints
 	for {
-		// Check if we've hit a comma (next column) or right paren (end of columns)
 		if p.current.Type == TOKEN_COMMA || p.current.Type == TOKEN_RPAREN {
 			break
 		}
 
-		// Check for EOF
 		if p.current.Type == TOKEN_EOF {
 			break
 		}
 
-		// Skip constraint keywords we don't yet support
-		// This includes NOT, NULL, PRIMARY, KEY, DEFAULT, AUTO_INCREMENT, etc.
+		// Handle NULL token type (if defined as keyword)
+		if p.current.Type == TOKEN_NULL {
+			col.Nullable = true
+			p.nextToken()
+			continue
+		}
+
 		if p.current.Type == TOKEN_IDENT {
 			keyword := strings.ToUpper(p.current.Literal)
+
 			switch keyword {
-			case "NOT", "NULL", "PRIMARY", "KEY", "DEFAULT", "AUTO_INCREMENT",
-				"UNIQUE", "CHECK", "REFERENCES", "FOREIGN":
-				// Skip these constraint keywords
+			case "NOT":
 				p.nextToken()
+				// Check for NULL as either TOKEN_NULL or TOKEN_IDENT
+				if p.current.Type == TOKEN_NULL || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NULL") {
+					col.Nullable = false
+					p.nextToken()
+				} else {
+					return col, fmt.Errorf("expected NULL after NOT, got %s (literal: '%s')", p.current.Type, p.current.Literal)
+				}
+			case "NULL":
+				// NULL as identifier (if not defined as keyword)
+				col.Nullable = true
+				p.nextToken()
+			case "PRIMARY":
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "KEY" {
+					col.IsPrimary = true
+					col.Nullable = false
+					p.nextToken()
+				} else {
+					return col, fmt.Errorf("expected KEY after PRIMARY, got %s (literal: '%s')", p.current.Type, p.current.Literal)
+				}
+			case "UNIQUE":
+				col.IsUnique = true
+				p.nextToken()
+			case "DEFAULT":
+				p.nextToken()
+				// Parse default value
+				switch p.current.Type {
+				case TOKEN_NUMBER:
+					if strings.Contains(p.current.Literal, ".") {
+						val, _ := strconv.ParseFloat(p.current.Literal, 64)
+						col.DefaultVal = val
+					} else {
+						val, _ := strconv.Atoi(p.current.Literal)
+						col.DefaultVal = val
+					}
+					p.nextToken()
+				case TOKEN_STRING:
+					col.DefaultVal = p.current.Literal
+					p.nextToken()
+				case TOKEN_NULL:
+					col.DefaultVal = nil
+					p.nextToken()
+				case TOKEN_IDENT:
+					if strings.ToUpper(p.current.Literal) == "NULL" {
+						col.DefaultVal = nil
+						p.nextToken()
+					} else {
+						return col, fmt.Errorf("unexpected default value: %s", p.current.Literal)
+					}
+				default:
+					return col, fmt.Errorf("expected default value, got %s", p.current.Type)
+				}
 			default:
-				// Unknown token - might be an error, but let's be lenient
-				return col, fmt.Errorf("unexpected token after column type: %s", p.current.Literal)
+				return col, fmt.Errorf("unexpected constraint: %s (after parsing column %s)", keyword, col.Name)
 			}
 		} else {
-			// Some other token type we don't expect
-			// Could be an error, but let's break and let the caller handle it
 			break
 		}
 	}
@@ -617,6 +666,7 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 			p.nextToken()   // consume ]
 		} else {
 			// Regular value parsing
+			// Regular value parsing
 			switch p.current.Type {
 			case TOKEN_NUMBER:
 				if strings.Contains(p.current.Literal, ".") {
@@ -628,6 +678,15 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 				}
 			case TOKEN_STRING:
 				val = p.current.Literal
+			case TOKEN_NULL:
+				val = nil // Explicit NULL
+			case TOKEN_IDENT:
+				// Handle NULL as identifier (case-insensitive)
+				if strings.ToUpper(p.current.Literal) == "NULL" {
+					val = nil
+				} else {
+					return nil, fmt.Errorf("unexpected identifier: %s", p.current.Literal)
+				}
 			default:
 				return nil, fmt.Errorf("unexpected value type: %s (literal: %s)", p.current.Type, p.current.Literal)
 			}

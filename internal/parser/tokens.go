@@ -82,6 +82,8 @@ const (
 	TOKEN_COSINE_DISTANCE
 	TOKEN_L2_DISTANCE
 	TOKEN_DISTANCE
+
+	TOKEN_NULL
 )
 
 type Token struct {
@@ -220,6 +222,7 @@ var keywords = map[string]TokenType{
 	"COSINE_DISTANCE": TOKEN_COSINE_DISTANCE,
 	"L2_DISTANCE":     TOKEN_L2_DISTANCE,
 	"DISTANCE":        TOKEN_DISTANCE,
+	"NULL":            TOKEN_NULL,
 }
 
 func LookupKeyword(ident string) TokenType {
