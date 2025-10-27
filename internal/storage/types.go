@@ -1,4 +1,29 @@
+// internal/storage/types.go << 'EOF'
 package storage
+
+import "fmt"
+
+// Vector represents a vector embedding
+type Vector struct {
+	Dimensions int
+	Values     []float32
+}
+
+// NewVector creates a new vector
+func NewVector(values []float32) *Vector {
+	return &Vector{
+		Dimensions: len(values),
+		Values:     values,
+	}
+}
+
+// String returns string representation of vector
+func (v *Vector) String() string {
+	if v == nil {
+		return "NULL"
+	}
+	return fmt.Sprintf("VECTOR(%d)", v.Dimensions)
+}
 
 // DataType represents column data types
 type DataType uint8
@@ -68,7 +93,7 @@ const (
 	PageTypeInvalid PageType = iota
 	PageTypeData             // Regular data pages
 	PageTypeIndex            // B+tree index pages
-	PageTypeVector           // Vector index pages
+	PageTypeVector           // Vector index pages (HNSW)
 	PageTypeMeta             // Metadata pages
 )
 

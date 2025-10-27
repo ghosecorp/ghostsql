@@ -42,6 +42,14 @@ const (
 	TOKEN_COMMENT
 	TOKEN_ON
 	TOKEN_IS
+	TOKEN_GROUP
+	TOKEN_HAVING
+	TOKEN_COUNT
+	TOKEN_SUM
+	TOKEN_AVG
+	TOKEN_MAX
+	TOKEN_MIN
+	TOKEN_AS
 
 	// Literals
 	TOKEN_IDENT
@@ -63,6 +71,12 @@ const (
 	TOKEN_GE
 	TOKEN_NE
 	TOKEN_PERCENT
+
+	// Vector Tokens
+	TOKEN_VECTOR_SEARCH
+	TOKEN_COSINE_DISTANCE
+	TOKEN_L2_DISTANCE
+	TOKEN_DISTANCE
 )
 
 type Token struct {
@@ -109,6 +123,14 @@ func (t TokenType) String() string {
 		TOKEN_COMMENT:   "COMMENT",
 		TOKEN_ON:        "ON",
 		TOKEN_IS:        "IS",
+		TOKEN_GROUP:     "GROUP",
+		TOKEN_HAVING:    "HAVING",
+		TOKEN_COUNT:     "COUNT",
+		TOKEN_SUM:       "SUM",
+		TOKEN_AVG:       "AVG",
+		TOKEN_MAX:       "MAX",
+		TOKEN_MIN:       "MIN",
+		TOKEN_AS:        "AS",
 		TOKEN_IDENT:     "IDENT",
 		TOKEN_NUMBER:    "NUMBER",
 		TOKEN_STRING:    "STRING",
@@ -134,39 +156,51 @@ func (t TokenType) String() string {
 }
 
 var keywords = map[string]TokenType{
-	"SELECT":    TOKEN_SELECT,
-	"INSERT":    TOKEN_INSERT,
-	"INTO":      TOKEN_INTO,
-	"VALUES":    TOKEN_VALUES,
-	"CREATE":    TOKEN_CREATE,
-	"TABLE":     TOKEN_TABLE,
-	"DATABASE":  TOKEN_DATABASE,
-	"USE":       TOKEN_USE,
-	"SHOW":      TOKEN_SHOW,
-	"DATABASES": TOKEN_DATABASES,
-	"TABLES":    TOKEN_TABLES,
-	"COLUMNS":   TOKEN_COLUMNS,
-	"FROM":      TOKEN_FROM,
-	"WHERE":     TOKEN_WHERE,
-	"METADATA":  TOKEN_METADATA,
-	"UPDATE":    TOKEN_UPDATE,
-	"SET":       TOKEN_SET,
-	"DELETE":    TOKEN_DELETE,
-	"DROP":      TOKEN_DROP,
-	"ALTER":     TOKEN_ALTER,
-	"ADD":       TOKEN_ADD,
-	"COLUMN":    TOKEN_COLUMN,
-	"TRUNCATE":  TOKEN_TRUNCATE,
-	"ORDER":     TOKEN_ORDER,
-	"BY":        TOKEN_BY,
-	"LIMIT":     TOKEN_LIMIT,
-	"OFFSET":    TOKEN_OFFSET,
-	"AND":       TOKEN_AND,
-	"OR":        TOKEN_OR,
-	"LIKE":      TOKEN_LIKE,
-	"COMMENT":   TOKEN_COMMENT,
-	"ON":        TOKEN_ON,
-	"IS":        TOKEN_IS,
+	"SELECT":          TOKEN_SELECT,
+	"INSERT":          TOKEN_INSERT,
+	"INTO":            TOKEN_INTO,
+	"VALUES":          TOKEN_VALUES,
+	"CREATE":          TOKEN_CREATE,
+	"TABLE":           TOKEN_TABLE,
+	"DATABASE":        TOKEN_DATABASE,
+	"USE":             TOKEN_USE,
+	"SHOW":            TOKEN_SHOW,
+	"DATABASES":       TOKEN_DATABASES,
+	"TABLES":          TOKEN_TABLES,
+	"COLUMNS":         TOKEN_COLUMNS,
+	"FROM":            TOKEN_FROM,
+	"WHERE":           TOKEN_WHERE,
+	"METADATA":        TOKEN_METADATA,
+	"UPDATE":          TOKEN_UPDATE,
+	"SET":             TOKEN_SET,
+	"DELETE":          TOKEN_DELETE,
+	"DROP":            TOKEN_DROP,
+	"ALTER":           TOKEN_ALTER,
+	"ADD":             TOKEN_ADD,
+	"COLUMN":          TOKEN_COLUMN,
+	"TRUNCATE":        TOKEN_TRUNCATE,
+	"ORDER":           TOKEN_ORDER,
+	"BY":              TOKEN_BY,
+	"LIMIT":           TOKEN_LIMIT,
+	"OFFSET":          TOKEN_OFFSET,
+	"AND":             TOKEN_AND,
+	"OR":              TOKEN_OR,
+	"LIKE":            TOKEN_LIKE,
+	"COMMENT":         TOKEN_COMMENT,
+	"ON":              TOKEN_ON,
+	"IS":              TOKEN_IS,
+	"GROUP":           TOKEN_GROUP,
+	"HAVING":          TOKEN_HAVING,
+	"COUNT":           TOKEN_COUNT,
+	"SUM":             TOKEN_SUM,
+	"AVG":             TOKEN_AVG,
+	"MAX":             TOKEN_MAX,
+	"MIN":             TOKEN_MIN,
+	"AS":              TOKEN_AS,
+	"VECTOR_SEARCH":   TOKEN_VECTOR_SEARCH,
+	"COSINE_DISTANCE": TOKEN_COSINE_DISTANCE,
+	"L2_DISTANCE":     TOKEN_L2_DISTANCE,
+	"DISTANCE":        TOKEN_DISTANCE,
 }
 
 func LookupKeyword(ident string) TokenType {

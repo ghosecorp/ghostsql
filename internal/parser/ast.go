@@ -59,12 +59,24 @@ func (s *InsertStmt) StatementNode() {}
 
 // SelectStmt represents SELECT
 type SelectStmt struct {
-	Columns   []string
-	TableName string
-	Where     *WhereClause
-	OrderBy   []OrderByClause
-	Limit     int
-	Offset    int
+	Columns       []string
+	Aggregates    []AggregateFunc
+	TableName     string
+	Where         *WhereClause
+	GroupBy       []string
+	Having        *WhereClause
+	OrderBy       []OrderByClause
+	VectorOrderBy *VectorOrderBy // Add this
+	Limit         int
+	Offset        int
+}
+
+// VectorOrderBy represents ORDER BY with vector distance
+type VectorOrderBy struct {
+	Function    string // "COSINE_DISTANCE", "L2_DISTANCE"
+	Column      string
+	QueryVector []float32
+	Descending  bool
 }
 
 func (s *SelectStmt) StatementNode() {}
@@ -149,3 +161,10 @@ type ShowMetadataStmt struct {
 }
 
 func (s *ShowMetadataStmt) StatementNode() {}
+
+// AggregateFunc represents aggregate functions
+type AggregateFunc struct {
+	Function string // COUNT, SUM, AVG, MAX, MIN
+	Column   string
+	Alias    string
+}

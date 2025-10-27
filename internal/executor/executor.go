@@ -232,7 +232,29 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		}
 
 		for i, colName := range colNames {
-			row[colName] = values[i]
+			val := values[i]
+
+			// Check if this column is a VECTOR type
+			var colType storage.DataType
+			for _, col := range table.Columns {
+				if col.Name == colName {
+					colType = col.Type
+					break
+				}
+			}
+
+			// Parse vector if needed
+			if colType == storage.TypeVector {
+				if strVal, ok := val.(string); ok {
+					vec, err := storage.ParseVector(strVal)
+					if err != nil {
+						return nil, fmt.Errorf("invalid vector format for column %s: %w", colName, err)
+					}
+					val = vec
+				}
+			}
+
+			row[colName] = val
 		}
 
 		if err := table.Insert(row); err != nil {
@@ -270,6 +292,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, err
 	}
 
+	// Check if this is a vector similarity search
+	if stmt.VectorOrderBy != nil {
+		return e.executeVectorSearch(stmt, rows, table)
+	}
+
+	// Check if this is an aggregate query
+	if len(stmt.Aggregates) > 0 {
+		return e.executeAggregateSelect(stmt, rows)
+	}
+
 	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
 		rows = e.applyOrderBy(rows, stmt.OrderBy)
@@ -297,6 +329,144 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		Rows:    rows,
 		Columns: columns,
 	}, nil
+}
+
+func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storage.Row) (*Result, error) {
+	// Convert parser aggregates to storage aggregates
+	aggregates := make([]storage.AggregateSpec, len(stmt.Aggregates))
+	for i, agg := range stmt.Aggregates {
+		aggregates[i] = storage.AggregateSpec{
+			Function: agg.Function,
+			Column:   agg.Column,
+			Alias:    agg.Alias,
+		}
+	}
+
+	// Handle GROUP BY
+	if len(stmt.GroupBy) > 0 {
+		return e.executeGroupBy(stmt, rows, aggregates)
+	}
+
+	// Simple aggregation without GROUP BY
+	results, err := storage.ComputeAggregates(rows, aggregates)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build result row
+	resultRow := make(storage.Row)
+	columns := make([]string, 0)
+
+	// Add regular columns (if any)
+	for _, col := range stmt.Columns {
+		if col != "" && col != "*" {
+			columns = append(columns, col)
+			if len(rows) > 0 {
+				resultRow[col] = rows[0][col]
+			}
+		}
+	}
+
+	// Add aggregate results
+	for _, res := range results {
+		columns = append(columns, res.Alias)
+		resultRow[res.Alias] = res.Value
+	}
+
+	return &Result{
+		Rows:    []storage.Row{resultRow},
+		Columns: columns,
+	}, nil
+}
+
+func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, aggregates []storage.AggregateSpec) (*Result, error) {
+	// Group rows
+	groups := storage.GroupRows(rows, stmt.GroupBy)
+
+	// Compute aggregates for each group
+	resultRows := make([]storage.Row, 0, len(groups))
+	columns := make([]string, 0)
+
+	// Add GROUP BY columns
+	columns = append(columns, stmt.GroupBy...)
+
+	// Add aggregate column names
+	for _, agg := range aggregates {
+		columns = append(columns, agg.Alias)
+	}
+
+	for _, group := range groups {
+		row := make(storage.Row)
+
+		// Add group key values
+		for col, val := range group.GroupKey {
+			row[col] = val
+		}
+
+		// Compute and add aggregates
+		aggResults, err := storage.ComputeAggregates(group.Rows, aggregates)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, res := range aggResults {
+			row[res.Alias] = res.Value
+		}
+
+		// Apply HAVING filter if present
+		if stmt.Having != nil {
+			having := convertWhereClause(stmt.Having)
+			if !evaluateWhereOnRow(row, having) {
+				continue
+			}
+		}
+
+		resultRows = append(resultRows, row)
+	}
+
+	// Apply ORDER BY on grouped results
+	if len(stmt.OrderBy) > 0 {
+		resultRows = e.applyOrderBy(resultRows, stmt.OrderBy)
+	}
+
+	// Apply LIMIT and OFFSET
+	if stmt.Offset > 0 && stmt.Offset < len(resultRows) {
+		resultRows = resultRows[stmt.Offset:]
+	}
+
+	if stmt.Limit > 0 && stmt.Limit < len(resultRows) {
+		resultRows = resultRows[:stmt.Limit]
+	}
+
+	return &Result{
+		Rows:    resultRows,
+		Columns: columns,
+	}, nil
+}
+
+// Helper function to evaluate WHERE on a single row
+func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
+	val, exists := row[where.Column]
+	if !exists {
+		return false
+	}
+
+	switch where.Operator {
+	case "=":
+		return compareValues(val, where.Value) == 0
+	case "!=", "<>":
+		return compareValues(val, where.Value) != 0
+	case "<":
+		return compareValues(val, where.Value) < 0
+	case "<=":
+		return compareValues(val, where.Value) <= 0
+	case ">":
+		return compareValues(val, where.Value) > 0
+	case ">=":
+		return compareValues(val, where.Value) >= 0
+	default:
+		return false
+	}
 }
 
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
@@ -641,5 +811,72 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 
 	return &Result{
 		Message: fmt.Sprintf("COMMENT ON COLUMN %s.%s", stmt.TableName, stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.Row, table *storage.Table) (*Result, error) {
+	// Create query vector
+	queryVector := storage.NewVector(stmt.VectorOrderBy.QueryVector)
+
+	// Determine distance metric
+	var metric storage.VectorDistance
+	switch stmt.VectorOrderBy.Function {
+	case "COSINE_DISTANCE":
+		metric = storage.DistanceCosine
+	case "L2_DISTANCE":
+		metric = storage.DistanceL2
+	default:
+		return nil, fmt.Errorf("unsupported distance function: %s", stmt.VectorOrderBy.Function)
+	}
+
+	// Perform vector search
+	limit := len(rows)
+	if stmt.Limit > 0 {
+		limit = stmt.Limit
+	}
+
+	results, err := storage.VectorSearch(rows, queryVector, stmt.VectorOrderBy.Column, metric, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply offset
+	if stmt.Offset > 0 && stmt.Offset < len(results) {
+		results = results[stmt.Offset:]
+	}
+
+	// Build result rows with distance
+	resultRows := make([]storage.Row, len(results))
+	for i, res := range results {
+		resultRows[i] = make(storage.Row)
+
+		// Copy requested columns
+		for _, col := range stmt.Columns {
+			if col == "*" {
+				// Copy all columns
+				for k, v := range res.Row {
+					resultRows[i][k] = v
+				}
+			} else {
+				resultRows[i][col] = res.Row[col]
+			}
+		}
+
+		// Always add distance
+		resultRows[i]["_distance"] = fmt.Sprintf("%.6f", res.Distance)
+	}
+
+	// Build columns list
+	columns := stmt.Columns
+	if len(columns) == 1 && columns[0] == "*" {
+		columns = table.GetColumnNames()
+	}
+
+	// Always append _distance to visible columns
+	columns = append(columns, "_distance")
+
+	return &Result{
+		Rows:    resultRows,
+		Columns: columns,
 	}, nil
 }

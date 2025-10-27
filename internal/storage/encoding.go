@@ -1,3 +1,4 @@
+// internal/storage/encoding.go
 package storage
 
 import (
@@ -26,6 +27,11 @@ func EncodeRow(columns []Column, row Row) ([]byte, error) {
 			case TypeText, TypeVarChar:
 				str := fmt.Sprintf("%v", val)
 				size += 4 + len(str) // 4 bytes for length + string data
+			case TypeVector:
+				vec, ok := val.(*Vector)
+				if ok {
+					size += 4 + (vec.Dimensions * 4) // 4 bytes for dim count + 4 bytes per float32
+				}
 			}
 		}
 	}
@@ -64,7 +70,7 @@ func EncodeRow(columns []Column, row Row) ([]byte, error) {
 			offset += 8
 
 		case TypeFloat:
-			floatVal := toFloat64(val)
+			floatVal, _ := toFloat64(val)
 			binary.LittleEndian.PutUint64(buf[offset:], math.Float64bits(floatVal))
 			offset += 8
 
@@ -83,6 +89,22 @@ func EncodeRow(columns []Column, row Row) ([]byte, error) {
 			offset += 4
 			copy(buf[offset:], []byte(str))
 			offset += len(str)
+
+		case TypeVector:
+			vec, ok := val.(*Vector)
+			if !ok {
+				return nil, fmt.Errorf("expected *Vector for VECTOR type")
+			}
+
+			// Write dimension count (4 bytes)
+			binary.LittleEndian.PutUint32(buf[offset:], uint32(vec.Dimensions))
+			offset += 4
+
+			// Write each float32 value (4 bytes each)
+			for _, v := range vec.Values {
+				binary.LittleEndian.PutUint32(buf[offset:], math.Float32bits(v))
+				offset += 4
+			}
 		}
 	}
 
@@ -168,6 +190,26 @@ func DecodeRow(columns []Column, data []byte) (Row, error) {
 			str := string(data[offset : offset+int(strLen)])
 			row[col.Name] = str
 			offset += int(strLen)
+
+		case TypeVector:
+			if offset+4 > len(data) {
+				return nil, fmt.Errorf("unexpected end of data for VECTOR dimensions")
+			}
+
+			dimensions := int(binary.LittleEndian.Uint32(data[offset:]))
+			offset += 4
+
+			values := make([]float32, dimensions)
+			for i := 0; i < dimensions; i++ {
+				if offset+4 > len(data) {
+					return nil, fmt.Errorf("unexpected end of data for VECTOR values")
+				}
+				bits := binary.LittleEndian.Uint32(data[offset:])
+				values[i] = math.Float32frombits(bits)
+				offset += 4
+			}
+
+			row[col.Name] = NewVector(values)
 		}
 	}
 
@@ -205,18 +247,18 @@ func toInt64(val interface{}) int64 {
 	}
 }
 
-func toFloat64(val interface{}) float64 {
+func toFloat64(val interface{}) (float64, error) {
 	switch v := val.(type) {
 	case float64:
-		return v
+		return v, nil
 	case float32:
-		return float64(v)
+		return float64(v), nil
 	case int:
-		return float64(v)
+		return float64(v), nil
 	case int64:
-		return float64(v)
+		return float64(v), nil
 	default:
-		return 0
+		return 0, fmt.Errorf("cannot convert to float64")
 	}
 }
 

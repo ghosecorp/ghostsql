@@ -455,6 +455,17 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		col.Type = storage.TypeBoolean
 	case "VECTOR":
 		col.Type = storage.TypeVector
+		// Optional: parse dimension VECTOR(384)
+		p.nextToken()
+		if p.current.Type == TOKEN_LPAREN {
+			// Skip dimension for now, just consume it
+			p.nextToken() // consume (
+			p.nextToken() // consume number
+			p.nextToken() // consume )
+		} else {
+			// Put back the token we just consumed
+			return col, nil
+		}
 	default:
 		return col, fmt.Errorf("unknown type: %s", typeName)
 	}
@@ -512,23 +523,46 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 	values := []interface{}{}
 	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
 		var val interface{}
-		switch p.current.Type {
-		case TOKEN_NUMBER:
-			// Check if it's a float or int
-			if strings.Contains(p.current.Literal, ".") {
-				num, _ := strconv.ParseFloat(p.current.Literal, 64)
-				val = num
-			} else {
-				num, _ := strconv.Atoi(p.current.Literal)
-				val = num
+
+		if p.current.Type == TOKEN_LBRACKET {
+			// Parse vector array [0.1, 0.2, 0.3]
+			vectorStr := "["
+			p.nextToken()
+			for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
+				vectorStr += p.current.Literal
+				p.nextToken()
+				if p.current.Type == TOKEN_COMMA {
+					vectorStr += ","
+					p.nextToken()
+				}
 			}
-		case TOKEN_STRING:
-			val = p.current.Literal
-		default:
-			return nil, fmt.Errorf("unexpected value type: %s (literal: %s)", p.current.Type, p.current.Literal)
+			if p.current.Type != TOKEN_RBRACKET {
+				return nil, fmt.Errorf("expected ]")
+			}
+			vectorStr += "]"
+			val = vectorStr // Store as string, will be parsed by executor
+			p.nextToken()   // consume ]
+		} else {
+			// Regular value parsing
+			switch p.current.Type {
+			case TOKEN_NUMBER:
+				if strings.Contains(p.current.Literal, ".") {
+					num, _ := strconv.ParseFloat(p.current.Literal, 64)
+					val = num
+				} else {
+					num, _ := strconv.Atoi(p.current.Literal)
+					val = num
+				}
+			case TOKEN_STRING:
+				val = p.current.Literal
+			default:
+				return nil, fmt.Errorf("unexpected value type: %s (literal: %s)", p.current.Type, p.current.Literal)
+			}
+			p.nextToken()
 		}
+
 		values = append(values, val)
-		p.nextToken()
+
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
 		}
@@ -547,16 +581,23 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 	p.nextToken() // consume SELECT
 
-	// Parse columns
+	// Parse columns and aggregates
 	for p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF {
-		switch p.current.Type {
-		case TOKEN_ASTERISK:
+		// Check for aggregate functions
+		if p.isAggregateFunction(p.current.Type) {
+			agg, err := p.parseAggregate()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Aggregates = append(stmt.Aggregates, agg)
+		} else if p.current.Type == TOKEN_ASTERISK {
 			stmt.Columns = append(stmt.Columns, "*")
 			p.nextToken()
-		case TOKEN_IDENT:
+		} else if p.current.Type == TOKEN_IDENT {
 			stmt.Columns = append(stmt.Columns, p.current.Literal)
 			p.nextToken()
 		}
+
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
 		}
@@ -584,6 +625,40 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Where = where
 	}
 
+	// Parse GROUP BY
+	if p.current.Type == TOKEN_GROUP {
+		p.nextToken()
+		if p.current.Type != TOKEN_BY {
+			return nil, fmt.Errorf("expected BY after GROUP")
+		}
+		p.nextToken()
+
+		for {
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected column name in GROUP BY")
+			}
+			stmt.GroupBy = append(stmt.GroupBy, p.current.Literal)
+			p.nextToken()
+
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+				continue
+			}
+			break
+		}
+	}
+
+	// Parse HAVING
+	if p.current.Type == TOKEN_HAVING {
+		p.nextToken()
+		having, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Having = having
+	}
+
+	// Parse ORDER BY
 	// Parse ORDER BY
 	if p.current.Type == TOKEN_ORDER {
 		p.nextToken()
@@ -592,32 +667,41 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		}
 		p.nextToken()
 
-		for {
-			if p.current.Type != TOKEN_IDENT {
-				return nil, fmt.Errorf("expected column name in ORDER BY")
+		// Check for vector distance function
+		if p.isVectorDistanceFunc(p.current.Type) {
+			vectorOrder, err := p.parseVectorOrderBy()
+			if err != nil {
+				return nil, err
 			}
+			stmt.VectorOrderBy = vectorOrder
+		} else {
+			// Regular ORDER BY
+			for {
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name in ORDER BY")
+				}
 
-			orderBy := OrderByClause{
-				Column:     p.current.Literal,
-				Descending: false,
-			}
-			p.nextToken()
-
-			// Check for DESC
-			if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
-				orderBy.Descending = true
+				orderBy := OrderByClause{
+					Column:     p.current.Literal,
+					Descending: false,
+				}
 				p.nextToken()
-			} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ASC" {
-				p.nextToken()
-			}
 
-			stmt.OrderBy = append(stmt.OrderBy, orderBy)
+				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
+					orderBy.Descending = true
+					p.nextToken()
+				} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ASC" {
+					p.nextToken()
+				}
 
-			if p.current.Type == TOKEN_COMMA {
-				p.nextToken()
-				continue
+				stmt.OrderBy = append(stmt.OrderBy, orderBy)
+
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+					continue
+				}
+				break
 			}
-			break
 		}
 	}
 
@@ -644,6 +728,54 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	}
 
 	return stmt, nil
+}
+
+func (p *Parser) isAggregateFunction(t TokenType) bool {
+	return t == TOKEN_COUNT || t == TOKEN_SUM || t == TOKEN_AVG || t == TOKEN_MAX || t == TOKEN_MIN
+}
+
+func (p *Parser) parseAggregate() (AggregateFunc, error) {
+	agg := AggregateFunc{}
+
+	// Get function name
+	agg.Function = strings.ToUpper(p.current.Literal)
+	p.nextToken()
+
+	if p.current.Type != TOKEN_LPAREN {
+		return agg, fmt.Errorf("expected ( after aggregate function")
+	}
+	p.nextToken()
+
+	// Parse column or *
+	switch p.current.Type {
+	case TOKEN_ASTERISK:
+		agg.Column = "*"
+	case TOKEN_IDENT:
+		agg.Column = p.current.Literal
+	default:
+		return agg, fmt.Errorf("expected column name or * in aggregate function")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_RPAREN {
+		return agg, fmt.Errorf("expected ) after aggregate function")
+	}
+	p.nextToken()
+
+	// Optional AS alias
+	if p.current.Type == TOKEN_AS {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			return agg, fmt.Errorf("expected alias after AS")
+		}
+		agg.Alias = p.current.Literal
+		p.nextToken()
+	} else {
+		// Default alias
+		agg.Alias = strings.ToLower(agg.Function) + "_" + agg.Column
+	}
+
+	return agg, nil
 }
 
 func (p *Parser) parseWhere() (*WhereClause, error) {
@@ -789,4 +921,88 @@ func (p *Parser) parseComment() (*CommentStmt, error) {
 	p.nextToken()
 
 	return stmt, nil
+}
+
+func (p *Parser) isVectorDistanceFunc(t TokenType) bool {
+	return t == TOKEN_COSINE_DISTANCE || t == TOKEN_L2_DISTANCE
+}
+
+func (p *Parser) parseVectorOrderBy() (*VectorOrderBy, error) {
+	vo := &VectorOrderBy{}
+
+	// Get function name
+	vo.Function = strings.ToUpper(p.current.Literal)
+	p.nextToken()
+
+	if p.current.Type != TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected ( after %s", vo.Function)
+	}
+	p.nextToken()
+
+	// Parse column name
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected column name")
+	}
+	vo.Column = p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_COMMA {
+		return nil, fmt.Errorf("expected , after column name")
+	}
+	p.nextToken()
+
+	// Parse query vector [0.1, 0.2, 0.3]
+	switch p.current.Type {
+	case TOKEN_LBRACKET:
+		values := make([]float32, 0)
+		p.nextToken()
+
+		for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
+			if p.current.Type == TOKEN_NUMBER {
+				var val float64
+				if strings.Contains(p.current.Literal, ".") {
+					val, _ = strconv.ParseFloat(p.current.Literal, 64)
+				} else {
+					intVal, _ := strconv.Atoi(p.current.Literal)
+					val = float64(intVal)
+				}
+				values = append(values, float32(val))
+			}
+			p.nextToken()
+
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			}
+		}
+
+		if p.current.Type != TOKEN_RBRACKET {
+			return nil, fmt.Errorf("expected ]")
+		}
+		p.nextToken()
+
+		vo.QueryVector = values
+	case TOKEN_STRING:
+		// Parse from string '[0.1, 0.2, 0.3]'
+		vec, err := storage.ParseVector(p.current.Literal)
+		if err != nil {
+			return nil, fmt.Errorf("invalid vector: %w", err)
+		}
+		vo.QueryVector = vec.Values
+		p.nextToken()
+	default:
+		return nil, fmt.Errorf("expected vector array or string")
+	}
+
+	if p.current.Type != TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ) after vector")
+	}
+	p.nextToken()
+
+	// Check for DESC/ASC
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
+		vo.Descending = true
+		p.nextToken()
+	}
+
+	return vo, nil
 }
