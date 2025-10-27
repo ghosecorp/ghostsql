@@ -256,10 +256,11 @@ func (db *Database) loadTableBinaryFromPath(tablePath string, tableName string) 
 	}
 
 	table := &Table{
-		Name:    tableName,
-		Columns: columns,
-		Pages:   make([]*SlottedPage, 0, numPages),
-		Rows:    make([]Row, 0),
+		Name:          tableName,
+		Columns:       columns,
+		Pages:         make([]*SlottedPage, 0, numPages),
+		Rows:          make([]Row, 0),
+		VectorIndexes: make(map[string]*HNSWIndex),
 	}
 
 	// Read pages

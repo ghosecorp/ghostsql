@@ -21,23 +21,25 @@ type Row map[string]interface{}
 
 // Table represents a database table with binary storage
 type Table struct {
-	Name     string
-	Columns  []Column
-	Rows     []Row // In-memory cache
-	Pages    []*SlottedPage
-	PageMgr  *PageManager
-	Metadata *metadata.Metadata
-	mu       sync.RWMutex
+	Name          string
+	Columns       []Column
+	Rows          []Row // In-memory cache
+	Pages         []*SlottedPage
+	PageMgr       *PageManager
+	Metadata      *metadata.Metadata
+	VectorIndexes map[string]*HNSWIndex // column_name -> index
+	mu            sync.RWMutex
 }
 
 // NewTable creates a new table
 func NewTable(name string, columns []Column, meta *metadata.Metadata) *Table {
 	return &Table{
-		Name:     name,
-		Columns:  columns,
-		Rows:     make([]Row, 0),
-		Pages:    make([]*SlottedPage, 0),
-		Metadata: meta,
+		Name:          name,
+		Columns:       columns,
+		Rows:          make([]Row, 0),
+		Pages:         make([]*SlottedPage, 0),
+		Metadata:      meta,
+		VectorIndexes: make(map[string]*HNSWIndex),
 	}
 }
 

@@ -65,8 +65,10 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return p.parseCreateDatabase()
 	case TOKEN_TABLE:
 		return p.parseCreateTable()
+	case TOKEN_INDEX:
+		return p.parseCreateIndex()
 	default:
-		return nil, fmt.Errorf("expected DATABASE or TABLE after CREATE")
+		return nil, fmt.Errorf("expected DATABASE, TABLE, or INDEX after CREATE")
 	}
 }
 
@@ -177,8 +179,10 @@ func (p *Parser) parseDrop() (Statement, error) {
 		return p.parseDropTable()
 	case TOKEN_DATABASE:
 		return p.parseDropDatabase()
+	case TOKEN_INDEX:
+		return p.parseDropIndex()
 	default:
-		return nil, fmt.Errorf("expected TABLE or DATABASE after DROP")
+		return nil, fmt.Errorf("expected TABLE, DATABASE, or INDEX after DROP")
 	}
 }
 
@@ -1005,4 +1009,127 @@ func (p *Parser) parseVectorOrderBy() (*VectorOrderBy, error) {
 	}
 
 	return vo, nil
+}
+
+func (p *Parser) parseCreateIndex() (*CreateIndexStmt, error) {
+	stmt := &CreateIndexStmt{
+		Options: make(map[string]int),
+	}
+
+	p.nextToken() // consume INDEX
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected index name")
+	}
+	stmt.IndexName = p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_ON {
+		return nil, fmt.Errorf("expected ON")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+
+	// Optional USING
+	if p.current.Type == TOKEN_USING {
+		p.nextToken()
+		switch p.current.Type {
+		case TOKEN_HNSW:
+			stmt.IndexType = "HNSW"
+		case TOKEN_BTREE:
+			stmt.IndexType = "BTREE"
+		default:
+			return nil, fmt.Errorf("expected HNSW or BTREE")
+		}
+		p.nextToken()
+	} else {
+		stmt.IndexType = "BTREE" // default
+	}
+
+	// Parse column
+	if p.current.Type != TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected (")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected column name")
+	}
+	stmt.ColumnName = p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected )")
+	}
+	p.nextToken()
+
+	// Parse WITH options for HNSW
+	if p.current.Type == TOKEN_WITH {
+		p.nextToken()
+		if p.current.Type != TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected (")
+		}
+		p.nextToken()
+
+		// Parse m=16, ef_construction=200
+		for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected option name")
+			}
+			optionName := p.current.Literal
+			p.nextToken()
+
+			if p.current.Type != TOKEN_EQUALS {
+				return nil, fmt.Errorf("expected =")
+			}
+			p.nextToken()
+
+			if p.current.Type != TOKEN_NUMBER {
+				return nil, fmt.Errorf("expected number")
+			}
+			value, _ := strconv.Atoi(p.current.Literal)
+			stmt.Options[optionName] = value
+			p.nextToken()
+
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			}
+		}
+
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected )")
+		}
+		p.nextToken()
+	}
+
+	// Set defaults if not specified
+	if stmt.IndexType == "HNSW" {
+		if _, exists := stmt.Options["m"]; !exists {
+			stmt.Options["m"] = 16
+		}
+		if _, exists := stmt.Options["ef_construction"]; !exists {
+			stmt.Options["ef_construction"] = 200
+		}
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
+	stmt := &DropIndexStmt{}
+
+	p.nextToken() // consume INDEX
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected index name")
+	}
+	stmt.IndexName = p.current.Literal
+	p.nextToken()
+
+	return stmt, nil
 }

@@ -168,3 +168,21 @@ type AggregateFunc struct {
 	Column   string
 	Alias    string
 }
+
+// CreateIndexStmt represents CREATE INDEX
+type CreateIndexStmt struct {
+	IndexName  string
+	TableName  string
+	ColumnName string
+	IndexType  string         // "HNSW", "BTREE", etc.
+	Options    map[string]int // m, ef_construction, etc.
+}
+
+func (s *CreateIndexStmt) StatementNode() {}
+
+// DropIndexStmt represents DROP INDEX
+type DropIndexStmt struct {
+	IndexName string
+}
+
+func (s *DropIndexStmt) StatementNode() {}

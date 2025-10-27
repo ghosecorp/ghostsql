@@ -54,6 +54,10 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeAlterTable(s)
 	case *parser.CommentStmt: // ADD THIS LINE
 		return e.executeComment(s) // ADD THIS LINE
+	case *parser.CreateIndexStmt:
+		return e.executeCreateIndex(s)
+	case *parser.DropIndexStmt:
+		return e.executeDropIndex(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -815,10 +819,8 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 }
 
 func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.Row, table *storage.Table) (*Result, error) {
-	// Create query vector
 	queryVector := storage.NewVector(stmt.VectorOrderBy.QueryVector)
 
-	// Determine distance metric
 	var metric storage.VectorDistance
 	switch stmt.VectorOrderBy.Function {
 	case "COSINE_DISTANCE":
@@ -829,31 +831,52 @@ func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.R
 		return nil, fmt.Errorf("unsupported distance function: %s", stmt.VectorOrderBy.Function)
 	}
 
-	// Perform vector search
 	limit := len(rows)
 	if stmt.Limit > 0 {
 		limit = stmt.Limit
 	}
 
-	results, err := storage.VectorSearch(rows, queryVector, stmt.VectorOrderBy.Column, metric, limit)
-	if err != nil {
-		return nil, err
+	var results []storage.VectorSearchResult
+	var err error
+
+	// Check if HNSW index exists for this column
+	if index, exists := table.VectorIndexes[stmt.VectorOrderBy.Column]; exists {
+		// Use HNSW index - O(log n)
+		ef := limit * 2 // ef_search parameter
+		if ef < 50 {
+			ef = 50
+		}
+		results, err = index.Search(queryVector, limit, ef)
+		if err != nil {
+			return nil, err
+		}
+
+		// Map row IDs back to actual rows
+		for i := range results {
+			rowID := results[i].Row["_row_id"].(int)
+			if rowID < len(rows) {
+				results[i].Row = rows[rowID]
+			}
+		}
+	} else {
+		// Use brute-force - O(n)
+		results, err = storage.VectorSearch(rows, queryVector, stmt.VectorOrderBy.Column, metric, limit)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Apply offset
+	// Rest of the function stays the same...
 	if stmt.Offset > 0 && stmt.Offset < len(results) {
 		results = results[stmt.Offset:]
 	}
 
-	// Build result rows with distance
 	resultRows := make([]storage.Row, len(results))
 	for i, res := range results {
 		resultRows[i] = make(storage.Row)
 
-		// Copy requested columns
 		for _, col := range stmt.Columns {
 			if col == "*" {
-				// Copy all columns
 				for k, v := range res.Row {
 					resultRows[i][k] = v
 				}
@@ -862,21 +885,89 @@ func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.R
 			}
 		}
 
-		// Always add distance
 		resultRows[i]["_distance"] = fmt.Sprintf("%.6f", res.Distance)
 	}
 
-	// Build columns list
 	columns := stmt.Columns
 	if len(columns) == 1 && columns[0] == "*" {
 		columns = table.GetColumnNames()
 	}
-
-	// Always append _distance to visible columns
 	columns = append(columns, "_distance")
 
 	return &Result{
 		Rows:    resultRows,
 		Columns: columns,
+	}, nil
+}
+
+func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	}
+
+	// Initialize VectorIndexes map if nil
+	if table.VectorIndexes == nil {
+		table.VectorIndexes = make(map[string]*storage.HNSWIndex)
+	}
+
+	// Find column
+	var colType storage.DataType
+	found := false
+	for _, col := range table.Columns {
+		if col.Name == stmt.ColumnName {
+			colType = col.Type
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("column %s not found", stmt.ColumnName)
+	}
+
+	// Only HNSW for VECTOR columns
+	if stmt.IndexType == "HNSW" {
+		if colType != storage.TypeVector {
+			return nil, fmt.Errorf("HNSW index only supported on VECTOR columns")
+		}
+
+		// Create HNSW index
+		m := stmt.Options["m"]
+		efConstruction := stmt.Options["ef_construction"]
+
+		index := storage.NewHNSWIndex(m, efConstruction, storage.DistanceCosine)
+
+		// Build index from existing data
+		for i, row := range table.Rows {
+			if vec, ok := row[stmt.ColumnName].(*storage.Vector); ok {
+				if err := index.Add(vec, i); err != nil {
+					return nil, fmt.Errorf("failed to build index: %w", err)
+				}
+			}
+		}
+
+		// Store index
+		table.VectorIndexes[stmt.ColumnName] = index
+
+		return &Result{
+			Message: fmt.Sprintf("CREATE INDEX %s ON %s USING HNSW (m=%d, ef_construction=%d)",
+				stmt.IndexName, stmt.TableName, m, efConstruction),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported index type: %s", stmt.IndexType)
+}
+
+func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
+	// For now, we store indexes by column name, not index name
+	// In production, you'd maintain an index registry
+	return &Result{
+		Message: fmt.Sprintf("DROP INDEX %s (not fully implemented)", stmt.IndexName),
 	}, nil
 }
