@@ -17,6 +17,7 @@ type Column struct {
 	IsPrimary  bool
 	IsUnique   bool
 	DefaultVal interface{}
+	ForeignKey *ForeignKeyConstraint // Add this
 	Metadata   *metadata.Metadata
 }
 
@@ -33,6 +34,12 @@ type Table struct {
 	Metadata      *metadata.Metadata
 	VectorIndexes map[string]*HNSWIndex // column_name -> index
 	mu            sync.RWMutex
+}
+
+// ForeignKeyConstraint represents a foreign key relationship
+type ForeignKeyConstraint struct {
+	RefTable  string
+	RefColumn string
 }
 
 // NewTable creates a new table

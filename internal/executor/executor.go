@@ -181,15 +181,23 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 
 	columns := make([]storage.Column, len(stmt.Columns))
 	for i, colDef := range stmt.Columns {
-		columns[i] = storage.Column{
-			Name:       colDef.Name,
-			Type:       colDef.Type,
-			Length:     colDef.Length,
-			Nullable:   colDef.Nullable,
-			IsPrimary:  colDef.IsPrimary,  // ADD THIS LINE
-			IsUnique:   colDef.IsUnique,   // ADD THIS LINE
-			DefaultVal: colDef.DefaultVal, // ADD THIS LINE
+		col := storage.Column{
+			Name:      colDef.Name,
+			Type:      colDef.Type,
+			Length:    colDef.Length,
+			Nullable:  colDef.Nullable,
+			IsPrimary: colDef.IsPrimary,
 		}
+
+		// Add foreign key if specified
+		if colDef.ForeignKey != nil {
+			col.ForeignKey = &storage.ForeignKeyConstraint{
+				RefTable:  colDef.ForeignKey.RefTable,
+				RefColumn: colDef.ForeignKey.RefColumn,
+			}
+		}
+
+		columns[i] = col
 	}
 
 	var tableMeta *metadata.Metadata
@@ -244,10 +252,32 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 
 			// Find column definition
 			var colDef storage.Column
+			// After building the row, validate foreign keys
 			for _, col := range table.Columns {
-				if col.Name == colName {
-					colDef = col
-					break
+				if col.ForeignKey != nil {
+					fkValue := row[col.Name]
+					if fkValue == nil && col.Nullable {
+						continue // NULL is allowed if column is nullable
+					}
+
+					// Check if referenced value exists
+					refTable, exists := dbInstance.Tables[col.ForeignKey.RefTable]
+					if !exists {
+						return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
+					}
+
+					found := false
+					for _, refRow := range refTable.Rows {
+						if compareValues(refRow[col.ForeignKey.RefColumn], fkValue) == 0 {
+							found = true
+							break
+						}
+					}
+
+					if !found {
+						return nil, fmt.Errorf("foreign key constraint failed: value %v not found in %s.%s",
+							fkValue, col.ForeignKey.RefTable, col.ForeignKey.RefColumn)
+					}
 				}
 			}
 
@@ -710,7 +740,6 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 }
 
 func compareValues(a, b interface{}) int {
-	// Try numeric comparison
 	aInt, aIsInt := toComparableInt(a)
 	bInt, bIsInt := toComparableInt(b)
 
@@ -723,7 +752,6 @@ func compareValues(a, b interface{}) int {
 		return 0
 	}
 
-	// String comparison
 	aStr := fmt.Sprintf("%v", a)
 	bStr := fmt.Sprintf("%v", b)
 

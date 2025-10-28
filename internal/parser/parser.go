@@ -520,28 +520,59 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 			break
 		}
 
-		// Handle NULL token type (if defined as keyword)
+		// Handle TOKEN_NULL directly
 		if p.current.Type == TOKEN_NULL {
 			col.Nullable = true
 			p.nextToken()
 			continue
 		}
 
+		// Handle TOKEN_REFERENCES directly
+		if p.current.Type == TOKEN_REFERENCES {
+			// Parse FOREIGN KEY: REFERENCES table(column)
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return col, fmt.Errorf("expected table name after REFERENCES")
+			}
+			refTable := p.current.Literal
+			p.nextToken()
+
+			if p.current.Type != TOKEN_LPAREN {
+				return col, fmt.Errorf("expected ( after table name")
+			}
+			p.nextToken()
+
+			if p.current.Type != TOKEN_IDENT {
+				return col, fmt.Errorf("expected column name")
+			}
+			refColumn := p.current.Literal
+			p.nextToken()
+
+			if p.current.Type != TOKEN_RPAREN {
+				return col, fmt.Errorf("expected )")
+			}
+			p.nextToken()
+
+			col.ForeignKey = &ForeignKeyDef{
+				RefTable:  refTable,
+				RefColumn: refColumn,
+			}
+			continue
+		}
+
 		if p.current.Type == TOKEN_IDENT {
 			keyword := strings.ToUpper(p.current.Literal)
-
 			switch keyword {
 			case "NOT":
 				p.nextToken()
-				// Check for NULL as either TOKEN_NULL or TOKEN_IDENT
+				// Handle both TOKEN_NULL and "NULL" as identifier
 				if p.current.Type == TOKEN_NULL || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NULL") {
 					col.Nullable = false
 					p.nextToken()
 				} else {
-					return col, fmt.Errorf("expected NULL after NOT, got %s (literal: '%s')", p.current.Type, p.current.Literal)
+					return col, fmt.Errorf("expected NULL after NOT")
 				}
 			case "NULL":
-				// NULL as identifier (if not defined as keyword)
 				col.Nullable = true
 				p.nextToken()
 			case "PRIMARY":
@@ -550,43 +581,39 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 					col.IsPrimary = true
 					col.Nullable = false
 					p.nextToken()
-				} else {
-					return col, fmt.Errorf("expected KEY after PRIMARY, got %s (literal: '%s')", p.current.Type, p.current.Literal)
 				}
-			case "UNIQUE":
-				col.IsUnique = true
+			case "REFERENCES":
+				// Parse FOREIGN KEY: REFERENCES table(column)
 				p.nextToken()
-			case "DEFAULT":
+				if p.current.Type != TOKEN_IDENT {
+					return col, fmt.Errorf("expected table name after REFERENCES")
+				}
+				refTable := p.current.Literal
 				p.nextToken()
-				// Parse default value
-				switch p.current.Type {
-				case TOKEN_NUMBER:
-					if strings.Contains(p.current.Literal, ".") {
-						val, _ := strconv.ParseFloat(p.current.Literal, 64)
-						col.DefaultVal = val
-					} else {
-						val, _ := strconv.Atoi(p.current.Literal)
-						col.DefaultVal = val
-					}
-					p.nextToken()
-				case TOKEN_STRING:
-					col.DefaultVal = p.current.Literal
-					p.nextToken()
-				case TOKEN_NULL:
-					col.DefaultVal = nil
-					p.nextToken()
-				case TOKEN_IDENT:
-					if strings.ToUpper(p.current.Literal) == "NULL" {
-						col.DefaultVal = nil
-						p.nextToken()
-					} else {
-						return col, fmt.Errorf("unexpected default value: %s", p.current.Literal)
-					}
-				default:
-					return col, fmt.Errorf("expected default value, got %s", p.current.Type)
+
+				if p.current.Type != TOKEN_LPAREN {
+					return col, fmt.Errorf("expected ( after table name")
+				}
+				p.nextToken()
+
+				if p.current.Type != TOKEN_IDENT {
+					return col, fmt.Errorf("expected column name")
+				}
+				refColumn := p.current.Literal
+				p.nextToken()
+
+				if p.current.Type != TOKEN_RPAREN {
+					return col, fmt.Errorf("expected )")
+				}
+				p.nextToken()
+
+				col.ForeignKey = &ForeignKeyDef{
+					RefTable:  refTable,
+					RefColumn: refColumn,
 				}
 			default:
-				return col, fmt.Errorf("unexpected constraint: %s (after parsing column %s)", keyword, col.Name)
+				// Skip unknown keywords
+				p.nextToken()
 			}
 		} else {
 			break

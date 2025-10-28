@@ -46,8 +46,9 @@ type ColumnDef struct {
 	Type       storage.DataType
 	Length     int
 	Nullable   bool
-	IsPrimary  bool // PRIMARY KEY
-	IsUnique   bool // UNIQUE
+	IsPrimary  bool           // PRIMARY KEY
+	IsUnique   bool           // UNIQUE
+	ForeignKey *ForeignKeyDef // Add this
 	DefaultVal interface{}
 }
 
@@ -56,6 +57,12 @@ type InsertStmt struct {
 	TableName string
 	Columns   []string
 	Values    [][]interface{}
+}
+
+// ForeignKeyDef represents FOREIGN KEY constraint
+type ForeignKeyDef struct {
+	RefTable  string
+	RefColumn string
 }
 
 func (s *InsertStmt) StatementNode() {}

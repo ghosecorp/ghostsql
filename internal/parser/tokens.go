@@ -84,6 +84,10 @@ const (
 	TOKEN_DISTANCE
 
 	TOKEN_NULL
+
+	// Foreign Key
+	TOKEN_FOREIGN
+	TOKEN_REFERENCES
 )
 
 type Token struct {
@@ -164,6 +168,10 @@ func (t TokenType) String() string {
 		TOKEN_COSINE_DISTANCE: "COSINE_DISTANCE",
 		TOKEN_L2_DISTANCE:     "L2_DISTANCE",
 		TOKEN_DISTANCE:        "DISTANCE",
+
+		TOKEN_NULL:       "NULL",    // Add this
+		TOKEN_FOREIGN:    "FOREIGN", // Add this
+		TOKEN_REFERENCES: "REFERENCES",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -223,6 +231,8 @@ var keywords = map[string]TokenType{
 	"L2_DISTANCE":     TOKEN_L2_DISTANCE,
 	"DISTANCE":        TOKEN_DISTANCE,
 	"NULL":            TOKEN_NULL,
+	"FOREIGN":         TOKEN_FOREIGN,
+	"REFERENCES":      TOKEN_REFERENCES,
 }
 
 func LookupKeyword(ident string) TokenType {
