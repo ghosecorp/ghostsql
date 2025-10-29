@@ -1,112 +1,118 @@
-Table Storage:
-┌─────────────────────────────────────┐
-│ Table Header Page (Page 0)          │
-│ - Magic number                      │
-│ - Table schema                      │
-│ - Root B+tree page ID               │
-│ - Row count, statistics             │
-└─────────────────────────────────────┘
-           ↓
-┌─────────────────────────────────────┐
-│ B+Tree Index Pages                  │
-│ - Internal nodes (keys + page IDs)  │
-│ - Leaf nodes (keys + row data)      │
-└─────────────────────────────────────┘
-           ↓
-┌─────────────────────────────────────┐
-│ Data Pages                          │
-│ - Fixed/variable length rows        │
-│ - Slotted page format               │
-└─────────────────────────────────────┘
+***
 
-edwardsepiol@EdwardSepiol:/mnt/c/Users/anubr/anu_projects/ghosecorp/ghostsql$ make build
-Building GhostSQL server...
-go build -o bin/ghostsql-server ./cmd/ghostsql-server
-edwardsepiol@EdwardSepiol:/mnt/c/Users/anubr/anu_projects/ghosecorp/ghostsql$ make run
-Building GhostSQL server...
-go build -o bin/ghostsql-server ./cmd/ghostsql-server
-Starting GhostSQL server...
-./bin/ghostsql-server
-╔═══════════════════════════════════════╗
-║         GhostSQL Database             ║
-║     High-Performance SQL + Vectors    ║
-╚═══════════════════════════════════════╝
+# GhostSQL
 
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Initializing data directory...
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loading databases from disk...
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loaded 2 table(s) for database ghostsql
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loaded 2 table(s) for database myapp
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loaded 0 table(s) for database production
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loaded 0 table(s) for database staging
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Database initialized at: /mnt/c/Users/anubr/anu_projects/ghosecorp/ghostsql/bin/data
-[2025-10-27 19:11:47] [INFO] [GhostSQL] Loaded 4 database(s)
-GhostSQL Interactive Shell
-Type 'exit' or 'quit' to exit
+**GhostSQL** is a high-performance, PostgreSQL-compatible SQL database written in Go, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
 
-ghostsql[ghostsql]> CREATE INDEX embeddings_idx ON embeddings USING HNSW (embedding) WITH (m=16, ef_construction=200);
-CREATE INDEX embeddings_idx ON embeddings USING HNSW (m=16, ef_construction=200)
-ghostsql[ghostsql]> SELECT id, text FROM embeddings ORDER BY COSINE_DISTANCE(embedding, [0.1, 0.2, 0.3, 0.4]) LIMIT 2;
-id                  text                _distance
-------------------------------------------------------------
-1                   hello world         0.000000
-3                   test vector         0.002035
+## Features
 
-2 row(s)
+- **PostgreSQL-like SQL syntax**: Familiar for developers
+- **Vector support**: Store and search embeddings with `VECTOR` type
+- **HNSW Indexing**: Fast approximate nearest neighbor via `CREATE INDEX ... USING HNSW`
+- **Relational integrity**: JOIN (INNER, LEFT, RIGHT, FULL OUTER, CROSS), FOREIGN KEY, PRIMARY KEY, NOT NULL
+- **Data types**: INT, BIGINT, TEXT, VARCHAR(n), VECTOR(n), FLOAT, BOOLEAN
+- **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY/HAVING
+- **Other SQL**: WHERE, ORDER BY, LIMIT, OFFSET, LIKE
+- **Transaction-safe storage**: Binary format, slotted pages, persistence to disk
 
-ghostsql[ghostsql]>
+## Getting Started
 
+### Build & Run
 
--- Create embeddings table
-CREATE TABLE documents (
-    id INT,
-    title VARCHAR,
-    content TEXT,
-    embedding VECTOR
+```bash
+make build
+make run
+```
+
+### Example Database Creation
+
+```sql
+-- Create tables for employees and departments
+CREATE TABLE departments (
+    id INT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
 );
 
--- Insert documents with embeddings
-INSERT INTO documents VALUES (1, 'AI Tutorial', 'Learn AI', [0.8, 0.2, 0.1, 0.05]);
-INSERT INTO documents VALUES (2, 'ML Guide', 'Machine Learning', [0.85, 0.25, 0.15, 0.08]);
-INSERT INTO documents VALUES (3, 'Cooking', 'Recipe book', [0.1, 0.7, 0.8, 0.2]);
+CREATE TABLE employees (
+    id INT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    dept_id INT REFERENCES departments(id)
+);
 
--- Exact search (brute-force, 100% accurate)
-SELECT title FROM documents 
-ORDER BY COSINE_DISTANCE(embedding, [0.82, 0.22, 0.12, 0.06]) 
-LIMIT 3;
+-- Insert data
+INSERT INTO departments VALUES (1, 'Engineering');
+INSERT INTO departments VALUES (2, 'Sales');
+INSERT INTO employees VALUES (1, 'Alice', 1);
+INSERT INTO employees VALUES (2, 'Bob', 2);
 
--- Create HNSW index for fast approximate search
-CREATE INDEX docs_idx ON documents USING HNSW (embedding) WITH (m=16, ef_construction=200);
+-- Vector table example (pgvector style)
+CREATE TABLE embeddings (
+    id INT PRIMARY KEY,
+    text TEXT,
+    embedding VECTOR(4)
+);
 
--- Now 95-99% accurate but 100x faster!
-SELECT title FROM documents 
-ORDER BY COSINE_DISTANCE(embedding, [0.82, 0.22, 0.12, 0.06]) 
-LIMIT 3;
+INSERT INTO embeddings VALUES (1, 'hello world', [0.1, 0.2, 0.3, 0.4]);
+INSERT INTO embeddings VALUES (2, 'another', [0.2, 0.1, 0.3, 0.4]);
+```
 
+## JOINs and Relational Queries
 
-
--- Setup test data
-ghostsql[ghostsql]> CREATE TABLE departments (id INT PRIMARY KEY, name VARCHAR(100));
-ghostsql[ghostsql]> INSERT INTO departments VALUES (1, 'Engineering');
-ghostsql[ghostsql]> INSERT INTO departments VALUES (2, 'Sales');
-ghostsql[ghostsql]> INSERT INTO departments VALUES (3, 'Marketing');
-
-ghostsql[ghostsql]> CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR(100), dept_id INT);
-ghostsql[ghostsql]> INSERT INTO employees VALUES (1, 'Alice', 1);
-ghostsql[ghostsql]> INSERT INTO employees VALUES (2, 'Bob', 1);
-ghostsql[ghostsql]> INSERT INTO employees VALUES (3, 'Charlie', 2);
-ghostsql[ghostsql]> INSERT INTO employees VALUES (4, 'David', NULL);
-
--- INNER JOIN
-ghostsql[ghostsql]> SELECT employees.name, departments.name 
-FROM employees 
+```sql
+-- Find employees and their department names
+SELECT employees.name, departments.name
+FROM employees
 INNER JOIN departments ON employees.dept_id = departments.id;
 
--- LEFT JOIN (includes David with NULL dept)
-ghostsql[ghostsql]> SELECT employees.name, departments.name 
-FROM employees 
+-- Left join to get all employees, even without department
+SELECT employees.name, departments.name
+FROM employees
 LEFT JOIN departments ON employees.dept_id = departments.id;
 
--- RIGHT JOIN (includes Marketing with no employees)
-ghostsql[ghostsql]> SELECT employees.name, departments.name 
-FROM employees 
+-- Right join to get all departments, even if no employees exist
+SELECT employees.name, departments.name
+FROM employees
 RIGHT JOIN departments ON employees.dept_id = departments.id;
+```
+
+## Vector Search Example
+
+```sql
+-- Create vector index for fast similarity search
+CREATE INDEX embeddings_idx ON embeddings USING HNSW (embedding) WITH (m=16, ef_construction=200);
+
+-- Retrieve the two closest rows to a query vector (cosine similarity)
+SELECT id, text
+FROM embeddings
+ORDER BY COSINE_DISTANCE(embedding, [0.1, 0.2, 0.3, 0.4])
+LIMIT 2;
+```
+
+## Advanced SQL
+
+```sql
+-- Aggregates and grouping
+SELECT dept_id, COUNT(*) AS num_employees
+FROM employees
+GROUP BY dept_id
+HAVING COUNT(*) > 1;
+
+-- Filtering
+SELECT name FROM employees WHERE name LIKE '%Ali%';
+```
+
+## Getting Help
+
+- Run `SHOW TABLES` to list tables
+- Run `SHOW COLUMNS FROM table_name` for schema
+- Use `exit` or `quit` to leave the shell
+
+## Status
+
+**Beta** — GhostSQL is suitable for prototyping, RAG setups, local semantic search, and scalable microservice data. Production features (index persistence, full ACID transactions) coming soon.
+
+***
+
+**License**: Apache 2.0 (suggested)
+
+**Contributing**: Pull requests, GitHub issues, feature suggestions welcome!
