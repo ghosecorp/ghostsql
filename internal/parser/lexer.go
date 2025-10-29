@@ -106,6 +106,10 @@ func (l *Lexer) NextToken() Token {
 	case '\'', '"':
 		token.Type = TOKEN_STRING
 		token.Literal = l.readString(ch)
+	case '.':
+		token.Type = TOKEN_DOT
+		token.Literal = "."
+		l.advance()
 	default:
 		if unicode.IsLetter(rune(ch)) {
 			token.Literal = l.readIdentifier()

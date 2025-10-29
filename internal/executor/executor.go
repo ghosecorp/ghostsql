@@ -52,8 +52,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeTruncate(s)
 	case *parser.AlterTableStmt:
 		return e.executeAlterTable(s)
-	case *parser.CommentStmt: // ADD THIS LINE
-		return e.executeComment(s) // ADD THIS LINE
+	case *parser.CommentStmt:
+		return e.executeComment(s)
 	case *parser.CreateIndexStmt:
 		return e.executeCreateIndex(s)
 	case *parser.DropIndexStmt:
@@ -252,32 +252,10 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 
 			// Find column definition
 			var colDef storage.Column
-			// After building the row, validate foreign keys
 			for _, col := range table.Columns {
-				if col.ForeignKey != nil {
-					fkValue := row[col.Name]
-					if fkValue == nil && col.Nullable {
-						continue // NULL is allowed if column is nullable
-					}
-
-					// Check if referenced value exists
-					refTable, exists := dbInstance.Tables[col.ForeignKey.RefTable]
-					if !exists {
-						return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
-					}
-
-					found := false
-					for _, refRow := range refTable.Rows {
-						if compareValues(refRow[col.ForeignKey.RefColumn], fkValue) == 0 {
-							found = true
-							break
-						}
-					}
-
-					if !found {
-						return nil, fmt.Errorf("foreign key constraint failed: value %v not found in %s.%s",
-							fkValue, col.ForeignKey.RefTable, col.ForeignKey.RefColumn)
-					}
+				if col.Name == colName {
+					colDef = col
+					break
 				}
 			}
 
@@ -325,10 +303,37 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 
 				for _, existingRow := range table.Rows {
 					existingVal := existingRow[col.Name]
-					// Use compare function for proper comparison
 					if compareValues(newVal, existingVal) == 0 {
 						return nil, fmt.Errorf("duplicate value for PRIMARY KEY column %s: %v", col.Name, newVal)
 					}
+				}
+			}
+		}
+
+		// Validate foreign keys
+		for _, col := range table.Columns {
+			if col.ForeignKey != nil {
+				fkValue := row[col.Name]
+				if fkValue == nil && col.Nullable {
+					continue
+				}
+
+				refTable, exists := dbInstance.Tables[col.ForeignKey.RefTable]
+				if !exists {
+					return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
+				}
+
+				found := false
+				for _, refRow := range refTable.Rows {
+					if compareValues(refRow[col.ForeignKey.RefColumn], fkValue) == 0 {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					return nil, fmt.Errorf("foreign key constraint failed: value %v not found in %s.%s",
+						fkValue, col.ForeignKey.RefTable, col.ForeignKey.RefColumn)
 				}
 			}
 		}
@@ -358,14 +363,23 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
+	// Get initial rows from the main table
 	var where *storage.WhereClause
 	if stmt.Where != nil {
 		where = convertWhereClause(stmt.Where)
 	}
 
-	rows, err := table.Select(stmt.Columns, where)
+	rows, err := table.Select([]string{"*"}, where)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle JOINs
+	if len(stmt.Joins) > 0 {
+		rows, err = e.executeJoins(stmt.TableName, rows, stmt.Joins, dbInstance)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Check if this is a vector similarity search
@@ -396,9 +410,39 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows = rows[:stmt.Limit]
 	}
 
+	// Build column list
 	columns := stmt.Columns
 	if len(columns) == 1 && columns[0] == "*" {
-		columns = table.GetColumnNames()
+		if len(stmt.Joins) > 0 {
+			// For JOINs, get all columns from all tables with prefixes
+			columns = make([]string, 0)
+			for _, col := range table.GetColumnNames() {
+				columns = append(columns, stmt.TableName+"."+col)
+			}
+			for _, join := range stmt.Joins {
+				joinTable := dbInstance.Tables[join.Table]
+				for _, col := range joinTable.GetColumnNames() {
+					columns = append(columns, join.Table+"."+col)
+				}
+			}
+		} else {
+			columns = table.GetColumnNames()
+		}
+	}
+
+	// Filter rows to only include requested columns
+	if len(stmt.Joins) > 0 && len(columns) > 0 {
+		filteredRows := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			filteredRow := make(storage.Row)
+			for _, col := range columns {
+				if val, exists := row[col]; exists {
+					filteredRow[col] = val
+				}
+			}
+			filteredRows[i] = filteredRow
+		}
+		rows = filteredRows
 	}
 
 	return &Result{
@@ -407,8 +451,221 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}, nil
 }
 
+func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins []parser.JoinClause, dbInstance *storage.DatabaseInstance) ([]storage.Row, error) {
+	resultRows := leftRows
+
+	for _, join := range joins {
+		rightTable, exists := dbInstance.Tables[join.Table]
+		if !exists {
+			return nil, fmt.Errorf("table %s does not exist", join.Table)
+		}
+
+		rightRows, err := rightTable.Select([]string{"*"}, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		switch join.Type {
+		case "INNER":
+			resultRows = e.executeInnerJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+		case "LEFT":
+			resultRows = e.executeLeftJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+		case "RIGHT":
+			resultRows = e.executeRightJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+		case "FULL":
+			resultRows = e.executeFullJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+		case "CROSS":
+			resultRows = e.executeCrossJoin(leftTable, resultRows, join.Table, rightRows)
+		default:
+			return nil, fmt.Errorf("unsupported join type: %s", join.Type)
+		}
+
+		leftTable = join.Table
+	}
+
+	return resultRows, nil
+}
+
+func (e *Executor) executeInnerJoin(leftTable string, leftRows []storage.Row, rightTable string, rightRows []storage.Row, condition *parser.JoinCondition) []storage.Row {
+	result := make([]storage.Row, 0)
+
+	for _, leftRow := range leftRows {
+		for _, rightRow := range rightRows {
+			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+				merged := make(storage.Row)
+				for k, v := range leftRow {
+					merged[leftTable+"."+k] = v
+				}
+				for k, v := range rightRow {
+					merged[rightTable+"."+k] = v
+				}
+				result = append(result, merged)
+			}
+		}
+	}
+
+	return result
+}
+
+func (e *Executor) executeLeftJoin(leftTable string, leftRows []storage.Row, rightTable string, rightRows []storage.Row, condition *parser.JoinCondition) []storage.Row {
+	result := make([]storage.Row, 0)
+
+	for _, leftRow := range leftRows {
+		matched := false
+		for _, rightRow := range rightRows {
+			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+				merged := make(storage.Row)
+				for k, v := range leftRow {
+					merged[leftTable+"."+k] = v
+				}
+				for k, v := range rightRow {
+					merged[rightTable+"."+k] = v
+				}
+				result = append(result, merged)
+				matched = true
+			}
+		}
+
+		if !matched {
+			merged := make(storage.Row)
+			for k, v := range leftRow {
+				merged[leftTable+"."+k] = v
+			}
+			result = append(result, merged)
+		}
+	}
+
+	return result
+}
+
+func (e *Executor) executeRightJoin(leftTable string, leftRows []storage.Row, rightTable string, rightRows []storage.Row, condition *parser.JoinCondition) []storage.Row {
+	result := make([]storage.Row, 0)
+
+	for _, rightRow := range rightRows {
+		matched := false
+		for _, leftRow := range leftRows {
+			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+				merged := make(storage.Row)
+				for k, v := range leftRow {
+					merged[leftTable+"."+k] = v
+				}
+				for k, v := range rightRow {
+					merged[rightTable+"."+k] = v
+				}
+				result = append(result, merged)
+				matched = true
+			}
+		}
+
+		if !matched {
+			merged := make(storage.Row)
+			for k, v := range rightRow {
+				merged[rightTable+"."+k] = v
+			}
+			result = append(result, merged)
+		}
+	}
+
+	return result
+}
+
+func (e *Executor) executeFullJoin(leftTable string, leftRows []storage.Row, rightTable string, rightRows []storage.Row, condition *parser.JoinCondition) []storage.Row {
+	result := make([]storage.Row, 0)
+	rightMatched := make(map[int]bool)
+
+	for _, leftRow := range leftRows {
+		matched := false
+		for i, rightRow := range rightRows {
+			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+				merged := make(storage.Row)
+				for k, v := range leftRow {
+					merged[leftTable+"."+k] = v
+				}
+				for k, v := range rightRow {
+					merged[rightTable+"."+k] = v
+				}
+				result = append(result, merged)
+				matched = true
+				rightMatched[i] = true
+			}
+		}
+
+		if !matched {
+			merged := make(storage.Row)
+			for k, v := range leftRow {
+				merged[leftTable+"."+k] = v
+			}
+			result = append(result, merged)
+		}
+	}
+
+	for i, rightRow := range rightRows {
+		if !rightMatched[i] {
+			merged := make(storage.Row)
+			for k, v := range rightRow {
+				merged[rightTable+"."+k] = v
+			}
+			result = append(result, merged)
+		}
+	}
+
+	return result
+}
+
+func (e *Executor) executeCrossJoin(leftTable string, leftRows []storage.Row, rightTable string, rightRows []storage.Row) []storage.Row {
+	result := make([]storage.Row, 0)
+
+	for _, leftRow := range leftRows {
+		for _, rightRow := range rightRows {
+			merged := make(storage.Row)
+			for k, v := range leftRow {
+				merged[leftTable+"."+k] = v
+			}
+			for k, v := range rightRow {
+				merged[rightTable+"."+k] = v
+			}
+			result = append(result, merged)
+		}
+	}
+
+	return result
+}
+
+func (e *Executor) evaluateJoinCondition(leftRow storage.Row, rightRow storage.Row, condition *parser.JoinCondition) bool {
+	if condition == nil {
+		return true
+	}
+
+	// Get values directly from rows by column name (no table prefix in row keys)
+	leftVal := leftRow[condition.LeftColumn]
+	rightVal := rightRow[condition.RightColumn]
+
+	// Handle NULL values
+	if leftVal == nil || rightVal == nil {
+		return false
+	}
+
+	cmp := compareValues(leftVal, rightVal)
+
+	switch condition.Operator {
+	case "=":
+		return cmp == 0
+	case "!=":
+		return cmp != 0
+	case "<":
+		return cmp < 0
+	case ">":
+		return cmp > 0
+	case "<=":
+		return cmp <= 0
+	case ">=":
+		return cmp >= 0
+	default:
+		return false
+	}
+}
+
 func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storage.Row) (*Result, error) {
-	// Convert parser aggregates to storage aggregates
 	aggregates := make([]storage.AggregateSpec, len(stmt.Aggregates))
 	for i, agg := range stmt.Aggregates {
 		aggregates[i] = storage.AggregateSpec{
@@ -418,22 +675,18 @@ func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storag
 		}
 	}
 
-	// Handle GROUP BY
 	if len(stmt.GroupBy) > 0 {
 		return e.executeGroupBy(stmt, rows, aggregates)
 	}
 
-	// Simple aggregation without GROUP BY
 	results, err := storage.ComputeAggregates(rows, aggregates)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build result row
 	resultRow := make(storage.Row)
 	columns := make([]string, 0)
 
-	// Add regular columns (if any)
 	for _, col := range stmt.Columns {
 		if col != "" && col != "*" {
 			columns = append(columns, col)
@@ -443,7 +696,6 @@ func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storag
 		}
 	}
 
-	// Add aggregate results
 	for _, res := range results {
 		columns = append(columns, res.Alias)
 		resultRow[res.Alias] = res.Value
@@ -456,17 +708,13 @@ func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storag
 }
 
 func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, aggregates []storage.AggregateSpec) (*Result, error) {
-	// Group rows
 	groups := storage.GroupRows(rows, stmt.GroupBy)
 
-	// Compute aggregates for each group
 	resultRows := make([]storage.Row, 0, len(groups))
 	columns := make([]string, 0)
 
-	// Add GROUP BY columns
 	columns = append(columns, stmt.GroupBy...)
 
-	// Add aggregate column names
 	for _, agg := range aggregates {
 		columns = append(columns, agg.Alias)
 	}
@@ -474,12 +722,10 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 	for _, group := range groups {
 		row := make(storage.Row)
 
-		// Add group key values
 		for col, val := range group.GroupKey {
 			row[col] = val
 		}
 
-		// Compute and add aggregates
 		aggResults, err := storage.ComputeAggregates(group.Rows, aggregates)
 		if err != nil {
 			return nil, err
@@ -489,7 +735,6 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 			row[res.Alias] = res.Value
 		}
 
-		// Apply HAVING filter if present
 		if stmt.Having != nil {
 			having := convertWhereClause(stmt.Having)
 			if !evaluateWhereOnRow(row, having) {
@@ -500,12 +745,10 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 		resultRows = append(resultRows, row)
 	}
 
-	// Apply ORDER BY on grouped results
 	if len(stmt.OrderBy) > 0 {
 		resultRows = e.applyOrderBy(resultRows, stmt.OrderBy)
 	}
 
-	// Apply LIMIT and OFFSET
 	if stmt.Offset > 0 && stmt.Offset < len(resultRows) {
 		resultRows = resultRows[stmt.Offset:]
 	}
@@ -520,7 +763,6 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 	}, nil
 }
 
-// Helper function to evaluate WHERE on a single row
 func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
 	val, exists := row[where.Column]
 	if !exists {
@@ -615,10 +857,8 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	// Delete from memory
 	delete(dbInstance.Tables, stmt.TableName)
 
-	// Delete from disk
 	tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
 	if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("failed to remove table file: %w", err)
@@ -697,7 +937,246 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 	return nil, fmt.Errorf("unsupported ALTER TABLE action: %s", stmt.Action)
 }
 
-// Helper functions
+func (e *Executor) executeComment(stmt *parser.CommentStmt) (*Result, error) {
+	switch stmt.ObjectType {
+	case "DATABASE":
+		return e.executeCommentDatabase(stmt)
+	case "TABLE":
+		return e.executeCommentTable(stmt)
+	case "COLUMN":
+		return e.executeCommentColumn(stmt)
+	default:
+		return nil, fmt.Errorf("unsupported COMMENT object type: %s", stmt.ObjectType)
+	}
+}
+
+func (e *Executor) executeCommentDatabase(stmt *parser.CommentStmt) (*Result, error) {
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON DATABASE %s", stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.ObjectName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
+	}
+
+	if table.Metadata == nil {
+		var id [16]byte
+		copy(id[:], stmt.ObjectName)
+		table.Metadata = metadata.NewMetadata(
+			metadata.ObjTypeTable,
+			id,
+			"User comment",
+			stmt.Comment,
+		)
+	} else {
+		table.Metadata.Description = stmt.Comment
+	}
+
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON TABLE %s", stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	if stmt.TableName == "" {
+		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	}
+
+	found := false
+	for i := range table.Columns {
+		if table.Columns[i].Name == stmt.ObjectName {
+			if table.Columns[i].Metadata == nil {
+				var id [16]byte
+				copy(id[:], stmt.ObjectName)
+				table.Columns[i].Metadata = metadata.NewMetadata(
+					metadata.ObjTypeColumn,
+					id,
+					"User comment",
+					stmt.Comment,
+				)
+			} else {
+				table.Columns[i].Metadata.Description = stmt.Comment
+			}
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
+	}
+
+	if err := e.db.SaveTableToDisk(table); err != nil {
+		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("COMMENT ON COLUMN %s.%s", stmt.TableName, stmt.ObjectName),
+	}, nil
+}
+
+func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.Row, table *storage.Table) (*Result, error) {
+	queryVector := storage.NewVector(stmt.VectorOrderBy.QueryVector)
+
+	var metric storage.VectorDistance
+	switch stmt.VectorOrderBy.Function {
+	case "COSINE_DISTANCE":
+		metric = storage.DistanceCosine
+	case "L2_DISTANCE":
+		metric = storage.DistanceL2
+	default:
+		return nil, fmt.Errorf("unsupported distance function: %s", stmt.VectorOrderBy.Function)
+	}
+
+	limit := len(rows)
+	if stmt.Limit > 0 {
+		limit = stmt.Limit
+	}
+
+	var results []storage.VectorSearchResult
+	var err error
+
+	if index, exists := table.VectorIndexes[stmt.VectorOrderBy.Column]; exists {
+		ef := limit * 2
+		if ef < 50 {
+			ef = 50
+		}
+		results, err = index.Search(queryVector, limit, ef)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range results {
+			rowID := results[i].Row["_row_id"].(int)
+			if rowID < len(rows) {
+				results[i].Row = rows[rowID]
+			}
+		}
+	} else {
+		results, err = storage.VectorSearch(rows, queryVector, stmt.VectorOrderBy.Column, metric, limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if stmt.Offset > 0 && stmt.Offset < len(results) {
+		results = results[stmt.Offset:]
+	}
+
+	resultRows := make([]storage.Row, len(results))
+	for i, res := range results {
+		resultRows[i] = make(storage.Row)
+
+		for _, col := range stmt.Columns {
+			if col == "*" {
+				for k, v := range res.Row {
+					resultRows[i][k] = v
+				}
+			} else {
+				resultRows[i][col] = res.Row[col]
+			}
+		}
+
+		resultRows[i]["_distance"] = fmt.Sprintf("%.6f", res.Distance)
+	}
+
+	columns := stmt.Columns
+	if len(columns) == 1 && columns[0] == "*" {
+		columns = table.GetColumnNames()
+	}
+	columns = append(columns, "_distance")
+
+	return &Result{
+		Rows:    resultRows,
+		Columns: columns,
+	}, nil
+}
+
+func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
+	dbInstance, err := e.db.GetCurrentDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	table, exists := dbInstance.Tables[stmt.TableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	}
+
+	if table.VectorIndexes == nil {
+		table.VectorIndexes = make(map[string]*storage.HNSWIndex)
+	}
+
+	var colType storage.DataType
+	found := false
+	for _, col := range table.Columns {
+		if col.Name == stmt.ColumnName {
+			colType = col.Type
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("column %s not found", stmt.ColumnName)
+	}
+
+	if stmt.IndexType == "HNSW" {
+		if colType != storage.TypeVector {
+			return nil, fmt.Errorf("HNSW index only supported on VECTOR columns")
+		}
+
+		m := stmt.Options["m"]
+		efConstruction := stmt.Options["ef_construction"]
+
+		index := storage.NewHNSWIndex(m, efConstruction, storage.DistanceCosine)
+
+		for i, row := range table.Rows {
+			if vec, ok := row[stmt.ColumnName].(*storage.Vector); ok {
+				if err := index.Add(vec, i); err != nil {
+					return nil, fmt.Errorf("failed to build index: %w", err)
+				}
+			}
+		}
+
+		table.VectorIndexes[stmt.ColumnName] = index
+
+		return &Result{
+			Message: fmt.Sprintf("CREATE INDEX %s ON %s USING HNSW (m=%d, ef_construction=%d)",
+				stmt.IndexName, stmt.TableName, m, efConstruction),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported index type: %s", stmt.IndexType)
+}
+
+func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
+	return &Result{
+		Message: fmt.Sprintf("DROP INDEX %s (not fully implemented)", stmt.IndexName),
+	}, nil
+}
 
 func convertWhereClause(where *parser.WhereClause) *storage.WhereClause {
 	if where == nil {
@@ -716,7 +1195,6 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 		return rows
 	}
 
-	// Make a copy to avoid modifying original
 	sorted := make([]storage.Row, len(rows))
 	copy(sorted, rows)
 
@@ -776,268 +1254,4 @@ func toComparableInt(val interface{}) (int64, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func (e *Executor) executeComment(stmt *parser.CommentStmt) (*Result, error) {
-	switch stmt.ObjectType {
-	case "DATABASE":
-		return e.executeCommentDatabase(stmt)
-	case "TABLE":
-		return e.executeCommentTable(stmt)
-	case "COLUMN":
-		return e.executeCommentColumn(stmt)
-	default:
-		return nil, fmt.Errorf("unsupported COMMENT object type: %s", stmt.ObjectType)
-	}
-}
-
-func (e *Executor) executeCommentDatabase(stmt *parser.CommentStmt) (*Result, error) {
-	// Store database metadata
-	// For now, we'll store it in a simple way
-	// In production, this would go to the metadata store
-
-	return &Result{
-		Message: fmt.Sprintf("COMMENT ON DATABASE %s", stmt.ObjectName),
-	}, nil
-}
-
-func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
-	if err != nil {
-		return nil, err
-	}
-
-	table, exists := dbInstance.Tables[stmt.ObjectName]
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
-	}
-
-	// Update table metadata
-	if table.Metadata == nil {
-		var id [16]byte
-		copy(id[:], stmt.ObjectName)
-		table.Metadata = metadata.NewMetadata(
-			metadata.ObjTypeTable,
-			id,
-			"User comment",
-			stmt.Comment,
-		)
-	} else {
-		table.Metadata.Description = stmt.Comment
-	}
-
-	// Save to disk
-	if err := e.db.SaveTableToDisk(table); err != nil {
-		return nil, fmt.Errorf("failed to persist table: %w", err)
-	}
-
-	return &Result{
-		Message: fmt.Sprintf("COMMENT ON TABLE %s", stmt.ObjectName),
-	}, nil
-}
-
-func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
-	if err != nil {
-		return nil, err
-	}
-
-	// Determine table name
-	if stmt.TableName == "" {
-		// Need to parse column name differently
-		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
-	}
-
-	table, exists := dbInstance.Tables[stmt.TableName]
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
-	}
-
-	// Find and update column metadata
-	found := false
-	for i := range table.Columns {
-		if table.Columns[i].Name == stmt.ObjectName {
-			if table.Columns[i].Metadata == nil {
-				var id [16]byte
-				copy(id[:], stmt.ObjectName)
-				table.Columns[i].Metadata = metadata.NewMetadata(
-					metadata.ObjTypeColumn,
-					id,
-					"User comment",
-					stmt.Comment,
-				)
-			} else {
-				table.Columns[i].Metadata.Description = stmt.Comment
-			}
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
-	}
-
-	// Save to disk
-	if err := e.db.SaveTableToDisk(table); err != nil {
-		return nil, fmt.Errorf("failed to persist table: %w", err)
-	}
-
-	return &Result{
-		Message: fmt.Sprintf("COMMENT ON COLUMN %s.%s", stmt.TableName, stmt.ObjectName),
-	}, nil
-}
-
-func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.Row, table *storage.Table) (*Result, error) {
-	queryVector := storage.NewVector(stmt.VectorOrderBy.QueryVector)
-
-	var metric storage.VectorDistance
-	switch stmt.VectorOrderBy.Function {
-	case "COSINE_DISTANCE":
-		metric = storage.DistanceCosine
-	case "L2_DISTANCE":
-		metric = storage.DistanceL2
-	default:
-		return nil, fmt.Errorf("unsupported distance function: %s", stmt.VectorOrderBy.Function)
-	}
-
-	limit := len(rows)
-	if stmt.Limit > 0 {
-		limit = stmt.Limit
-	}
-
-	var results []storage.VectorSearchResult
-	var err error
-
-	// Check if HNSW index exists for this column
-	if index, exists := table.VectorIndexes[stmt.VectorOrderBy.Column]; exists {
-		// Use HNSW index - O(log n)
-		ef := limit * 2 // ef_search parameter
-		if ef < 50 {
-			ef = 50
-		}
-		results, err = index.Search(queryVector, limit, ef)
-		if err != nil {
-			return nil, err
-		}
-
-		// Map row IDs back to actual rows
-		for i := range results {
-			rowID := results[i].Row["_row_id"].(int)
-			if rowID < len(rows) {
-				results[i].Row = rows[rowID]
-			}
-		}
-	} else {
-		// Use brute-force - O(n)
-		results, err = storage.VectorSearch(rows, queryVector, stmt.VectorOrderBy.Column, metric, limit)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Rest of the function stays the same...
-	if stmt.Offset > 0 && stmt.Offset < len(results) {
-		results = results[stmt.Offset:]
-	}
-
-	resultRows := make([]storage.Row, len(results))
-	for i, res := range results {
-		resultRows[i] = make(storage.Row)
-
-		for _, col := range stmt.Columns {
-			if col == "*" {
-				for k, v := range res.Row {
-					resultRows[i][k] = v
-				}
-			} else {
-				resultRows[i][col] = res.Row[col]
-			}
-		}
-
-		resultRows[i]["_distance"] = fmt.Sprintf("%.6f", res.Distance)
-	}
-
-	columns := stmt.Columns
-	if len(columns) == 1 && columns[0] == "*" {
-		columns = table.GetColumnNames()
-	}
-	columns = append(columns, "_distance")
-
-	return &Result{
-		Rows:    resultRows,
-		Columns: columns,
-	}, nil
-}
-
-func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
-	if err != nil {
-		return nil, err
-	}
-
-	table, exists := dbInstance.Tables[stmt.TableName]
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
-	}
-
-	// Initialize VectorIndexes map if nil
-	if table.VectorIndexes == nil {
-		table.VectorIndexes = make(map[string]*storage.HNSWIndex)
-	}
-
-	// Find column
-	var colType storage.DataType
-	found := false
-	for _, col := range table.Columns {
-		if col.Name == stmt.ColumnName {
-			colType = col.Type
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return nil, fmt.Errorf("column %s not found", stmt.ColumnName)
-	}
-
-	// Only HNSW for VECTOR columns
-	if stmt.IndexType == "HNSW" {
-		if colType != storage.TypeVector {
-			return nil, fmt.Errorf("HNSW index only supported on VECTOR columns")
-		}
-
-		// Create HNSW index
-		m := stmt.Options["m"]
-		efConstruction := stmt.Options["ef_construction"]
-
-		index := storage.NewHNSWIndex(m, efConstruction, storage.DistanceCosine)
-
-		// Build index from existing data
-		for i, row := range table.Rows {
-			if vec, ok := row[stmt.ColumnName].(*storage.Vector); ok {
-				if err := index.Add(vec, i); err != nil {
-					return nil, fmt.Errorf("failed to build index: %w", err)
-				}
-			}
-		}
-
-		// Store index
-		table.VectorIndexes[stmt.ColumnName] = index
-
-		return &Result{
-			Message: fmt.Sprintf("CREATE INDEX %s ON %s USING HNSW (m=%d, ef_construction=%d)",
-				stmt.IndexName, stmt.TableName, m, efConstruction),
-		}, nil
-	}
-
-	return nil, fmt.Errorf("unsupported index type: %s", stmt.IndexType)
-}
-
-func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
-	// For now, we store indexes by column name, not index name
-	// In production, you'd maintain an index registry
-	return &Result{
-		Message: fmt.Sprintf("DROP INDEX %s (not fully implemented)", stmt.IndexName),
-	}, nil
 }

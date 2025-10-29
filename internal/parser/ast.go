@@ -72,6 +72,7 @@ type SelectStmt struct {
 	Columns       []string
 	Aggregates    []AggregateFunc
 	TableName     string
+	Joins         []JoinClause // Add this
 	Where         *WhereClause
 	GroupBy       []string
 	Having        *WhereClause
@@ -196,3 +197,20 @@ type DropIndexStmt struct {
 }
 
 func (s *DropIndexStmt) StatementNode() {}
+
+// JoinClause represents a JOIN operation
+type JoinClause struct {
+	Type      string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS"
+	Table     string // Table to join
+	Alias     string // Optional table alias
+	Condition *JoinCondition
+}
+
+// JoinCondition represents ON condition
+type JoinCondition struct {
+	LeftTable   string
+	LeftColumn  string
+	Operator    string // "=", "!=", etc.
+	RightTable  string
+	RightColumn string
+}

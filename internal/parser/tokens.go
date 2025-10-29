@@ -88,6 +88,16 @@ const (
 	// Foreign Key
 	TOKEN_FOREIGN
 	TOKEN_REFERENCES
+
+	TOKEN_JOIN
+	TOKEN_INNER
+	TOKEN_LEFT
+	TOKEN_RIGHT
+	TOKEN_FULL
+	TOKEN_OUTER
+	TOKEN_CROSS
+
+	TOKEN_DOT
 )
 
 type Token struct {
@@ -172,6 +182,16 @@ func (t TokenType) String() string {
 		TOKEN_NULL:       "NULL",    // Add this
 		TOKEN_FOREIGN:    "FOREIGN", // Add this
 		TOKEN_REFERENCES: "REFERENCES",
+
+		TOKEN_JOIN:  "JOIN",
+		TOKEN_INNER: "INNER",
+		TOKEN_LEFT:  "LEFT",
+		TOKEN_RIGHT: "RIGHT",
+		TOKEN_FULL:  "FULL",
+		TOKEN_OUTER: "OUTER",
+		TOKEN_CROSS: "CROSS",
+
+		TOKEN_DOT: "DOT",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -233,6 +253,13 @@ var keywords = map[string]TokenType{
 	"NULL":            TOKEN_NULL,
 	"FOREIGN":         TOKEN_FOREIGN,
 	"REFERENCES":      TOKEN_REFERENCES,
+	"JOIN":            TOKEN_JOIN,
+	"INNER":           TOKEN_INNER,
+	"LEFT":            TOKEN_LEFT,
+	"RIGHT":           TOKEN_RIGHT,
+	"FULL":            TOKEN_FULL,
+	"OUTER":           TOKEN_OUTER,
+	"CROSS":           TOKEN_CROSS,
 }
 
 func LookupKeyword(ident string) TokenType {

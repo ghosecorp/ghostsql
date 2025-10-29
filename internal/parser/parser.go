@@ -753,7 +753,25 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			stmt.Columns = append(stmt.Columns, "*")
 			p.nextToken()
 		} else if p.current.Type == TOKEN_IDENT {
-			stmt.Columns = append(stmt.Columns, p.current.Literal)
+			// Parse column name (may be table.column)
+			firstPart := p.current.Literal
+			p.nextToken()
+
+			// Check for dot token
+			if p.current.Type == TOKEN_DOT {
+				p.nextToken() // consume dot
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name after")
+				}
+				colName := firstPart + "." + p.current.Literal
+				stmt.Columns = append(stmt.Columns, colName)
+				p.nextToken()
+			} else {
+				// Just a column name without table prefix
+				stmt.Columns = append(stmt.Columns, firstPart)
+			}
+		} else {
+			// Unknown token, skip
 			p.nextToken()
 		}
 
@@ -773,6 +791,44 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 	stmt.TableName = p.current.Literal
 	p.nextToken()
+
+	// Parse JOINs
+	for {
+		joinType := ""
+
+		// Check for join type keywords
+		if p.current.Type == TOKEN_INNER || p.current.Type == TOKEN_LEFT ||
+			p.current.Type == TOKEN_RIGHT || p.current.Type == TOKEN_FULL ||
+			p.current.Type == TOKEN_CROSS {
+			joinType = strings.ToUpper(p.current.Literal)
+			p.nextToken()
+
+			// Handle FULL OUTER JOIN
+			if joinType == "FULL" && p.current.Type == TOKEN_OUTER {
+				p.nextToken()
+			}
+			// Handle LEFT OUTER JOIN, RIGHT OUTER JOIN
+			if (joinType == "LEFT" || joinType == "RIGHT") && p.current.Type == TOKEN_OUTER {
+				p.nextToken()
+			}
+		}
+
+		// Check for JOIN keyword
+		if p.current.Type == TOKEN_JOIN {
+			if joinType == "" {
+				joinType = "INNER" // Default to INNER JOIN
+			}
+			p.nextToken()
+
+			join, err := p.parseJoin(joinType)
+			if err != nil {
+				return nil, err
+			}
+			stmt.Joins = append(stmt.Joins, join)
+		} else {
+			break
+		}
+	}
 
 	// Parse WHERE clause
 	if p.current.Type == TOKEN_WHERE {
@@ -817,7 +873,6 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Having = having
 	}
 
-	// Parse ORDER BY
 	// Parse ORDER BY
 	if p.current.Type == TOKEN_ORDER {
 		p.nextToken()
@@ -1287,4 +1342,103 @@ func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
 	p.nextToken()
 
 	return stmt, nil
+}
+
+func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
+	join := JoinClause{Type: joinType}
+
+	// Parse table name
+	if p.current.Type != TOKEN_IDENT {
+		return join, fmt.Errorf("expected table name")
+	}
+	join.Table = p.current.Literal
+	p.nextToken()
+
+	// Optional alias
+	if p.current.Type == TOKEN_AS {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			return join, fmt.Errorf("expected alias after AS")
+		}
+		join.Alias = p.current.Literal
+		p.nextToken()
+	}
+
+	// CROSS JOIN doesn't have ON condition
+	if joinType == "CROSS" {
+		return join, nil
+	}
+
+	// Parse ON condition
+	if p.current.Type != TOKEN_ON {
+		return join, fmt.Errorf("expected ON after JOIN table")
+	}
+	p.nextToken()
+
+	// Parse join condition: table1.col1 = table2.col2
+	condition := &JoinCondition{}
+
+	// Parse left side
+	if p.current.Type != TOKEN_IDENT {
+		return join, fmt.Errorf("expected table or column name")
+	}
+	leftPart := p.current.Literal
+	p.nextToken()
+
+	// Check for DOT token (table.column syntax)
+	if p.current.Type == TOKEN_DOT {
+		p.nextToken() // consume dot
+		if p.current.Type != TOKEN_IDENT {
+			return join, fmt.Errorf("expected column name after")
+		}
+		condition.LeftTable = leftPart
+		condition.LeftColumn = p.current.Literal
+		p.nextToken()
+	} else {
+		// No table prefix, just column
+		condition.LeftColumn = leftPart
+	}
+
+	// Parse operator
+	switch p.current.Type {
+	case TOKEN_EQUALS:
+		condition.Operator = "="
+	case TOKEN_NE:
+		condition.Operator = "!="
+	case TOKEN_LT:
+		condition.Operator = "<"
+	case TOKEN_GT:
+		condition.Operator = ">"
+	case TOKEN_LE:
+		condition.Operator = "<="
+	case TOKEN_GE:
+		condition.Operator = ">="
+	default:
+		return join, fmt.Errorf("expected comparison operator, got %s", p.current.Type)
+	}
+	p.nextToken()
+
+	// Parse right side
+	if p.current.Type != TOKEN_IDENT {
+		return join, fmt.Errorf("expected table or column name")
+	}
+	rightPart := p.current.Literal
+	p.nextToken()
+
+	// Check for DOT token (table.column syntax)
+	if p.current.Type == TOKEN_DOT {
+		p.nextToken() // consume dot
+		if p.current.Type != TOKEN_IDENT {
+			return join, fmt.Errorf("expected column name after")
+		}
+		condition.RightTable = rightPart
+		condition.RightColumn = p.current.Literal
+		p.nextToken()
+	} else {
+		// No table prefix
+		condition.RightColumn = rightPart
+	}
+
+	join.Condition = condition
+	return join, nil
 }

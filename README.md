@@ -81,3 +81,32 @@ CREATE INDEX docs_idx ON documents USING HNSW (embedding) WITH (m=16, ef_constru
 SELECT title FROM documents 
 ORDER BY COSINE_DISTANCE(embedding, [0.82, 0.22, 0.12, 0.06]) 
 LIMIT 3;
+
+
+
+-- Setup test data
+ghostsql[ghostsql]> CREATE TABLE departments (id INT PRIMARY KEY, name VARCHAR(100));
+ghostsql[ghostsql]> INSERT INTO departments VALUES (1, 'Engineering');
+ghostsql[ghostsql]> INSERT INTO departments VALUES (2, 'Sales');
+ghostsql[ghostsql]> INSERT INTO departments VALUES (3, 'Marketing');
+
+ghostsql[ghostsql]> CREATE TABLE employees (id INT PRIMARY KEY, name VARCHAR(100), dept_id INT);
+ghostsql[ghostsql]> INSERT INTO employees VALUES (1, 'Alice', 1);
+ghostsql[ghostsql]> INSERT INTO employees VALUES (2, 'Bob', 1);
+ghostsql[ghostsql]> INSERT INTO employees VALUES (3, 'Charlie', 2);
+ghostsql[ghostsql]> INSERT INTO employees VALUES (4, 'David', NULL);
+
+-- INNER JOIN
+ghostsql[ghostsql]> SELECT employees.name, departments.name 
+FROM employees 
+INNER JOIN departments ON employees.dept_id = departments.id;
+
+-- LEFT JOIN (includes David with NULL dept)
+ghostsql[ghostsql]> SELECT employees.name, departments.name 
+FROM employees 
+LEFT JOIN departments ON employees.dept_id = departments.id;
+
+-- RIGHT JOIN (includes Marketing with no employees)
+ghostsql[ghostsql]> SELECT employees.name, departments.name 
+FROM employees 
+RIGHT JOIN departments ON employees.dept_id = departments.id;
