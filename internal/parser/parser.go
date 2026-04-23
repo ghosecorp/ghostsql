@@ -1401,49 +1401,33 @@ func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
 func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	join := JoinClause{Type: joinType}
 
-	fmt.Printf("DEBUG parseJoin: Starting, joinType=%s, current=%s (literal='%s')\n",
-		joinType, p.current.Type, p.current.Literal)
-
 	// Parse table name
 	if p.current.Type != TOKEN_IDENT {
 		return join, fmt.Errorf("expected table name")
 	}
 	join.Table = p.current.Literal
-	fmt.Printf("DEBUG parseJoin: Got table name: %s\n", join.Table)
 	p.nextToken()
-	fmt.Printf("DEBUG parseJoin: After table name, current=%s (literal='%s')\n",
-		p.current.Type, p.current.Literal)
 
 	// Optional alias
 	switch p.current.Type {
 	case TOKEN_AS:
-		fmt.Printf("DEBUG parseJoin: Found AS keyword\n")
 		p.nextToken()
 		if p.current.Type != TOKEN_IDENT {
 			return join, fmt.Errorf("expected alias after AS")
 		}
 		join.Alias = p.current.Literal
-		fmt.Printf("DEBUG parseJoin: Got alias (with AS): %s\n", join.Alias)
 		p.nextToken()
 	case TOKEN_IDENT:
 		keyword := strings.ToUpper(p.current.Literal)
-		fmt.Printf("DEBUG parseJoin: Found IDENT, checking if alias: '%s' (upper: '%s')\n",
-			p.current.Literal, keyword)
 
 		if keyword != "ON" && keyword != "WHERE" && keyword != "INNER" &&
 			keyword != "LEFT" && keyword != "RIGHT" && keyword != "FULL" &&
 			keyword != "CROSS" && keyword != "JOIN" && keyword != "ORDER" &&
 			keyword != "GROUP" && keyword != "LIMIT" && keyword != "OFFSET" {
 			join.Alias = p.current.Literal
-			fmt.Printf("DEBUG parseJoin: Got implicit alias: %s\n", join.Alias)
 			p.nextToken()
-		} else {
-			fmt.Printf("DEBUG parseJoin: '%s' is a keyword, not an alias\n", keyword)
 		}
 	}
-
-	fmt.Printf("DEBUG parseJoin: Before ON check, current=%s (literal='%s')\n",
-		p.current.Type, p.current.Literal)
 
 	// CROSS JOIN doesn't have ON condition
 	if joinType == "CROSS" {
@@ -1455,7 +1439,6 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 		return join, fmt.Errorf("expected ON after JOIN table, got %s (literal: '%s')",
 			p.current.Type, p.current.Literal)
 	}
-	fmt.Printf("DEBUG parseJoin: Found ON, parsing condition\n")
 	p.nextToken()
 
 	// Parse join condition
@@ -1519,9 +1502,7 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	}
 
 	join.Condition = condition
-	fmt.Printf("DEBUG parseJoin: Parsed condition: %s.%s %s %s.%s\n",
-		condition.LeftTable, condition.LeftColumn, condition.Operator,
-		condition.RightTable, condition.RightColumn)
 
 	return join, nil
 }
+
