@@ -6,22 +6,12 @@ import (
 )
 
 // SaveTableToDisk persists a table to disk in BINARY format
-func (db *Database) SaveTableToDisk(table *Table) error {
-	dbInstance, err := db.GetCurrentDatabase()
-	if err != nil {
-		return err
-	}
-
+func (db *Database) SaveTableToDisk(dbInstance *DatabaseInstance, table *Table) error {
 	return db.saveTableForDatabase(dbInstance, table)
 }
 
 // LoadTableFromDisk loads a table from disk
-func (db *Database) LoadTableFromDisk(tableName string) (*Table, error) {
-	dbInstance, err := db.GetCurrentDatabase()
-	if err != nil {
-		return nil, err
-	}
-
+func (db *Database) LoadTableFromDisk(dbInstance *DatabaseInstance, tableName string) (*Table, error) {
 	return db.loadTableForDatabase(dbInstance, tableName)
 }
 
