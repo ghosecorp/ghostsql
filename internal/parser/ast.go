@@ -72,6 +72,7 @@ type SelectStmt struct {
 	Columns       []string
 	Aggregates    []AggregateFunc
 	TableName     string
+	TableAlias    string       // ADD THIS LINE
 	Joins         []JoinClause // Add this
 	Where         *WhereClause
 	GroupBy       []string
