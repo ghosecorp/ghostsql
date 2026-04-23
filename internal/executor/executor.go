@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/ghosecorp/ghostsql/internal/metadata"
 	"github.com/ghosecorp/ghostsql/internal/parser"
@@ -363,22 +364,93 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	// Get initial rows from the main table
 	var where *storage.WhereClause
 	if stmt.Where != nil {
 		where = convertWhereClause(stmt.Where)
 	}
 
-	rows, err := table.Select([]string{"*"}, where)
+	rows, err := table.Select(stmt.Columns, where)
 	if err != nil {
 		return nil, err
 	}
 
 	// Handle JOINs
 	if len(stmt.Joins) > 0 {
+		// Prefix main table columns before JOIN
+		prefixedRows := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			prefixedRow := make(storage.Row)
+			for k, v := range row {
+				if !strings.Contains(k, ".") {
+					// Use alias if specified, otherwise use table name
+					tableRef := stmt.TableName
+					if stmt.TableAlias != "" {
+						tableRef = stmt.TableAlias
+					}
+					prefixedRow[tableRef+"."+k] = v
+				} else {
+					prefixedRow[k] = v
+				}
+			}
+			prefixedRows[i] = prefixedRow
+		}
+		rows = prefixedRows
+
 		rows, err = e.executeJoins(stmt.TableName, rows, stmt.Joins, dbInstance)
 		if err != nil {
 			return nil, err
+		}
+
+		// Build alias to table mapping
+		aliasMap := make(map[string]string)
+
+		// Add main table (use alias if specified, otherwise table name maps to itself)
+		if stmt.TableAlias != "" {
+			aliasMap[stmt.TableAlias] = stmt.TableName
+		}
+		aliasMap[stmt.TableName] = stmt.TableName
+
+		// Add joined tables
+		for _, join := range stmt.Joins {
+			if join.Alias != "" {
+				aliasMap[join.Alias] = join.Table
+			}
+			aliasMap[join.Table] = join.Table
+		}
+
+		// Project columns with alias resolution
+		if len(stmt.Columns) > 0 && stmt.Columns[0] != "*" {
+			projectedRows := make([]storage.Row, len(rows))
+			for i, row := range rows {
+				projectedRow := make(storage.Row)
+				for _, colSpec := range stmt.Columns {
+					if strings.Contains(colSpec, ".") {
+						parts := strings.Split(colSpec, ".")
+						tableOrAlias := parts[0]
+						colName := parts[1]
+
+						// Resolve alias to actual table name
+						actualTable := tableOrAlias
+						if mappedTable, ok := aliasMap[tableOrAlias]; ok {
+							actualTable = mappedTable
+						}
+
+						// Look up the column value
+						key := actualTable + "." + colName
+						val, ok := row[key]
+						if !ok {
+							// Try without prefix as fallback
+							val = row[colName]
+						}
+
+						projectedRow[colSpec] = val
+					} else {
+						projectedRow[colSpec] = row[colSpec]
+					}
+				}
+				projectedRows[i] = projectedRow
+			}
+			rows = projectedRows
 		}
 	}
 
@@ -410,39 +482,17 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows = rows[:stmt.Limit]
 	}
 
-	// Build column list
+	// Determine output columns
 	columns := stmt.Columns
 	if len(columns) == 1 && columns[0] == "*" {
-		if len(stmt.Joins) > 0 {
-			// For JOINs, get all columns from all tables with prefixes
-			columns = make([]string, 0)
-			for _, col := range table.GetColumnNames() {
-				columns = append(columns, stmt.TableName+"."+col)
+		columns = table.GetColumnNames()
+		// Add joined table columns with prefixes
+		for _, join := range stmt.Joins {
+			joinTable := dbInstance.Tables[join.Table]
+			for _, col := range joinTable.GetColumnNames() {
+				columns = append(columns, join.Table+"."+col)
 			}
-			for _, join := range stmt.Joins {
-				joinTable := dbInstance.Tables[join.Table]
-				for _, col := range joinTable.GetColumnNames() {
-					columns = append(columns, join.Table+"."+col)
-				}
-			}
-		} else {
-			columns = table.GetColumnNames()
 		}
-	}
-
-	// Filter rows to only include requested columns
-	if len(stmt.Joins) > 0 && len(columns) > 0 {
-		filteredRows := make([]storage.Row, len(rows))
-		for i, row := range rows {
-			filteredRow := make(storage.Row)
-			for _, col := range columns {
-				if val, exists := row[col]; exists {
-					filteredRow[col] = val
-				}
-			}
-			filteredRows[i] = filteredRow
-		}
-		rows = filteredRows
 	}
 
 	return &Result{
@@ -480,7 +530,7 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 			return nil, fmt.Errorf("unsupported join type: %s", join.Type)
 		}
 
-		leftTable = join.Table
+		leftTable = join.Table // For chained joins
 	}
 
 	return resultRows, nil
@@ -491,14 +541,27 @@ func (e *Executor) executeInnerJoin(leftTable string, leftRows []storage.Row, ri
 
 	for _, leftRow := range leftRows {
 		for _, rightRow := range rightRows {
-			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
+
+				// Copy left row with table prefix
 				for k, v := range leftRow {
-					merged[leftTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[leftTable+"."+k] = v
+					}
 				}
+
+				// Copy right row with table prefix
 				for k, v := range rightRow {
-					merged[rightTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[rightTable+"."+k] = v
+					}
 				}
+
 				result = append(result, merged)
 			}
 		}
@@ -513,14 +576,25 @@ func (e *Executor) executeLeftJoin(leftTable string, leftRows []storage.Row, rig
 	for _, leftRow := range leftRows {
 		matched := false
 		for _, rightRow := range rightRows {
-			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
+
 				for k, v := range leftRow {
-					merged[leftTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[leftTable+"."+k] = v
+					}
 				}
+
 				for k, v := range rightRow {
-					merged[rightTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[rightTable+"."+k] = v
+					}
 				}
+
 				result = append(result, merged)
 				matched = true
 			}
@@ -529,7 +603,11 @@ func (e *Executor) executeLeftJoin(leftTable string, leftRows []storage.Row, rig
 		if !matched {
 			merged := make(storage.Row)
 			for k, v := range leftRow {
-				merged[leftTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[leftTable+"."+k] = v
+				}
 			}
 			result = append(result, merged)
 		}
@@ -544,14 +622,25 @@ func (e *Executor) executeRightJoin(leftTable string, leftRows []storage.Row, ri
 	for _, rightRow := range rightRows {
 		matched := false
 		for _, leftRow := range leftRows {
-			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
+
 				for k, v := range leftRow {
-					merged[leftTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[leftTable+"."+k] = v
+					}
 				}
+
 				for k, v := range rightRow {
-					merged[rightTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[rightTable+"."+k] = v
+					}
 				}
+
 				result = append(result, merged)
 				matched = true
 			}
@@ -560,7 +649,11 @@ func (e *Executor) executeRightJoin(leftTable string, leftRows []storage.Row, ri
 		if !matched {
 			merged := make(storage.Row)
 			for k, v := range rightRow {
-				merged[rightTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[rightTable+"."+k] = v
+				}
 			}
 			result = append(result, merged)
 		}
@@ -576,14 +669,25 @@ func (e *Executor) executeFullJoin(leftTable string, leftRows []storage.Row, rig
 	for _, leftRow := range leftRows {
 		matched := false
 		for i, rightRow := range rightRows {
-			if e.evaluateJoinCondition(leftRow, rightRow, condition) {
+			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
+
 				for k, v := range leftRow {
-					merged[leftTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[leftTable+"."+k] = v
+					}
 				}
+
 				for k, v := range rightRow {
-					merged[rightTable+"."+k] = v
+					if strings.Contains(k, ".") {
+						merged[k] = v
+					} else {
+						merged[rightTable+"."+k] = v
+					}
 				}
+
 				result = append(result, merged)
 				matched = true
 				rightMatched[i] = true
@@ -593,7 +697,11 @@ func (e *Executor) executeFullJoin(leftTable string, leftRows []storage.Row, rig
 		if !matched {
 			merged := make(storage.Row)
 			for k, v := range leftRow {
-				merged[leftTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[leftTable+"."+k] = v
+				}
 			}
 			result = append(result, merged)
 		}
@@ -603,7 +711,11 @@ func (e *Executor) executeFullJoin(leftTable string, leftRows []storage.Row, rig
 		if !rightMatched[i] {
 			merged := make(storage.Row)
 			for k, v := range rightRow {
-				merged[rightTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[rightTable+"."+k] = v
+				}
 			}
 			result = append(result, merged)
 		}
@@ -618,12 +730,23 @@ func (e *Executor) executeCrossJoin(leftTable string, leftRows []storage.Row, ri
 	for _, leftRow := range leftRows {
 		for _, rightRow := range rightRows {
 			merged := make(storage.Row)
+
 			for k, v := range leftRow {
-				merged[leftTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[leftTable+"."+k] = v
+				}
 			}
+
 			for k, v := range rightRow {
-				merged[rightTable+"."+k] = v
+				if strings.Contains(k, ".") {
+					merged[k] = v
+				} else {
+					merged[rightTable+"."+k] = v
+				}
 			}
+
 			result = append(result, merged)
 		}
 	}
@@ -631,20 +754,72 @@ func (e *Executor) executeCrossJoin(leftTable string, leftRows []storage.Row, ri
 	return result
 }
 
-func (e *Executor) evaluateJoinCondition(leftRow storage.Row, rightRow storage.Row, condition *parser.JoinCondition) bool {
+func (e *Executor) evaluateJoinCondition(leftTable string, leftRow storage.Row, rightTable string, rightRow storage.Row, condition *parser.JoinCondition) bool {
 	if condition == nil {
 		return true
 	}
 
-	// Get values directly from rows by column name (no table prefix in row keys)
-	leftVal := leftRow[condition.LeftColumn]
-	rightVal := rightRow[condition.RightColumn]
+	var leftVal, rightVal interface{}
 
-	// Handle NULL values
-	if leftVal == nil || rightVal == nil {
-		return false
+	// Resolve left column value
+	if condition.LeftTable != "" {
+		// Explicit table specified in condition
+		switch condition.LeftTable {
+		case leftTable:
+			key := leftTable + "." + condition.LeftColumn
+			if val, ok := leftRow[key]; ok {
+				leftVal = val
+			} else {
+				leftVal = leftRow[condition.LeftColumn]
+			}
+		case rightTable:
+			key := rightTable + "." + condition.LeftColumn
+			if val, ok := rightRow[key]; ok {
+				leftVal = val
+			} else {
+				leftVal = rightRow[condition.LeftColumn]
+			}
+		}
+	} else {
+		// No table specified, try left row first
+		key := leftTable + "." + condition.LeftColumn
+		if val, ok := leftRow[key]; ok {
+			leftVal = val
+		} else if val, ok := leftRow[condition.LeftColumn]; ok {
+			leftVal = val
+		}
 	}
 
+	// Resolve right column value
+	if condition.RightTable != "" {
+		// Explicit table specified in condition
+		switch condition.RightTable {
+		case rightTable:
+			key := rightTable + "." + condition.RightColumn
+			if val, ok := rightRow[key]; ok {
+				rightVal = val
+			} else {
+				rightVal = rightRow[condition.RightColumn]
+			}
+		case leftTable:
+			key := leftTable + "." + condition.RightColumn
+			if val, ok := leftRow[key]; ok {
+				rightVal = val
+			} else {
+				rightVal = leftRow[condition.RightColumn]
+			}
+		}
+	} else {
+		// No table specified, try right row first
+		key := rightTable + "." + condition.RightColumn
+		if val, ok := rightRow[key]; ok {
+			rightVal = val
+		} else if val, ok := rightRow[condition.RightColumn]; ok {
+			rightVal = val
+		}
+	}
+
+	// Compare values
 	cmp := compareValues(leftVal, rightVal)
 
 	switch condition.Operator {
@@ -1218,6 +1393,7 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 }
 
 func compareValues(a, b interface{}) int {
+	// Try numeric comparison
 	aInt, aIsInt := toComparableInt(a)
 	bInt, bIsInt := toComparableInt(b)
 
@@ -1230,6 +1406,7 @@ func compareValues(a, b interface{}) int {
 		return 0
 	}
 
+	// String comparison
 	aStr := fmt.Sprintf("%v", a)
 	bStr := fmt.Sprintf("%v", b)
 

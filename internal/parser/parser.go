@@ -663,75 +663,85 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 	}
 	p.nextToken()
 
-	if p.current.Type != TOKEN_LPAREN {
-		return nil, fmt.Errorf("expected (")
-	}
-	p.nextToken()
+	// Parse multiple value sets: VALUES (1, 'a'), (2, 'b'), (3, 'c')
+	for {
+		if p.current.Type != TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected (")
+		}
+		p.nextToken()
 
-	// Parse values
-	values := []interface{}{}
-	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
-		var val interface{}
+		// Parse values for one row
+		values := []interface{}{}
+		for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+			var val interface{}
 
-		if p.current.Type == TOKEN_LBRACKET {
-			// Parse vector array [0.1, 0.2, 0.3]
-			vectorStr := "["
-			p.nextToken()
-			for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
-				vectorStr += p.current.Literal
+			if p.current.Type == TOKEN_LBRACKET {
+				// Parse vector array
+				vectorStr := "["
 				p.nextToken()
-				if p.current.Type == TOKEN_COMMA {
-					vectorStr += ","
+				for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
+					vectorStr += p.current.Literal
 					p.nextToken()
+					if p.current.Type == TOKEN_COMMA {
+						vectorStr += ","
+						p.nextToken()
+					}
 				}
-			}
-			if p.current.Type != TOKEN_RBRACKET {
-				return nil, fmt.Errorf("expected ]")
-			}
-			vectorStr += "]"
-			val = vectorStr // Store as string, will be parsed by executor
-			p.nextToken()   // consume ]
-		} else {
-			// Regular value parsing
-			// Regular value parsing
-			switch p.current.Type {
-			case TOKEN_NUMBER:
-				if strings.Contains(p.current.Literal, ".") {
-					num, _ := strconv.ParseFloat(p.current.Literal, 64)
-					val = num
-				} else {
-					num, _ := strconv.Atoi(p.current.Literal)
-					val = num
+				if p.current.Type != TOKEN_RBRACKET {
+					return nil, fmt.Errorf("expected ]")
 				}
-			case TOKEN_STRING:
-				val = p.current.Literal
-			case TOKEN_NULL:
-				val = nil // Explicit NULL
-			case TOKEN_IDENT:
-				// Handle NULL as identifier (case-insensitive)
-				if strings.ToUpper(p.current.Literal) == "NULL" {
+				vectorStr += "]"
+				val = vectorStr
+				p.nextToken()
+			} else {
+				switch p.current.Type {
+				case TOKEN_NUMBER:
+					if strings.Contains(p.current.Literal, ".") {
+						num, _ := strconv.ParseFloat(p.current.Literal, 64)
+						val = num
+					} else {
+						num, _ := strconv.Atoi(p.current.Literal)
+						val = num
+					}
+				case TOKEN_STRING:
+					val = p.current.Literal
+				case TOKEN_NULL:
 					val = nil
-				} else {
-					return nil, fmt.Errorf("unexpected identifier: %s", p.current.Literal)
+				case TOKEN_IDENT:
+					if strings.ToUpper(p.current.Literal) == "NULL" {
+						val = nil
+					} else {
+						return nil, fmt.Errorf("unexpected identifier: %s", p.current.Literal)
+					}
+				default:
+					return nil, fmt.Errorf("unexpected value type: %s", p.current.Type)
 				}
-			default:
-				return nil, fmt.Errorf("unexpected value type: %s (literal: %s)", p.current.Type, p.current.Literal)
+				p.nextToken()
 			}
-			p.nextToken()
+
+			values = append(values, val)
+
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			}
 		}
 
-		values = append(values, val)
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected )")
+		}
+		p.nextToken()
 
+		stmt.Values = append(stmt.Values, values)
+
+		// Check for more rows
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
+			continue
+		} else {
+			break
 		}
 	}
 
-	if p.current.Type != TOKEN_RPAREN {
-		return nil, fmt.Errorf("expected )")
-	}
-
-	stmt.Values = append(stmt.Values, values)
 	return stmt, nil
 }
 
@@ -761,7 +771,7 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			if p.current.Type == TOKEN_DOT {
 				p.nextToken() // consume dot
 				if p.current.Type != TOKEN_IDENT {
-					return nil, fmt.Errorf("expected column name after")
+					return nil, fmt.Errorf("expected column name after dot")
 				}
 				colName := firstPart + "." + p.current.Literal
 				stmt.Columns = append(stmt.Columns, colName)
@@ -791,6 +801,50 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 	stmt.TableName = p.current.Literal
 	p.nextToken()
+
+	// Check for table alias (AS alias or just alias)
+	if p.current.Type == TOKEN_AS {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected alias after AS")
+		}
+		stmt.TableAlias = p.current.Literal
+		p.nextToken()
+	} else if p.current.Type == TOKEN_IDENT &&
+		p.current.Type != TOKEN_INNER &&
+		p.current.Type != TOKEN_LEFT &&
+		p.current.Type != TOKEN_RIGHT &&
+		p.current.Type != TOKEN_FULL &&
+		p.current.Type != TOKEN_CROSS &&
+		p.current.Type != TOKEN_WHERE &&
+		p.current.Type != TOKEN_ORDER &&
+		p.current.Type != TOKEN_GROUP &&
+		p.current.Type != TOKEN_LIMIT {
+		// Implicit alias (no AS keyword)
+		stmt.TableAlias = p.current.Literal
+		p.nextToken()
+	}
+
+	// Parse optional table alias: FROM documents d or FROM documents AS d
+	switch p.current.Type {
+	case TOKEN_AS:
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected alias after AS")
+		}
+		stmt.TableAlias = p.current.Literal
+		p.nextToken()
+	case TOKEN_IDENT:
+		// Check if this is an implicit alias (not a keyword)
+		keyword := strings.ToUpper(p.current.Literal)
+		if keyword != "INNER" && keyword != "LEFT" && keyword != "RIGHT" &&
+			keyword != "FULL" && keyword != "CROSS" && keyword != "JOIN" &&
+			keyword != "WHERE" && keyword != "GROUP" && keyword != "ORDER" &&
+			keyword != "LIMIT" && keyword != "OFFSET" && keyword != "HAVING" {
+			stmt.TableAlias = p.current.Literal
+			p.nextToken()
+		}
+	}
 
 	// Parse JOINs
 	for {
@@ -1347,22 +1401,49 @@ func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
 func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	join := JoinClause{Type: joinType}
 
+	fmt.Printf("DEBUG parseJoin: Starting, joinType=%s, current=%s (literal='%s')\n",
+		joinType, p.current.Type, p.current.Literal)
+
 	// Parse table name
 	if p.current.Type != TOKEN_IDENT {
 		return join, fmt.Errorf("expected table name")
 	}
 	join.Table = p.current.Literal
+	fmt.Printf("DEBUG parseJoin: Got table name: %s\n", join.Table)
 	p.nextToken()
+	fmt.Printf("DEBUG parseJoin: After table name, current=%s (literal='%s')\n",
+		p.current.Type, p.current.Literal)
 
 	// Optional alias
-	if p.current.Type == TOKEN_AS {
+	switch p.current.Type {
+	case TOKEN_AS:
+		fmt.Printf("DEBUG parseJoin: Found AS keyword\n")
 		p.nextToken()
 		if p.current.Type != TOKEN_IDENT {
 			return join, fmt.Errorf("expected alias after AS")
 		}
 		join.Alias = p.current.Literal
+		fmt.Printf("DEBUG parseJoin: Got alias (with AS): %s\n", join.Alias)
 		p.nextToken()
+	case TOKEN_IDENT:
+		keyword := strings.ToUpper(p.current.Literal)
+		fmt.Printf("DEBUG parseJoin: Found IDENT, checking if alias: '%s' (upper: '%s')\n",
+			p.current.Literal, keyword)
+
+		if keyword != "ON" && keyword != "WHERE" && keyword != "INNER" &&
+			keyword != "LEFT" && keyword != "RIGHT" && keyword != "FULL" &&
+			keyword != "CROSS" && keyword != "JOIN" && keyword != "ORDER" &&
+			keyword != "GROUP" && keyword != "LIMIT" && keyword != "OFFSET" {
+			join.Alias = p.current.Literal
+			fmt.Printf("DEBUG parseJoin: Got implicit alias: %s\n", join.Alias)
+			p.nextToken()
+		} else {
+			fmt.Printf("DEBUG parseJoin: '%s' is a keyword, not an alias\n", keyword)
+		}
 	}
+
+	fmt.Printf("DEBUG parseJoin: Before ON check, current=%s (literal='%s')\n",
+		p.current.Type, p.current.Literal)
 
 	// CROSS JOIN doesn't have ON condition
 	if joinType == "CROSS" {
@@ -1371,11 +1452,13 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 
 	// Parse ON condition
 	if p.current.Type != TOKEN_ON {
-		return join, fmt.Errorf("expected ON after JOIN table")
+		return join, fmt.Errorf("expected ON after JOIN table, got %s (literal: '%s')",
+			p.current.Type, p.current.Literal)
 	}
+	fmt.Printf("DEBUG parseJoin: Found ON, parsing condition\n")
 	p.nextToken()
 
-	// Parse join condition: table1.col1 = table2.col2
+	// Parse join condition
 	condition := &JoinCondition{}
 
 	// Parse left side
@@ -1385,17 +1468,15 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	leftPart := p.current.Literal
 	p.nextToken()
 
-	// Check for DOT token (table.column syntax)
 	if p.current.Type == TOKEN_DOT {
-		p.nextToken() // consume dot
+		p.nextToken()
 		if p.current.Type != TOKEN_IDENT {
-			return join, fmt.Errorf("expected column name after")
+			return join, fmt.Errorf("expected column name after dot")
 		}
 		condition.LeftTable = leftPart
 		condition.LeftColumn = p.current.Literal
 		p.nextToken()
 	} else {
-		// No table prefix, just column
 		condition.LeftColumn = leftPart
 	}
 
@@ -1425,20 +1506,22 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	rightPart := p.current.Literal
 	p.nextToken()
 
-	// Check for DOT token (table.column syntax)
 	if p.current.Type == TOKEN_DOT {
-		p.nextToken() // consume dot
+		p.nextToken()
 		if p.current.Type != TOKEN_IDENT {
-			return join, fmt.Errorf("expected column name after")
+			return join, fmt.Errorf("expected column name after dot")
 		}
 		condition.RightTable = rightPart
 		condition.RightColumn = p.current.Literal
 		p.nextToken()
 	} else {
-		// No table prefix
 		condition.RightColumn = rightPart
 	}
 
 	join.Condition = condition
+	fmt.Printf("DEBUG parseJoin: Parsed condition: %s.%s %s %s.%s\n",
+		condition.LeftTable, condition.LeftColumn, condition.Operator,
+		condition.RightTable, condition.RightColumn)
+
 	return join, nil
 }
