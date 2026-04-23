@@ -369,25 +369,32 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		where = convertWhereClause(stmt.Where)
 	}
 
-	rows, err := table.Select(stmt.Columns, where)
+	// Fetch rows from main table
+	initialColumns := stmt.Columns
+	if len(stmt.Joins) > 0 {
+		initialColumns = []string{"*"}
+	}
+
+	rows, err := table.Select(initialColumns, where)
 	if err != nil {
 		return nil, err
 	}
 
 	// Handle JOINs
 	if len(stmt.Joins) > 0 {
+		// Determine the effective name for the main table (alias or name)
+		mainTableRef := stmt.TableName
+		if stmt.TableAlias != "" {
+			mainTableRef = stmt.TableAlias
+		}
+
 		// Prefix main table columns before JOIN
 		prefixedRows := make([]storage.Row, len(rows))
 		for i, row := range rows {
 			prefixedRow := make(storage.Row)
 			for k, v := range row {
 				if !strings.Contains(k, ".") {
-					// Use alias if specified, otherwise use table name
-					tableRef := stmt.TableName
-					if stmt.TableAlias != "" {
-						tableRef = stmt.TableAlias
-					}
-					prefixedRow[tableRef+"."+k] = v
+					prefixedRow[mainTableRef+"."+k] = v
 				} else {
 					prefixedRow[k] = v
 				}
@@ -396,7 +403,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 		rows = prefixedRows
 
-		rows, err = e.executeJoins(stmt.TableName, rows, stmt.Joins, dbInstance)
+		rows, err = e.executeJoins(mainTableRef, rows, stmt.Joins, dbInstance)
 		if err != nil {
 			return nil, err
 		}
@@ -418,34 +425,20 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			aliasMap[join.Table] = join.Table
 		}
 
-		// Project columns with alias resolution
+		// Project columns
 		if len(stmt.Columns) > 0 && stmt.Columns[0] != "*" {
 			projectedRows := make([]storage.Row, len(rows))
 			for i, row := range rows {
 				projectedRow := make(storage.Row)
 				for _, colSpec := range stmt.Columns {
-					if strings.Contains(colSpec, ".") {
-						parts := strings.Split(colSpec, ".")
-						tableOrAlias := parts[0]
-						colName := parts[1]
-
-						// Resolve alias to actual table name
-						actualTable := tableOrAlias
-						if mappedTable, ok := aliasMap[tableOrAlias]; ok {
-							actualTable = mappedTable
-						}
-
-						// Look up the column value
-						key := actualTable + "." + colName
-						val, ok := row[key]
-						if !ok {
-							// Try without prefix as fallback
-							val = row[colName]
-						}
-
-						projectedRow[colSpec] = val
+					val, ok := row[colSpec]
+					if !ok && strings.Contains(colSpec, ".") {
+						// Fallback: if they used table name but it's aliased, try to resolve?
+						// Actually, standard SQL requires using the alias.
+						// But let's try to find it in the row.
+						projectedRow[colSpec] = nil
 					} else {
-						projectedRow[colSpec] = row[colSpec]
+						projectedRow[colSpec] = val
 					}
 				}
 				projectedRows[i] = projectedRow
@@ -515,22 +508,28 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 			return nil, err
 		}
 
+		// Determine effective name for right table (alias or name)
+		rightTableRef := join.Table
+		if join.Alias != "" {
+			rightTableRef = join.Alias
+		}
+
 		switch join.Type {
 		case "INNER":
-			resultRows = e.executeInnerJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+			resultRows = e.executeInnerJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
 		case "LEFT":
-			resultRows = e.executeLeftJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+			resultRows = e.executeLeftJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
 		case "RIGHT":
-			resultRows = e.executeRightJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+			resultRows = e.executeRightJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
 		case "FULL":
-			resultRows = e.executeFullJoin(leftTable, resultRows, join.Table, rightRows, join.Condition)
+			resultRows = e.executeFullJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
 		case "CROSS":
-			resultRows = e.executeCrossJoin(leftTable, resultRows, join.Table, rightRows)
+			resultRows = e.executeCrossJoin(leftTable, resultRows, rightTableRef, rightRows)
 		default:
 			return nil, fmt.Errorf("unsupported join type: %s", join.Type)
 		}
 
-		leftTable = join.Table // For chained joins
+		leftTable = rightTableRef // For chained joins
 	}
 
 	return resultRows, nil
