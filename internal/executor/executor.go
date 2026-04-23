@@ -14,17 +14,29 @@ import (
 )
 
 type Executor struct {
-	db *storage.Database
+	db      *storage.Database
+	session *storage.Session
 }
 
-func NewExecutor(db *storage.Database) *Executor {
-	return &Executor{db: db}
+func NewExecutor(db *storage.Database, session *storage.Session) *Executor {
+	return &Executor{
+		db:      db,
+		session: session,
+	}
 }
 
 type Result struct {
 	Message string
 	Rows    []storage.Row
 	Columns []string
+}
+
+func (e *Executor) getActiveDatabase() (*storage.DatabaseInstance, error) {
+	dbName := e.session.GetDatabase()
+	if dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+	return e.db.GetDatabaseInstance(dbName)
 }
 
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
@@ -75,9 +87,12 @@ func (e *Executor) executeCreateDatabase(stmt *parser.CreateDatabaseStmt) (*Resu
 }
 
 func (e *Executor) executeUseDatabase(stmt *parser.UseDatabaseStmt) (*Result, error) {
-	if err := e.db.UseDatabase(stmt.DatabaseName); err != nil {
+	if _, err := e.db.GetDatabaseInstance(stmt.DatabaseName); err != nil {
 		return nil, err
 	}
+
+	e.session.SetDatabase(stmt.DatabaseName)
+	e.db.Logger.Info("Session %s switched to database: %s", e.session.ID, stmt.DatabaseName)
 
 	return &Result{
 		Message: fmt.Sprintf("Database changed to %s", stmt.DatabaseName),
@@ -103,7 +118,7 @@ func (e *Executor) executeShowDatabases() (*Result, error) {
 	rows := make([]storage.Row, len(databases))
 	for i, dbName := range databases {
 		current := ""
-		if dbName == e.db.CurrentDatabase {
+		if dbName == e.session.GetDatabase() {
 			current = "*"
 		}
 		rows[i] = storage.Row{
@@ -119,7 +134,7 @@ func (e *Executor) executeShowDatabases() (*Result, error) {
 }
 
 func (e *Executor) executeShowTables() (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
@@ -138,12 +153,12 @@ func (e *Executor) executeShowTables() (*Result, error) {
 }
 
 func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[tableName]
+	table, exists := dbInstance.GetTable(tableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
@@ -175,7 +190,7 @@ func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
 }
 
 func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
@@ -214,9 +229,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	}
 
 	table := storage.NewTable(stmt.TableName, columns, tableMeta)
-	dbInstance.Tables[stmt.TableName] = table
+	dbInstance.SetTable(stmt.TableName, table)
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -226,12 +241,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 }
 
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -319,7 +334,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					continue
 				}
 
-				refTable, exists := dbInstance.Tables[col.ForeignKey.RefTable]
+				refTable, exists := dbInstance.GetTable(col.ForeignKey.RefTable)
 				if !exists {
 					return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
 				}
@@ -344,7 +359,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		}
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -354,12 +369,12 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -481,7 +496,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		columns = table.GetColumnNames()
 		// Add joined table columns with prefixes
 		for _, join := range stmt.Joins {
-			joinTable := dbInstance.Tables[join.Table]
+			joinTable, ok := dbInstance.GetTable(join.Table)
+			if !ok {
+				continue
+			}
 			for _, col := range joinTable.GetColumnNames() {
 				columns = append(columns, join.Table+"."+col)
 			}
@@ -498,7 +516,7 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 	resultRows := leftRows
 
 	for _, join := range joins {
-		rightTable, exists := dbInstance.Tables[join.Table]
+		rightTable, exists := dbInstance.GetTable(join.Table)
 		if !exists {
 			return nil, fmt.Errorf("table %s does not exist", join.Table)
 		}
@@ -962,12 +980,12 @@ func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
 }
 
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -982,7 +1000,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -992,12 +1010,12 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 }
 
 func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1012,7 +1030,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1022,16 +1040,16 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 }
 
 func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	if _, exists := dbInstance.Tables[stmt.TableName]; !exists {
+	if _, exists := dbInstance.GetTable(stmt.TableName); !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	delete(dbInstance.Tables, stmt.TableName)
+	dbInstance.DeleteTable(stmt.TableName)
 
 	tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
 	if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
@@ -1054,12 +1072,12 @@ func (e *Executor) executeDropDatabase(stmt *parser.DropDatabaseStmt) (*Result, 
 }
 
 func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1068,7 +1086,7 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1078,12 +1096,12 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 }
 
 func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1099,7 +1117,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 			return nil, err
 		}
 
-		if err := e.db.SaveTableToDisk(table); err != nil {
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -1131,12 +1149,12 @@ func (e *Executor) executeCommentDatabase(stmt *parser.CommentStmt) (*Result, er
 }
 
 func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.ObjectName]
+	table, exists := dbInstance.GetTable(stmt.ObjectName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
 	}
@@ -1154,7 +1172,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 		table.Metadata.Description = stmt.Comment
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1164,7 +1182,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 }
 
 func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
@@ -1173,7 +1191,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1202,7 +1220,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
 	}
 
-	if err := e.db.SaveTableToDisk(table); err != nil {
+	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1289,12 +1307,12 @@ func (e *Executor) executeVectorSearch(stmt *parser.SelectStmt, rows []storage.R
 }
 
 func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
-	dbInstance, err := e.db.GetCurrentDatabase()
+	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
 	}
 
-	table, exists := dbInstance.Tables[stmt.TableName]
+	table, exists := dbInstance.GetTable(stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}

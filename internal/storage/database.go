@@ -20,7 +20,29 @@ type DatabaseInstance struct {
 	Name     string
 	Tables   map[string]*Table
 	BasePath string
-	mu       sync.RWMutex // nolint:unused // Reserved for future thread-safe operations
+	mu       sync.RWMutex
+}
+
+// GetTable retrieves a table by name safely
+func (di *DatabaseInstance) GetTable(name string) (*Table, bool) {
+	di.mu.RLock()
+	defer di.mu.RUnlock()
+	t, ok := di.Tables[name]
+	return t, ok
+}
+
+// SetTable adds or updates a table safely
+func (di *DatabaseInstance) SetTable(name string, table *Table) {
+	di.mu.Lock()
+	defer di.mu.Unlock()
+	di.Tables[name] = table
+}
+
+// DeleteTable removes a table safely
+func (di *DatabaseInstance) DeleteTable(name string) {
+	di.mu.Lock()
+	defer di.mu.Unlock()
+	delete(di.Tables, name)
 }
 
 // NewDatabaseInstance creates a new database instance
@@ -38,9 +60,9 @@ type Database struct {
 	Logger          *util.Logger
 	MetadataStore   *metadata.MetadataStore
 	Databases       map[string]*DatabaseInstance
-	CurrentDatabase string
 	LockFile        string
 	mu              sync.RWMutex
+	SessionMgr      *SessionManager
 }
 
 // Initialize sets up the database with persistent storage
@@ -57,8 +79,9 @@ func Initialize() (*Database, error) {
 	db := &Database{
 		DataDir:   dd,
 		Logger:    logger,
-		Databases: make(map[string]*DatabaseInstance),
-		LockFile:  filepath.Join(dd.RootPath, "ghostsql.pid"),
+		Databases:  make(map[string]*DatabaseInstance),
+		LockFile:   filepath.Join(dd.RootPath, "ghostsql.pid"),
+		SessionMgr: NewSessionManager(),
 	}
 
 	// Acquire lock file
@@ -117,41 +140,18 @@ func (db *Database) CreateDatabase(dbName string) error {
 	dbInstance := NewDatabaseInstance(dbName, dbPath)
 	db.Databases[dbName] = dbInstance
 
-	// If this is the first database, make it current
-	if db.CurrentDatabase == "" {
-		db.CurrentDatabase = dbName
-	}
-
 	db.Logger.Info("Created database: %s", dbName)
 	return nil
 }
 
-// UseDatabase switches to a different database
-func (db *Database) UseDatabase(dbName string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if _, exists := db.Databases[dbName]; !exists {
-		return fmt.Errorf("database %s does not exist", dbName)
-	}
-
-	db.CurrentDatabase = dbName
-	db.Logger.Info("Switched to database: %s", dbName)
-	return nil
-}
-
-// GetCurrentDatabase returns the current database instance
-func (db *Database) GetCurrentDatabase() (*DatabaseInstance, error) {
+// GetDatabaseInstance returns a database instance by name
+func (db *Database) GetDatabaseInstance(dbName string) (*DatabaseInstance, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	if db.CurrentDatabase == "" {
-		return nil, fmt.Errorf("no database selected")
-	}
-
-	dbInstance, exists := db.Databases[db.CurrentDatabase]
+	dbInstance, exists := db.Databases[dbName]
 	if !exists {
-		return nil, fmt.Errorf("current database %s does not exist", db.CurrentDatabase)
+		return nil, fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	return dbInstance, nil
@@ -171,14 +171,11 @@ func (db *Database) ListDatabases() []string {
 
 // DropDatabase deletes a database
 func (db *Database) DropDatabase(dbName string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if dbName == db.CurrentDatabase {
-		return fmt.Errorf("cannot drop currently selected database")
-	}
-
+	// Check if exists
+	db.mu.RLock()
 	dbInstance, exists := db.Databases[dbName]
+	db.mu.RUnlock()
+
 	if !exists {
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
@@ -218,11 +215,6 @@ func (db *Database) LoadAllDatabases() error {
 		}
 
 		db.Databases[dbName] = dbInstance
-
-		// Set first database as current
-		if db.CurrentDatabase == "" {
-			db.CurrentDatabase = dbName
-		}
 	}
 
 	return nil
