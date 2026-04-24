@@ -98,6 +98,15 @@ const (
 	TOKEN_CROSS
 
 	TOKEN_DOT
+	TOKEN_CASE
+	TOKEN_WHEN
+	TOKEN_THEN
+	TOKEN_ELSE
+	TOKEN_END
+	TOKEN_OPERATOR
+	TOKEN_IN
+	TOKEN_NOT_MATCH
+	TOKEN_NOT_MATCH_CI
 )
 
 type Token struct {
@@ -191,7 +200,16 @@ func (t TokenType) String() string {
 		TOKEN_OUTER: "OUTER",
 		TOKEN_CROSS: "CROSS",
 
-		TOKEN_DOT: "DOT",
+		TOKEN_DOT:      "DOT",
+		TOKEN_CASE:     "CASE",
+		TOKEN_WHEN:     "WHEN",
+		TOKEN_THEN:     "THEN",
+		TOKEN_ELSE:     "ELSE",
+		TOKEN_END:      "END",
+		TOKEN_OPERATOR:     "OPERATOR",
+		TOKEN_IN:           "IN",
+		TOKEN_NOT_MATCH:    "!~",
+		TOKEN_NOT_MATCH_CI: "!~*",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -260,6 +278,13 @@ var keywords = map[string]TokenType{
 	"FULL":            TOKEN_FULL,
 	"OUTER":           TOKEN_OUTER,
 	"CROSS":           TOKEN_CROSS,
+	"CASE":            TOKEN_CASE,
+	"WHEN":            TOKEN_WHEN,
+	"THEN":            TOKEN_THEN,
+	"ELSE":            TOKEN_ELSE,
+	"END":             TOKEN_END,
+	"OPERATOR":        TOKEN_OPERATOR,
+	"IN":              TOKEN_IN,
 }
 
 func LookupKeyword(ident string) TokenType {

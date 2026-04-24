@@ -98,6 +98,18 @@ func (l *Lexer) NextToken() Token {
 			token.Literal = "!="
 			l.advance()
 			l.advance()
+		} else if l.peek() == '~' {
+			l.advance()
+			if l.peek() == '*' {
+				token.Type = TOKEN_NOT_MATCH_CI
+				token.Literal = "!~*"
+				l.advance()
+				l.advance()
+			} else {
+				token.Type = TOKEN_NOT_MATCH
+				token.Literal = "!~"
+				l.advance()
+			}
 		} else {
 			token.Type = TOKEN_ILLEGAL
 			token.Literal = "!"
@@ -106,6 +118,10 @@ func (l *Lexer) NextToken() Token {
 	case '\'', '"':
 		token.Type = TOKEN_STRING
 		token.Literal = l.readString(ch)
+	case '~':
+		token.Type = TOKEN_IDENT
+		token.Literal = "~"
+		l.advance()
 	case '.':
 		token.Type = TOKEN_DOT
 		token.Literal = "."
