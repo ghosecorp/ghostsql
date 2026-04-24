@@ -870,9 +870,40 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				stmt.Columns = append(stmt.Columns, name)
 				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: name, Alias: alias})
 			}
-		} else {
-			// Unknown token, skip
+		} else if p.current.Type == TOKEN_STRING {
+			// Bare string literal e.g. ''
+			expr := "'" + p.current.Literal + "'"
 			p.nextToken()
+			alias := expr
+			if p.current.Type == TOKEN_AS {
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM {
+				alias = p.current.Literal
+				p.nextToken()
+			}
+			stmt.Columns = append(stmt.Columns, alias)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
+		} else {
+			// Other literal (e.g. false, true)
+			expr := p.current.Literal
+			p.nextToken()
+			alias := expr
+			if p.current.Type == TOKEN_AS {
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM {
+				alias = p.current.Literal
+				p.nextToken()
+			}
+			stmt.Columns = append(stmt.Columns, alias)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
 		}
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
