@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ghosecorp/ghostsql/internal/metadata"
@@ -386,13 +388,22 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Fetch rows from main table
 	initialColumns := stmt.Columns
+	effectiveWhere := where
 	if len(stmt.Joins) > 0 {
 		initialColumns = []string{"*"}
+		effectiveWhere = nil // Delay filtering until after JOINs
 	}
 
-	rows, err := table.Select(initialColumns, where)
+	rows, err := table.Select(initialColumns, effectiveWhere)
 	if err != nil {
 		return nil, err
+	}
+
+	// Validate columns in WHERE clause (if not a JOIN where columns might be from other tables)
+	if len(stmt.Joins) == 0 && where != nil {
+		if err := e.validateWhereColumns(table, where); err != nil {
+			return nil, err
+		}
 	}
 
 	// Handle JOINs
@@ -421,6 +432,17 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows, err = e.executeJoins(mainTableRef, rows, stmt.Joins, dbInstance)
 		if err != nil {
 			return nil, err
+		}
+
+		// Apply delayed WHERE clause after JOINs
+		if len(stmt.Joins) > 0 && where != nil {
+			filteredRows := make([]storage.Row, 0)
+			for _, row := range rows {
+				if evaluateWhereOnRow(row, where) {
+					filteredRows = append(filteredRows, row)
+				}
+			}
+			rows = filteredRows
 		}
 
 		// Build alias to table mapping
@@ -490,18 +512,78 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows = rows[:stmt.Limit]
 	}
 
-	// Determine output columns
-	columns := stmt.Columns
-	if len(columns) == 1 && columns[0] == "*" {
-		columns = table.GetColumnNames()
-		// Add joined table columns with prefixes
-		for _, join := range stmt.Joins {
-			joinTable, ok := dbInstance.GetTable(join.Table)
-			if !ok {
-				continue
+	// Determine output columns using SelectColumns for alias support
+	var columns []string
+	if len(stmt.SelectColumns) > 0 && !(len(stmt.SelectColumns) == 1 && stmt.SelectColumns[0].Expression == "*") {
+		columns = make([]string, len(stmt.SelectColumns))
+		// Rewrite rows to use aliased keys
+		for i, sc := range stmt.SelectColumns {
+			outName := sc.Expression
+			if sc.Alias != "" {
+				outName = sc.Alias
+			} else if strings.Contains(outName, ".") {
+				// Strip table prefix: "c.relname" -> "relname"
+				parts := strings.Split(outName, ".")
+				outName = parts[len(parts)-1]
 			}
-			for _, col := range joinTable.GetColumnNames() {
-				columns = append(columns, join.Table+"."+col)
+			columns[i] = outName
+		}
+		// Ensure unique column names for row mapping
+		uniqueNames := make([]string, len(columns))
+		nameCount := make(map[string]int)
+		for i, name := range columns {
+			count := nameCount[name]
+			nameCount[name]++
+			if count > 0 {
+				uniqueNames[i] = fmt.Sprintf("%s_%d", name, count)
+			} else {
+				uniqueNames[i] = name
+			}
+		}
+		columns = uniqueNames
+
+		// Rewrite rows: map expression keys to output names
+		rewritten := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			newRow := make(storage.Row)
+			for j, sc := range stmt.SelectColumns {
+				outName := columns[j]
+				expr := sc.Expression
+				// Try exact key first
+				val, ok := row[expr]
+				if !ok {
+					// Try with table prefix variants
+					for k, v := range row {
+						if k == expr || strings.HasSuffix(k, "."+expr) ||
+							(strings.Contains(expr, ".") && strings.HasSuffix(expr, "."+strings.Split(k, ".")[len(strings.Split(k, "."))-1])) {
+							val = v
+							ok = true
+							break
+						}
+					}
+				}
+				if !ok {
+					// Stub: function calls and computed columns return empty string
+					val = ""
+				}
+				newRow[outName] = val
+			}
+			rewritten[i] = newRow
+		}
+		rows = rewritten
+	} else {
+		columns = stmt.Columns
+		if len(columns) == 1 && columns[0] == "*" {
+			columns = table.GetColumnNames()
+			// Add joined table columns with prefixes
+			for _, join := range stmt.Joins {
+				joinTable, ok := dbInstance.GetTable(join.Table)
+				if !ok {
+					continue
+				}
+				for _, col := range joinTable.GetColumnNames() {
+					columns = append(columns, join.Table+"."+col)
+				}
 			}
 		}
 	}
@@ -561,21 +643,24 @@ func (e *Executor) executeInnerJoin(leftTable string, leftRows []storage.Row, ri
 			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
 
-				// Copy left row with table prefix
+				// Copy left row
 				for k, v := range leftRow {
-					if strings.Contains(k, ".") {
-						merged[k] = v
-					} else {
+					merged[k] = v
+					if !strings.Contains(k, ".") {
 						merged[leftTable+"."+k] = v
 					}
 				}
 
-				// Copy right row with table prefix
+				// Copy right row
 				for k, v := range rightRow {
-					if strings.Contains(k, ".") {
-						merged[k] = v
-					} else {
+					if !strings.Contains(k, ".") {
 						merged[rightTable+"."+k] = v
+						// Only add un-prefixed if not already present from left
+						if _, exists := merged[k]; !exists {
+							merged[k] = v
+						}
+					} else {
+						merged[k] = v
 					}
 				}
 
@@ -596,19 +681,23 @@ func (e *Executor) executeLeftJoin(leftTable string, leftRows []storage.Row, rig
 			if e.evaluateJoinCondition(leftTable, leftRow, rightTable, rightRow, condition) {
 				merged := make(storage.Row)
 
+				// Copy left row
 				for k, v := range leftRow {
-					if strings.Contains(k, ".") {
-						merged[k] = v
-					} else {
+					merged[k] = v
+					if !strings.Contains(k, ".") {
 						merged[leftTable+"."+k] = v
 					}
 				}
 
+				// Copy right row
 				for k, v := range rightRow {
-					if strings.Contains(k, ".") {
-						merged[k] = v
-					} else {
+					if !strings.Contains(k, ".") {
 						merged[rightTable+"."+k] = v
+						if _, exists := merged[k]; !exists {
+							merged[k] = v
+						}
+					} else {
+						merged[k] = v
 					}
 				}
 
@@ -620,9 +709,8 @@ func (e *Executor) executeLeftJoin(leftTable string, leftRows []storage.Row, rig
 		if !matched {
 			merged := make(storage.Row)
 			for k, v := range leftRow {
-				if strings.Contains(k, ".") {
-					merged[k] = v
-				} else {
+				merged[k] = v
+				if !strings.Contains(k, ".") {
 					merged[leftTable+"."+k] = v
 				}
 			}
@@ -956,27 +1044,82 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 }
 
 func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
-	val, exists := row[where.Column]
-	if !exists {
-		return false
+	// Base condition evaluation
+	match := false
+
+	// Skip system function calls - always evaluate to true for catalog visibility
+	// Detect any function-like call (containing parentheses)
+	if strings.Contains(where.Column, "(") {
+		match = true
+	} else {
+		val, exists := row[where.Column]
+		if !exists {
+			// Try fuzzy matching for joined columns (e.g. c.relname)
+			for k, v := range row {
+				if strings.HasSuffix(k, "."+where.Column) || strings.HasSuffix(where.Column, "."+k) {
+					val = v
+					exists = true
+					break
+				}
+			}
+		}
+
+		if !exists {
+			// If column doesn't exist, it's a mismatch unless we're looking for NULL
+			match = (where.Operator == "=" && where.Value == nil)
+		} else {
+			switch where.Operator {
+			case "=":
+				match = compareValues(val, where.Value) == 0
+			case "!=", "<>":
+				match = compareValues(val, where.Value) != 0
+			case "<":
+				match = compareValues(val, where.Value) < 0
+			case "<=":
+				match = compareValues(val, where.Value) <= 0
+			case ">":
+				match = compareValues(val, where.Value) > 0
+			case ">=":
+				match = compareValues(val, where.Value) >= 0
+			case "LIKE":
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern = strings.ReplaceAll(pattern, "_", ".")
+				// Map LIKE to a case-insensitive anchored regex
+				match, _ = regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+			case "~":
+				match, _ = regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+			case "~*":
+				match, _ = regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+			case "!~":
+				matched, _ := regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match = !matched
+			case "!~*":
+				matched, _ := regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match = !matched
+			case "IN":
+				if list, ok := where.Value.([]interface{}); ok {
+					for _, item := range list {
+						if compareValues(val, item) == 0 {
+							match = true
+							break
+						}
+					}
+				}
+			default:
+				match = false
+			}
+		}
 	}
 
-	switch where.Operator {
-	case "=":
-		return compareValues(val, where.Value) == 0
-	case "!=", "<>":
-		return compareValues(val, where.Value) != 0
-	case "<":
-		return compareValues(val, where.Value) < 0
-	case "<=":
-		return compareValues(val, where.Value) <= 0
-	case ">":
-		return compareValues(val, where.Value) > 0
-	case ">=":
-		return compareValues(val, where.Value) >= 0
-	default:
-		return false
+	// Handle AND/OR chains
+	if where.And != nil {
+		return match && evaluateWhereOnRow(row, where.And)
 	}
+	if where.Or != nil {
+		return match || evaluateWhereOnRow(row, where.Or)
+	}
+
+	return match
 }
 
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
@@ -1375,11 +1518,20 @@ func convertWhereClause(where *parser.WhereClause) *storage.WhereClause {
 		return nil
 	}
 
-	return &storage.WhereClause{
+	sw := &storage.WhereClause{
 		Column:   where.Column,
 		Operator: where.Operator,
 		Value:    where.Value,
 	}
+
+	if where.And != nil {
+		sw.And = convertWhereClause(where.And)
+	}
+	if where.Or != nil {
+		sw.Or = convertWhereClause(where.Or)
+	}
+
+	return sw
 }
 
 func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClause) []storage.Row {
@@ -1390,10 +1542,29 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 	sorted := make([]storage.Row, len(rows))
 	copy(sorted, rows)
 
+	// Pre-build column list for positional ORDER BY resolution
+	colNames := []string{}
+	if len(sorted) > 0 {
+		// Use keys from the first row as columns
+		for k := range sorted[0] {
+			colNames = append(colNames, k)
+		}
+		sort.Strings(colNames)
+	}
+
 	sort.SliceStable(sorted, func(i, j int) bool {
 		for _, order := range orderBy {
-			valI := sorted[i][order.Column]
-			valJ := sorted[j][order.Column]
+			col := order.Column
+			// Handle positional ORDER BY (e.g. ORDER BY 1, 2)
+			if pos, err := strconv.Atoi(col); err == nil {
+				if pos >= 1 && pos <= len(colNames) {
+					// Map position to column name
+					col = colNames[pos-1]
+				}
+			}
+
+			valI := sorted[i][col]
+			valJ := sorted[j][col]
 
 			cmp := compareValues(valI, valJ)
 			if cmp != 0 {
@@ -1407,6 +1578,39 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 	})
 
 	return sorted
+}
+
+func (e *Executor) validateWhereColumns(table *storage.Table, where *storage.WhereClause) error {
+	if where == nil {
+		return nil
+	}
+
+	// Skip function calls and system stubs
+	if !strings.Contains(where.Column, "(") {
+		exists := false
+		for _, col := range table.Columns {
+			if col.Name == where.Column {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			return fmt.Errorf("column \"%s\" does not exist", where.Column)
+		}
+	}
+
+	if where.And != nil {
+		if err := e.validateWhereColumns(table, where.And); err != nil {
+			return err
+		}
+	}
+	if where.Or != nil {
+		if err := e.validateWhereColumns(table, where.Or); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func compareValues(a, b interface{}) int {
