@@ -133,6 +133,6 @@ psql -h localhost -p 5433 -d ghostsql -U ghost -W
 
 ***
 
-**License**: Apache 2.0 (suggested)
+**License**: Apache 2.0
 
 **Contributing**: Pull requests, GitHub issues, feature suggestions welcome!
