@@ -2,7 +2,7 @@
 
 # GhostSQL
 
-**GhostSQL** is a high-performance, PostgreSQL-compatible SQL database written in Go, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
+**GhostSQL** is a high-performance, PostgreSQL-compatible SQL database by **Ghosecorp**, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
 
 ## Features
 
