@@ -10,7 +10,7 @@ GhostSQL is a flagship project of **Ghosecorp**, an initiative dedicated to buil
 
 Alongside GhostSQL, Ghosecorp maintains a growing portfolio of projects designed with a focus on architectural integrity and system efficiency.
 
-*   **Website**: [github.com/ghosecorp](https://github.com/ghosecorp/)
+*   **Website**: [ghosecorp.github.io](https://ghosecorp.github.io/)
 *   **GitHub**: [github.com/ghosecorp](https://github.com/ghosecorp)
 *   **LinkedIn**: [LinkedIn](https://www.linkedin.com/company/107066512/)
 

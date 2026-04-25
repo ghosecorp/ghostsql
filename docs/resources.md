@@ -2,7 +2,9 @@
 
 ## Communication
 
-*   **Website**: [ghosecorp.github.io/ghostsql](https://ghosecorp.github.io/ghostsql/)
+*   **Website**: [ghosecorp.github.io](https://ghosecorp.github.io/)
+*   **GitHub**: [github.com/ghosecorp](https://github.com/ghosecorp)
+*   **LinkedIn**: [Ghosecorp](https://www.linkedin.com/company/107066512/)
 *   **Email**: [ghosecorp@gmail.com](mailto:ghosecorp@gmail.com)
 
 ## Development Tools

@@ -34,6 +34,8 @@ theme:
   icon:
     logo: material/database
     repo: material/github
+  
+  favicon: https://raw.githubusercontent.com/ghosecorp/ghosecorp/main/assets/ghosecorp_logo.jpg
 
 repo_name: ghosecorp/ghostsql
 repo_url: https://github.com/ghosecorp/ghostsql
