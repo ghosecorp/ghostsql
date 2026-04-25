@@ -34,6 +34,8 @@ theme:
   icon:
     logo: material/database
     repo: material/github
+  
+  favicon: https://raw.githubusercontent.com/ghosecorp/ghosecorp/main/assets/ghosecorp_logo.jpg
 
 repo_name: ghosecorp/ghostsql
 repo_url: https://github.com/ghosecorp/ghostsql
@@ -42,8 +44,9 @@ nav:
   - Introduction: index.md
   - Getting Started: getting-started.md
   - Features:
+    - Relational Queries: features/relational.md
     - Vector Search: features/vector-search.md
-    - Relational Integrity: features/relational.md
+    - Authentication: features/authentication.md
     - SQL Reference: features/sql-reference.md
   - Development:
     - Architecture: development/architecture.md
