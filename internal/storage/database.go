@@ -86,35 +86,46 @@ func NewDatabaseInstance(name string, basePath string, db *Database) *DatabaseIn
 	}
 }
 
+// DatabaseConfig stores server configuration including credentials
+type DatabaseConfig struct {
+	Username string
+	Password string
+}
+
 // Database represents the GhostSQL server managing multiple databases
 type Database struct {
-	DataDir         *DataDir
-	Logger          *util.Logger
-	MetadataStore   *metadata.MetadataStore
-	Databases       map[string]*DatabaseInstance
-	LockFile        string
-	mu              sync.RWMutex
-	SessionMgr      *SessionManager
-	Catalog         *CatalogProvider
+	DataDir       *DataDir
+	Logger        *util.Logger
+	MetadataStore *metadata.MetadataStore
+	Databases     map[string]*DatabaseInstance
+	LockFile      string
+	mu            sync.RWMutex
+	SessionMgr    *SessionManager
+	Catalog       *CatalogProvider
+	Config        DatabaseConfig
 }
 
 // Initialize sets up the database with persistent storage
-func Initialize() (*Database, error) {
+func Initialize(rootPath string) (*Database, error) {
 	logger := util.NewLogger("GhostSQL")
 
 	// Initialize data directory structure
 	logger.Info("Initializing data directory...")
-	dd, err := InitDataDirectory()
+	dd, err := InitDataDirectory(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data directory: %w", err)
 	}
 
 	db := &Database{
-		DataDir:   dd,
-		Logger:    logger,
+		DataDir:    dd,
+		Logger:     logger,
 		Databases:  make(map[string]*DatabaseInstance),
 		LockFile:   filepath.Join(dd.RootPath, "ghostsql.pid"),
 		SessionMgr: NewSessionManager(),
+		Config: DatabaseConfig{
+			Username: "ghost",
+			Password: "ghostsql",
+		},
 	}
 	db.Catalog = NewCatalogProvider(db)
 

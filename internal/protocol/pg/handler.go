@@ -17,6 +17,7 @@ type Handler struct {
 	db       *storage.Database
 	session  *storage.Session
 	executor *executor.Executor
+	user     string
 }
 
 // NewHandler creates a new PG protocol handler
@@ -36,9 +37,18 @@ func (h *Handler) Handle() error {
 		return err
 	}
 
-	// 2. Authentication (Trust for now)
-	if err := h.sendAuthenticationOk(); err != nil {
-		return err
+	// 2. Authentication
+	// Only require password if the user is the configured 'ghost' user
+	if h.user == h.db.Config.Username {
+		if err := h.requestPassword(); err != nil {
+			h.sendError(err)
+			return err
+		}
+	} else {
+		// Trust other users (or anonymous) for now as requested
+		if err := h.sendAuthenticationOk(); err != nil {
+			return err
+		}
 	}
 
 	// 3. Send Parameter Status & ReadyForQuery
@@ -136,6 +146,10 @@ func (h *Handler) handleStartup() error {
 		h.session.SetDatabase(dbName)
 	}
 
+	if user, ok := params["user"]; ok {
+		h.user = user
+	}
+
 	return nil
 }
 
@@ -157,6 +171,34 @@ func (h *Handler) sendAuthenticationOk() error {
 	binary.BigEndian.PutUint32(msg[5:9], 0) // Auth OK
 	_, err := h.conn.Write(msg)
 	return err
+}
+
+func (h *Handler) requestPassword() error {
+	// Send AuthenticationCleartextPassword (3)
+	msg := make([]byte, 9)
+	msg[0] = ResAuthentication
+	binary.BigEndian.PutUint32(msg[1:5], 8)
+	binary.BigEndian.PutUint32(msg[5:9], 3) 
+	if _, err := h.conn.Write(msg); err != nil {
+		return err
+	}
+
+	// Read PasswordMessage
+	msgType, payload, err := h.readMessage()
+	if err != nil {
+		return err
+	}
+
+	if msgType != MsgPassword {
+		return fmt.Errorf("expected password message, got %c", msgType)
+	}
+
+	password := string(payload[:len(payload)-1]) // Remove null terminator
+	if password != h.db.Config.Password {
+		return fmt.Errorf("invalid password for user %s", h.user)
+	}
+
+	return h.sendAuthenticationOk()
 }
 
 func (h *Handler) sendParameterStatus(name, value string) error {

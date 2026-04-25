@@ -5,6 +5,9 @@ All notable changes to GhostSQL will be documented in this file.
 ## [0.1.1] - 2026-04-25
 
 ### Added
+- **PostgreSQL Authentication**: Implemented standard cleartext authentication flow with configurable credentials (default: `ghost`/`ghostsql`).
+- **Flexible Connection Modes**: Added support for 'Trusted' connections (skip auth for local development) while enforcing 'Password' mode for specific users.
+- **Improved Test Isolation**: Refactored `storage.Initialize` to support custom data paths, enabling concurrent test execution without lock file collisions.
 - **Comprehensive Integration Test Suite**: Added `tests/executor_test.go` covering full database lifecycle (CRUD, DDL, DML).
 - **PostgreSQL Vector Operators**: Added support for `<->` (L2 distance) and `<=>` (Cosine distance) in the lexer and parser.
 - **Enhanced JOIN support**: Verified and tested INNER, LEFT, RIGHT, FULL OUTER, and CROSS joins.

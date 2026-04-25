@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - master
-      - option-a # Added since user is currently working on this branch
+      - option-a
 
 permissions:
   contents: write
