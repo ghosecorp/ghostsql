@@ -39,6 +39,22 @@ func (di *DatabaseInstance) GetTable(name string) (*Table, bool) {
 		rows := di.db.Catalog.GetPGAttributeRows(di)
 		return &Table{Name: "pg_attribute", Rows: rows, Columns: di.db.Catalog.GetPGAttributeColumns()}, true
 	}
+	if name == "pg_attrdef" || name == "pg_catalog.pg_attrdef" {
+		rows := di.db.Catalog.GetPGAttrDefRows()
+		return &Table{Name: "pg_attrdef", Rows: rows, Columns: di.db.Catalog.GetPGAttrDefColumns()}, true
+	}
+	if name == "pg_type" || name == "pg_catalog.pg_type" {
+		rows := di.db.Catalog.GetPGTypeRows()
+		return &Table{Name: "pg_type", Rows: rows, Columns: di.db.Catalog.GetPGTypeColumns()}, true
+	}
+	if name == "pg_collation" || name == "pg_catalog.pg_collation" {
+		rows := di.db.Catalog.GetPGCollationRows()
+		return &Table{Name: "pg_collation", Rows: rows, Columns: di.db.Catalog.GetPGCollationColumns()}, true
+	}
+	if name == "pg_constraint" || name == "pg_catalog.pg_constraint" {
+		rows := di.db.Catalog.GetPGConstraintRows()
+		return &Table{Name: "pg_constraint", Rows: rows, Columns: di.db.Catalog.GetPGConstraintColumns()}, true
+	}
 
 	di.mu.RLock()
 	defer di.mu.RUnlock()

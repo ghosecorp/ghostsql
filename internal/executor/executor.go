@@ -399,6 +399,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, err
 	}
 
+	// Validate columns in WHERE clause (if not a JOIN where columns might be from other tables)
+	if len(stmt.Joins) == 0 && where != nil {
+		if err := e.validateWhereColumns(table, where); err != nil {
+			return nil, err
+		}
+	}
+
 	// Handle JOINs
 	if len(stmt.Joins) > 0 {
 		// Determine the effective name for the main table (alias or name)
@@ -521,6 +528,20 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			}
 			columns[i] = outName
 		}
+		// Ensure unique column names for row mapping
+		uniqueNames := make([]string, len(columns))
+		nameCount := make(map[string]int)
+		for i, name := range columns {
+			count := nameCount[name]
+			nameCount[name]++
+			if count > 0 {
+				uniqueNames[i] = fmt.Sprintf("%s_%d", name, count)
+			} else {
+				uniqueNames[i] = name
+			}
+		}
+		columns = uniqueNames
+
 		// Rewrite rows: map expression keys to output names
 		rewritten := make([]storage.Row, len(rows))
 		for i, row := range rows {
@@ -1557,6 +1578,39 @@ func (e *Executor) applyOrderBy(rows []storage.Row, orderBy []parser.OrderByClau
 	})
 
 	return sorted
+}
+
+func (e *Executor) validateWhereColumns(table *storage.Table, where *storage.WhereClause) error {
+	if where == nil {
+		return nil
+	}
+
+	// Skip function calls and system stubs
+	if !strings.Contains(where.Column, "(") {
+		exists := false
+		for _, col := range table.Columns {
+			if col.Name == where.Column {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			return fmt.Errorf("column \"%s\" does not exist", where.Column)
+		}
+	}
+
+	if where.And != nil {
+		if err := e.validateWhereColumns(table, where.And); err != nil {
+			return err
+		}
+	}
+	if where.Or != nil {
+		if err := e.validateWhereColumns(table, where.Or); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func compareValues(a, b interface{}) int {

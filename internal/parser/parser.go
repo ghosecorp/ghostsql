@@ -29,32 +29,46 @@ func (p *Parser) nextToken() {
 }
 
 func (p *Parser) Parse() (Statement, error) {
+	var stmt Statement
+	var err error
+
 	switch p.current.Type {
-	case TOKEN_CREATE:
-		return p.parseCreate()
-	case TOKEN_INSERT:
-		return p.parseInsert()
 	case TOKEN_SELECT:
-		return p.parseSelect()
+		stmt, err = p.parseSelect()
+	case TOKEN_INSERT:
+		stmt, err = p.parseInsert()
+	case TOKEN_CREATE:
+		stmt, err = p.parseCreate()
 	case TOKEN_USE:
-		return p.parseUse()
+		stmt, err = p.parseUse()
 	case TOKEN_SHOW:
-		return p.parseShow()
+		stmt, err = p.parseShow()
 	case TOKEN_UPDATE:
-		return p.parseUpdate()
+		stmt, err = p.parseUpdate()
 	case TOKEN_DELETE:
-		return p.parseDelete()
+		stmt, err = p.parseDelete()
 	case TOKEN_DROP:
-		return p.parseDrop()
-	case TOKEN_TRUNCATE:
-		return p.parseTruncate()
+		stmt, err = p.parseDrop()
 	case TOKEN_ALTER:
-		return p.parseAlter()
+		stmt, err = p.parseAlter()
+	case TOKEN_TRUNCATE:
+		stmt, err = p.parseTruncate()
 	case TOKEN_COMMENT:
-		return p.parseComment()
+		stmt, err = p.parseComment()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure no trailing junk
+	if p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_SEMICOLON {
+		return nil, fmt.Errorf("unexpected token after statement: %s (literal: '%s')", p.current.Type, p.current.Literal)
+	}
+
+	return stmt, nil
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
@@ -887,10 +901,58 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			}
 			stmt.Columns = append(stmt.Columns, alias)
 			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
+		} else if p.current.Type == TOKEN_LPAREN {
+			// Standalone subquery or expression in parens
+			p.nextToken() // consume (
+			depth := 1
+			expr := "("
+			isSubquery := false
+			if p.current.Type == TOKEN_SELECT {
+				isSubquery = true
+			}
+
+			for depth > 0 && p.current.Type != TOKEN_EOF {
+				if p.current.Type == TOKEN_LPAREN {
+					depth++
+				} else if p.current.Type == TOKEN_RPAREN {
+					depth--
+				}
+				expr += p.current.Literal + " "
+				p.nextToken()
+			}
+			expr = strings.TrimSpace(expr)
+
+			alias := "computed_column"
+			if isSubquery {
+				alias = "subquery"
+			}
+
+			if p.current.Type == TOKEN_AS {
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM {
+				alias = p.current.Literal
+				p.nextToken()
+			}
+			stmt.Columns = append(stmt.Columns, alias)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
 		} else {
 			// Other literal (e.g. false, true)
 			expr := p.current.Literal
 			p.nextToken()
+
+			// Handle potential cast: false::pg_catalog.bool
+			for p.current.Type == TOKEN_CAST {
+				p.nextToken() // consume ::
+				// Consume type name (may be dotted)
+				for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+					p.nextToken()
+				}
+			}
+
 			alias := expr
 			if p.current.Type == TOKEN_AS {
 				p.nextToken()
@@ -1075,15 +1137,50 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		} else {
 			// Regular ORDER BY
 			for {
-				if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_NUMBER {
-					return nil, fmt.Errorf("expected column name in ORDER BY")
+				col := p.current.Literal
+				p.nextToken()
+
+				// Check for operator syntax: vec <-> '[...]'
+				if p.current.Type == TOKEN_L2_DISTANCE || p.current.Type == TOKEN_COSINE_DISTANCE {
+					opType := p.current.Type
+					p.nextToken()
+
+					// Parse vector
+					vec, err := p.parseLiteralValue()
+					if err != nil {
+						return nil, err
+					}
+
+					funcName := "L2_DISTANCE"
+					if opType == TOKEN_COSINE_DISTANCE {
+						funcName = "COSINE_DISTANCE"
+					}
+
+					// Convert to vector string for executor
+					vecStr := ""
+					if s, ok := vec.(string); ok {
+						vecStr = s
+					}
+
+					stmt.VectorOrderBy = &VectorOrderBy{
+						Function:    funcName,
+						Column:      col,
+						QueryVector: nil, // Will be parsed by executor if string
+					}
+					// Special case: if it's a string, we can parse it here
+					if vecStr != "" {
+						v, err := storage.ParseVector(vecStr)
+						if err == nil {
+							stmt.VectorOrderBy.QueryVector = v.Values
+						}
+					}
+					break // Vector order by is usually standalone
 				}
 
 				orderBy := OrderByClause{
-					Column:     p.current.Literal,
+					Column:     col,
 					Descending: false,
 				}
-				p.nextToken()
 
 				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
 					orderBy.Descending = true

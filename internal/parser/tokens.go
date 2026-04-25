@@ -107,6 +107,8 @@ const (
 	TOKEN_IN
 	TOKEN_NOT_MATCH
 	TOKEN_NOT_MATCH_CI
+	TOKEN_CAST
+	TOKEN_COLON
 )
 
 type Token struct {
@@ -210,6 +212,8 @@ func (t TokenType) String() string {
 		TOKEN_IN:           "IN",
 		TOKEN_NOT_MATCH:    "!~",
 		TOKEN_NOT_MATCH_CI: "!~*",
+		TOKEN_CAST:         "::",
+		TOKEN_COLON:        ":",
 	}
 	if name, ok := names[t]; ok {
 		return name

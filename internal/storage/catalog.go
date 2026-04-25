@@ -162,3 +162,64 @@ func (cp *CatalogProvider) GetPGAttributeColumns() []Column {
 		{Name: "attcollation", Type: TypeInt},
 	}
 }
+
+// GetPGAttrDefRows returns rows for pg_catalog.pg_attrdef
+func (cp *CatalogProvider) GetPGAttrDefRows() []Row {
+	return []Row{} // Empty for now, no defaults
+}
+
+func (cp *CatalogProvider) GetPGAttrDefColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: TypeInt},
+		{Name: "adrelid", Type: TypeInt},
+		{Name: "adnum", Type: TypeInt},
+		{Name: "adbin", Type: TypeText},
+	}
+}
+
+// GetPGTypeRows returns rows for pg_catalog.pg_type
+func (cp *CatalogProvider) GetPGTypeRows() []Row {
+	return []Row{
+		{"oid": int64(23), "typname": "int4", "typlen": int16(4), "typnamespace": cp.GenerateOID("pg_catalog")},
+		{"oid": int64(25), "typname": "text", "typlen": int16(-1), "typnamespace": cp.GenerateOID("pg_catalog")},
+		{"oid": int64(1043), "typname": "varchar", "typlen": int16(-1), "typnamespace": cp.GenerateOID("pg_catalog")},
+	}
+}
+
+func (cp *CatalogProvider) GetPGTypeColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: TypeInt},
+		{Name: "typname", Type: TypeText},
+		{Name: "typlen", Type: TypeInt},
+		{Name: "typnamespace", Type: TypeInt},
+	}
+}
+
+// GetPGCollationRows returns rows for pg_catalog.pg_collation
+func (cp *CatalogProvider) GetPGCollationRows() []Row {
+	return []Row{
+		{"oid": int64(100), "collname": "default", "collnamespace": cp.GenerateOID("pg_catalog")},
+	}
+}
+
+func (cp *CatalogProvider) GetPGCollationColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: TypeInt},
+		{Name: "collname", Type: TypeText},
+		{Name: "collnamespace", Type: TypeInt},
+	}
+}
+
+// GetPGConstraintRows returns rows for pg_catalog.pg_constraint
+func (cp *CatalogProvider) GetPGConstraintRows() []Row {
+	return []Row{} // Empty for now
+}
+
+func (cp *CatalogProvider) GetPGConstraintColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: TypeInt},
+		{Name: "conname", Type: TypeText},
+		{Name: "conrelid", Type: TypeInt},
+		{Name: "contype", Type: TypeText},
+	}
+}
