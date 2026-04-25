@@ -101,6 +101,26 @@ HAVING COUNT(*) > 1;
 SELECT name FROM employees WHERE name LIKE '%Ali%';
 ```
 
+## Security & Authentication
+
+GhostSQL supports PostgreSQL-compatible authentication. By default, the server operates in a dual-mode:
+
+- **Trusted Mode**: Connections using any username other than the administrative account are trusted (no password required). This is ideal for local development and testing.
+- **Password Mode**: Connections using the administrative account (`ghost`) require password verification.
+
+**Default Credentials:**
+- **Username**: `ghost`
+* **Password**: `ghostsql`
+
+### Connecting via psql
+```bash
+# Trusted (skip password)
+psql -h localhost -p 5433 -d ghostsql
+
+# Authenticated
+psql -h localhost -p 5433 -d ghostsql -U ghost -W
+```
+
 ## Getting Help
 
 - Run `SHOW TABLES` to list tables

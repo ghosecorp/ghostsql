@@ -17,16 +17,19 @@ type DataDir struct {
 }
 
 // InitDataDirectory initializes the data directory structure
-func InitDataDirectory() (*DataDir, error) {
-	// Get executable directory
-	ex, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get executable path: %w", err)
+func InitDataDirectory(customPath string) (*DataDir, error) {
+	var dataRoot string
+	if customPath != "" {
+		dataRoot = customPath
+	} else {
+		// Get executable directory
+		ex, err := os.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get executable path: %w", err)
+		}
+		exePath := filepath.Dir(ex)
+		dataRoot = filepath.Join(exePath, "data")
 	}
-	exePath := filepath.Dir(ex)
-
-	// Create data directory relative to executable
-	dataRoot := filepath.Join(exePath, "data")
 
 	dd := &DataDir{
 		RootPath:      dataRoot,

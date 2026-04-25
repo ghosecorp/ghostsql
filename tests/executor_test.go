@@ -16,11 +16,10 @@ func TestFullDatabaseLifecycle(t *testing.T) {
 	os.MkdirAll(tmpDir, 0755)
 	defer os.RemoveAll(tmpDir)
 
-	db, err := storage.Initialize()
+	db, err := storage.Initialize(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to initialize database: %v", err)
 	}
-	db.DataDir.RootPath = tmpDir
 
 	// Create a session for the executor
 	session := storage.NewSession("test-session")

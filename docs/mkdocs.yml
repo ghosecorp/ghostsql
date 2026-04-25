@@ -42,8 +42,9 @@ nav:
   - Introduction: index.md
   - Getting Started: getting-started.md
   - Features:
+    - Relational Queries: features/relational.md
     - Vector Search: features/vector-search.md
-    - Relational Integrity: features/relational.md
+    - Authentication: features/authentication.md
     - SQL Reference: features/sql-reference.md
   - Development:
     - Architecture: development/architecture.md
