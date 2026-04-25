@@ -4,25 +4,31 @@
 
 **GhostSQL** is a high-performance, PostgreSQL-compatible SQL database written in Go, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
 
-## Features
-
-- **PostgreSQL-like SQL syntax**: Familiar for developers
-- **Vector support**: Store and search embeddings with `VECTOR` type
-- **HNSW Indexing**: Fast approximate nearest neighbor via `CREATE INDEX ... USING HNSW`
-- **Relational integrity**: JOIN (INNER, LEFT, RIGHT, FULL OUTER, CROSS), FOREIGN KEY, PRIMARY KEY, NOT NULL
-- **Data types**: INT, BIGINT, TEXT, VARCHAR(n), VECTOR(n), FLOAT, BOOLEAN
-- **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY/HAVING
-- **Other SQL**: WHERE, ORDER BY, LIMIT, OFFSET, LIKE
-- **Transaction-safe storage**: Binary format, slotted pages, persistence to disk
-
-## Getting Started
-
 ### Build & Run
 
 ```bash
 make build
 make run
 ```
+
+### Running Tests
+
+GhostSQL includes a comprehensive integration test suite covering relational operations and vector search:
+
+```bash
+go test -v ./tests/...
+```
+
+### Features
+
+- **PostgreSQL-like SQL syntax**: Familiar for developers
+- **Vector support**: Store and search embeddings with `VECTOR` type
+- **PostgreSQL Vector Operators**: Support for `<->` (L2) and `<=>` (Cosine) distance
+- **HNSW Indexing**: Fast approximate nearest neighbor via `CREATE INDEX ... USING HNSW`
+- **Relational integrity**: JOIN (INNER, LEFT, RIGHT, FULL OUTER, CROSS), FOREIGN KEY, PRIMARY KEY, NOT NULL
+- **Data types**: INT, BIGINT, TEXT, VARCHAR(n), VECTOR(n), FLOAT, BOOLEAN
+- **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY/HAVING
+- **psql Compatibility**: Works with standard PostgreSQL clients via protocol virtualization
 
 ### Example Database Creation
 
@@ -81,11 +87,11 @@ RIGHT JOIN departments ON employees.dept_id = departments.id;
 -- Create vector index for fast similarity search
 CREATE INDEX embeddings_idx ON embeddings USING HNSW (embedding) WITH (m=16, ef_construction=200);
 
--- Retrieve the two closest rows to a query vector (cosine similarity)
-SELECT id, text
-FROM embeddings
-ORDER BY COSINE_DISTANCE(embedding, [0.1, 0.2, 0.3, 0.4])
-LIMIT 2;
+-- Retrieve the closest row using the L2 distance operator (<->)
+SELECT text FROM embeddings ORDER BY embedding <-> [0.1, 0.2, 0.3, 0.4] LIMIT 1;
+
+-- Retrieve the closest row using the Cosine distance operator (<=>)
+SELECT text FROM embeddings ORDER BY embedding <=> [0.1, 0.2, 0.3, 0.4] LIMIT 1;
 ```
 
 ## Advanced SQL
