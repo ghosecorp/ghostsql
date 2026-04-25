@@ -42,6 +42,16 @@ func (h *Handler) Handle() error {
 	}
 
 	// 3. Send Parameter Status & ReadyForQuery
+	if err := h.sendParameterStatus("server_version", "0.1.0"); err != nil {
+		return err
+	}
+	if err := h.sendParameterStatus("client_encoding", "UTF8"); err != nil {
+		return err
+	}
+	if err := h.sendParameterStatus("standard_conforming_strings", "on"); err != nil {
+		return err
+	}
+
 	if err := h.sendReadyForQuery(); err != nil {
 		return err
 	}
@@ -146,6 +156,23 @@ func (h *Handler) sendAuthenticationOk() error {
 	binary.BigEndian.PutUint32(msg[1:5], 8)
 	binary.BigEndian.PutUint32(msg[5:9], 0) // Auth OK
 	_, err := h.conn.Write(msg)
+	return err
+}
+
+func (h *Handler) sendParameterStatus(name, value string) error {
+	buf := make([]byte, 0)
+	buf = append(buf, ResParameterStatus)
+	
+	lenPos := len(buf)
+	buf = append(buf, 0, 0, 0, 0)
+	
+	buf = append(buf, name...)
+	buf = append(buf, 0)
+	buf = append(buf, value...)
+	buf = append(buf, 0)
+
+	binary.BigEndian.PutUint32(buf[lenPos:], uint32(len(buf)-lenPos))
+	_, err := h.conn.Write(buf)
 	return err
 }
 

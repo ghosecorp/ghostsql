@@ -67,9 +67,16 @@ type ForeignKeyDef struct {
 
 func (s *InsertStmt) StatementNode() {}
 
-// SelectStmt represents SELECT
+// SelectColumn represents a SELECT list entry with optional alias
+type SelectColumn struct {
+	Expression string // raw expression: "c.relname", "computed_column", etc.
+	Alias      string // AS alias, empty if none
+}
+
+// SelectStmt represents a SELECT query
 type SelectStmt struct {
 	Columns       []string
+	SelectColumns []SelectColumn
 	Aggregates    []AggregateFunc
 	TableName     string
 	TableAlias    string       // ADD THIS LINE

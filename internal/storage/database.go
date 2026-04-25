@@ -21,10 +21,41 @@ type DatabaseInstance struct {
 	Tables   map[string]*Table
 	BasePath string
 	mu       sync.RWMutex
+	db       *Database
 }
 
-// GetTable retrieves a table by name safely
+// GetTable retrieves a table by name safely, including virtual system tables
 func (di *DatabaseInstance) GetTable(name string) (*Table, bool) {
+	// Handle pg_catalog virtualization
+	if name == "pg_class" || name == "pg_catalog.pg_class" {
+		rows := di.db.Catalog.GetPGClassRows(di)
+		return &Table{Name: "pg_class", Rows: rows, Columns: di.db.Catalog.GetPGClassColumns()}, true
+	}
+	if name == "pg_namespace" || name == "pg_catalog.pg_namespace" {
+		rows := di.db.Catalog.GetPGNamespaceRows()
+		return &Table{Name: "pg_namespace", Rows: rows, Columns: di.db.Catalog.GetPGNamespaceColumns()}, true
+	}
+	if name == "pg_attribute" || name == "pg_catalog.pg_attribute" {
+		rows := di.db.Catalog.GetPGAttributeRows(di)
+		return &Table{Name: "pg_attribute", Rows: rows, Columns: di.db.Catalog.GetPGAttributeColumns()}, true
+	}
+	if name == "pg_attrdef" || name == "pg_catalog.pg_attrdef" {
+		rows := di.db.Catalog.GetPGAttrDefRows()
+		return &Table{Name: "pg_attrdef", Rows: rows, Columns: di.db.Catalog.GetPGAttrDefColumns()}, true
+	}
+	if name == "pg_type" || name == "pg_catalog.pg_type" {
+		rows := di.db.Catalog.GetPGTypeRows()
+		return &Table{Name: "pg_type", Rows: rows, Columns: di.db.Catalog.GetPGTypeColumns()}, true
+	}
+	if name == "pg_collation" || name == "pg_catalog.pg_collation" {
+		rows := di.db.Catalog.GetPGCollationRows()
+		return &Table{Name: "pg_collation", Rows: rows, Columns: di.db.Catalog.GetPGCollationColumns()}, true
+	}
+	if name == "pg_constraint" || name == "pg_catalog.pg_constraint" {
+		rows := di.db.Catalog.GetPGConstraintRows()
+		return &Table{Name: "pg_constraint", Rows: rows, Columns: di.db.Catalog.GetPGConstraintColumns()}, true
+	}
+
 	di.mu.RLock()
 	defer di.mu.RUnlock()
 	t, ok := di.Tables[name]
@@ -46,11 +77,12 @@ func (di *DatabaseInstance) DeleteTable(name string) {
 }
 
 // NewDatabaseInstance creates a new database instance
-func NewDatabaseInstance(name string, basePath string) *DatabaseInstance {
+func NewDatabaseInstance(name string, basePath string, db *Database) *DatabaseInstance {
 	return &DatabaseInstance{
 		Name:     name,
 		Tables:   make(map[string]*Table),
 		BasePath: basePath,
+		db:       db,
 	}
 }
 
@@ -63,6 +95,7 @@ type Database struct {
 	LockFile        string
 	mu              sync.RWMutex
 	SessionMgr      *SessionManager
+	Catalog         *CatalogProvider
 }
 
 // Initialize sets up the database with persistent storage
@@ -83,6 +116,7 @@ func Initialize() (*Database, error) {
 		LockFile:   filepath.Join(dd.RootPath, "ghostsql.pid"),
 		SessionMgr: NewSessionManager(),
 	}
+	db.Catalog = NewCatalogProvider(db)
 
 	// Acquire lock file
 	if err := db.acquireLock(); err != nil {
@@ -137,7 +171,7 @@ func (db *Database) CreateDatabase(dbName string) error {
 	}
 
 	// Create database instance
-	dbInstance := NewDatabaseInstance(dbName, dbPath)
+	dbInstance := NewDatabaseInstance(dbName, dbPath, db)
 	db.Databases[dbName] = dbInstance
 
 	db.Logger.Info("Created database: %s", dbName)
@@ -206,7 +240,7 @@ func (db *Database) LoadAllDatabases() error {
 		dbPath := filepath.Join(db.DataDir.DatabasesPath, dbName)
 
 		// Create database instance
-		dbInstance := NewDatabaseInstance(dbName, dbPath)
+		dbInstance := NewDatabaseInstance(dbName, dbPath, db)
 
 		// Load tables for this database
 		if err := db.loadTablesForDatabase(dbInstance); err != nil {

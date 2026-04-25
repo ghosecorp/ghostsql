@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -138,33 +139,88 @@ type WhereClause struct {
 	Column   string
 	Operator string
 	Value    interface{}
+	And      *WhereClause
+	Or       *WhereClause
 }
 
 // evaluateWhere evaluates a WHERE clause against a row
 func evaluateWhere(row Row, where *WhereClause) bool {
-	val, exists := row[where.Column]
-	if !exists {
-		return false
+	// Base condition evaluation
+	match := false
+
+	// Skip system function calls - always evaluate to true for catalog visibility
+	// Detect any function-like call (containing parentheses)
+	if strings.Contains(where.Column, "(") {
+		match = true
+	} else {
+		val, exists := row[where.Column]
+		if !exists {
+			// Try fuzzy matching for joined columns
+			for k, v := range row {
+				if strings.HasSuffix(k, "."+where.Column) || strings.HasSuffix(where.Column, "."+k) {
+					val = v
+					exists = true
+					break
+				}
+			}
+		}
+
+		if !exists {
+			// If column doesn't exist, it's a mismatch unless we're looking for NULL
+			match = (where.Operator == "=" && where.Value == nil)
+		} else {
+			switch where.Operator {
+			case "=":
+				match = compare(val, where.Value) == 0
+			case "!=", "<>":
+				match = compare(val, where.Value) != 0
+			case "<":
+				match = compare(val, where.Value) < 0
+			case "<=":
+				match = compare(val, where.Value) <= 0
+			case ">":
+				match = compare(val, where.Value) > 0
+			case ">=":
+				match = compare(val, where.Value) >= 0
+			case "LIKE":
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern = strings.ReplaceAll(pattern, "_", ".")
+				// Map LIKE to a case-insensitive anchored regex
+				match, _ = regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+			case "~":
+				match, _ = regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+			case "~*":
+				match, _ = regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+			case "!~":
+				matched, _ := regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match = !matched
+			case "!~*":
+				matched, _ := regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match = !matched
+			case "IN":
+				if list, ok := where.Value.([]interface{}); ok {
+					for _, item := range list {
+						if compare(val, item) == 0 {
+							match = true
+							break
+						}
+					}
+				}
+			default:
+				match = false
+			}
+		}
 	}
 
-	switch where.Operator {
-	case "=":
-		return compare(val, where.Value) == 0
-	case "!=", "<>":
-		return compare(val, where.Value) != 0
-	case "<":
-		return compare(val, where.Value) < 0
-	case "<=":
-		return compare(val, where.Value) <= 0
-	case ">":
-		return compare(val, where.Value) > 0
-	case ">=":
-		return compare(val, where.Value) >= 0
-	case "LIKE":
-		return matchLike(val, where.Value)
-	default:
-		return false
+	// Handle AND/OR chains
+	if where.And != nil {
+		return match && evaluateWhere(row, where.And)
 	}
+	if where.Or != nil {
+		return match || evaluateWhere(row, where.Or)
+	}
+
+	return match
 }
 
 // compare compares two values
