@@ -1,0 +1,65 @@
+site_name: GhostSQL
+site_description: High-performance PostgreSQL-compatible SQL + Vector database.
+site_url: https://ghosecorp.github.io/ghostsql/
+
+docs_dir: . # Since mkdocs.yml is now inside the docs folder
+site_dir: ../site # Keep build output outside of source folder
+
+theme:
+  name: material
+  logo: https://raw.githubusercontent.com/ghosecorp/ghosecorp/main/assets/ghosecorp_logo.jpg
+  palette:
+    # Dark mode (Default)
+    - scheme: slate
+      primary: black
+      accent: black
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    # Light mode
+    - scheme: default
+      primary: black
+      accent: black
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  icon:
+    logo: material/database
+    repo: material/github
+
+repo_name: ghosecorp/ghostsql
+repo_url: https://github.com/ghosecorp/ghostsql
+
+nav:
+  - Introduction: index.md
+  - Getting Started: getting-started.md
+  - Features:
+    - Vector Search: features/vector-search.md
+    - Relational Integrity: features/relational.md
+    - SQL Reference: features/sql-reference.md
+  - Development:
+    - Architecture: development/architecture.md
+    - Testing: development/testing.md
+  - Team: team.md
+  - Resources: resources.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
