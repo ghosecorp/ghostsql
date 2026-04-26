@@ -185,6 +185,14 @@ func evaluateWhere(row Row, where *WhereClause) bool {
 	} else {
 		val, exists := row[where.Column]
 		if !exists {
+			// Try evaluate as arithmetic expression
+			val = EvaluateExpression(where.Column, row)
+			if val != nil {
+				exists = true
+			}
+		}
+
+		if !exists {
 			// Try fuzzy matching for joined columns
 			for k, v := range row {
 				if strings.HasSuffix(k, "."+where.Column) || strings.HasSuffix(where.Column, "."+k) {

@@ -1,6 +1,24 @@
 # SQL Reference
 
-GhostSQL supports a broad subset of PostgreSQL-compatible SQL.
+GhostSQL supports a broad subset of PostgreSQL-compatible SQL, including arithmetic and advanced filtering.
+
+## Expressions & Operators
+
+### Arithmetic
+GhostSQL supports standard arithmetic operators in `SELECT` and `WHERE` clauses:
+- `+` (Addition)
+- `-` (Subtraction)
+- `*` (Multiplication)
+- `/` (Division)
+
+Example: `SELECT (salary + 5000) * 1.1 AS bonus FROM employees;`
+
+### Comparison & Pattern Matching
+- `=`, `!=`, `<`, `>`, `<=`, `>=`
+- `IN (val1, val2, ...)`
+- `LIKE 'pattern'` (use `%` for any string, `_` for single character)
+
+Example: `SELECT * FROM users WHERE name LIKE 'A%' AND id IN (1, 10, 100);`
 
 ## Data Manipulation (DML)
 
@@ -44,7 +62,7 @@ ALTER TABLE table_name ENABLE ROW LEVEL SECURITY;
 
 ### DROP TABLE
 ```sql
-DROP TABLE table_name;
+DROP TABLE [IF EXISTS] table_name;
 ```
 
 ## Access Control (DCL)
@@ -57,7 +75,7 @@ CREATE ROLE rolename WITH LOGIN PASSWORD 'pass' SUPERUSER;
 
 ### DROP ROLE
 ```sql
-DROP ROLE rolename;
+DROP ROLE [IF EXISTS] rolename;
 ```
 
 ### GRANT

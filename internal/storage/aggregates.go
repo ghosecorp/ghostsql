@@ -84,7 +84,7 @@ func computeSum(rows []Row, column string) (float64, error) {
 			continue
 		}
 
-		numVal, err := convertToFloat64(val)
+		numVal, err := ConvertToFloat64(val)
 		if err != nil {
 			return 0, fmt.Errorf("SUM requires numeric values")
 		}
@@ -107,7 +107,7 @@ func computeAvg(rows []Row, column string) (float64, error) {
 			continue
 		}
 
-		numVal, err := convertToFloat64(val)
+		numVal, err := ConvertToFloat64(val)
 		if err != nil {
 			return 0, fmt.Errorf("AVG requires numeric values")
 		}
@@ -186,8 +186,8 @@ func computeMin(rows []Row, column string) (interface{}, error) {
 	return min, nil
 }
 
-// convertToFloat64 converts interface{} to float64 for aggregates
-func convertToFloat64(val interface{}) (float64, error) {
+// ConvertToFloat64 converts interface{} to float64 for aggregates and arithmetic
+func ConvertToFloat64(val interface{}) (float64, error) {
 	switch v := val.(type) {
 	case int:
 		return float64(v), nil

@@ -134,6 +134,9 @@ const (
 	TOKEN_BEGIN
 	TOKEN_COMMIT
 	TOKEN_ROLLBACK
+	TOKEN_PLUS
+	TOKEN_MINUS
+	TOKEN_SLASH
 )
 
 type Token struct {
@@ -262,6 +265,9 @@ func (t TokenType) String() string {
 		TOKEN_LEVEL:    "LEVEL",
 		TOKEN_DISABLE:  "DISABLE",
 		TOKEN_CURRENT_USER: "CURRENT_USER",
+		TOKEN_PLUS:         "+",
+		TOKEN_MINUS:        "-",
+		TOKEN_SLASH:        "/",
 	}
 	if name, ok := names[t]; ok {
 		return name

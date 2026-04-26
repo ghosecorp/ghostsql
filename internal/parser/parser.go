@@ -207,15 +207,42 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 func (p *Parser) parseDrop() (Statement, error) {
 	p.nextToken() // consume DROP
 
+	ifExists := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken()
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS" {
+			ifExists = true
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected EXISTS after DROP IF")
+		}
+	}
+
 	switch p.current.Type {
 	case TOKEN_TABLE:
-		return p.parseDropTable()
+		stmt, err := p.parseDropTable()
+		if err == nil {
+			stmt.IfExists = ifExists
+		}
+		return stmt, err
 	case TOKEN_DATABASE:
-		return p.parseDropDatabase()
+		stmt, err := p.parseDropDatabase()
+		if err == nil {
+			stmt.IfExists = ifExists
+		}
+		return stmt, err
 	case TOKEN_INDEX:
-		return p.parseDropIndex()
+		stmt, err := p.parseDropIndex()
+		if err == nil {
+			stmt.IfExists = ifExists
+		}
+		return stmt, err
 	case TOKEN_ROLE:
-		return p.parseDropRole()
+		stmt, err := p.parseDropRole()
+		if err == nil {
+			stmt.IfExists = ifExists
+		}
+		return stmt, err
 	default:
 		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, or ROLE after DROP")
 	}
@@ -828,6 +855,7 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				return nil, err
 			}
 			stmt.Aggregates = append(stmt.Aggregates, agg)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: agg.Function + "(" + agg.Column + ")", Alias: agg.Alias})
 		} else if p.current.Type == TOKEN_ASTERISK {
 			stmt.Columns = append(stmt.Columns, "*")
 			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: "*"})
@@ -923,6 +951,27 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				}
 				stmt.Columns = append(stmt.Columns, name)
 				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: name, Alias: alias})
+			} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
+				// Arithmetic expression starting with identifier
+				expr := name
+				for p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_AS {
+					expr += p.current.Literal
+					p.nextToken()
+				}
+				expr = strings.TrimSpace(expr)
+				alias := expr
+				if p.current.Type == TOKEN_AS {
+					p.nextToken()
+					if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+						alias = p.current.Literal
+						p.nextToken()
+					}
+				} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+				stmt.Columns = append(stmt.Columns, alias)
+				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
 			} else {
 				alias := ""
 				if p.current.Type == TOKEN_AS {
@@ -982,6 +1031,27 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				alias = "subquery"
 			}
 
+			if p.current.Type == TOKEN_AS {
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM {
+				alias = p.current.Literal
+				p.nextToken()
+			}
+			stmt.Columns = append(stmt.Columns, alias)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
+		} else if p.current.Type == TOKEN_NUMBER || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
+			// Arithmetic expression
+			expr := ""
+			for p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_AS {
+				expr += p.current.Literal
+				p.nextToken()
+			}
+			expr = strings.TrimSpace(expr)
+			alias := expr
 			if p.current.Type == TOKEN_AS {
 				p.nextToken()
 				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
@@ -1322,7 +1392,7 @@ func (p *Parser) parseAggregate() (AggregateFunc, error) {
 		p.nextToken()
 	} else {
 		// Default alias
-		agg.Alias = strings.ToLower(agg.Function) + "_" + agg.Column
+		agg.Alias = agg.Function + "(" + agg.Column + ")"
 	}
 
 	return agg, nil
@@ -1332,24 +1402,34 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 	where := &WhereClause{}
 
 	// Parse LHS (may be column, table.column, function_call(), or CURRENT_USER)
-	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_CURRENT_USER {
-		return nil, fmt.Errorf("expected identifier in WHERE, got %s", p.current.Type)
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_CURRENT_USER && !p.isAggregateFunction(p.current.Type) {
+		return nil, fmt.Errorf("expected identifier in WHERE, got %s", p.current.Literal)
 	}
 
 	lhs := p.current.Literal
 	if p.current.Type == TOKEN_CURRENT_USER {
 		lhs = "current_user()"
+	} else if p.current.Type == TOKEN_NUMBER {
+		// Start of arithmetic expression
 	}
 	p.nextToken()
 
-	// Handle dots and function calls
-	for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN {
+	// Handle dots, function calls, and arithmetic operators
+	for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
 		if p.current.Type == TOKEN_DOT {
 			p.nextToken()
 			lhs += "." + p.current.Literal
 			p.nextToken()
+		} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
+			lhs += p.current.Literal
+			p.nextToken()
+			if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
+				lhs += p.current.Literal
+				p.nextToken()
+			}
 		} else if p.current.Type == TOKEN_LPAREN {
-			// Skip function arguments for now
+			// Preserve function arguments
+			lhs += "("
 			p.nextToken()
 			depth := 1
 			for depth > 0 && p.current.Type != TOKEN_EOF {
@@ -1358,12 +1438,13 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 				} else if p.current.Type == TOKEN_RPAREN {
 					depth--
 				}
-				p.nextToken()
+				if depth > 0 {
+					lhs += p.current.Literal
+					p.nextToken()
+				}
 			}
-			// If LHS was current_user, it already has parens if we want them normalized
-			if !strings.HasSuffix(lhs, "()") {
-				lhs += "()"
-			}
+			lhs += ")"
+			p.nextToken() // consume )
 		}
 	}
 
