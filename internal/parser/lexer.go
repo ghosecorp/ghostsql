@@ -61,6 +61,18 @@ func (l *Lexer) NextToken() Token {
 		token.Type = TOKEN_ASTERISK
 		token.Literal = "*"
 		l.advance()
+	case '+':
+		token.Type = TOKEN_PLUS
+		token.Literal = "+"
+		l.advance()
+	case '/':
+		token.Type = TOKEN_SLASH
+		token.Literal = "/"
+		l.advance()
+	case '%':
+		token.Type = TOKEN_PERCENT
+		token.Literal = "%"
+		l.advance()
 	case '=':
 		token.Type = TOKEN_EQUALS
 		token.Literal = "="
@@ -141,6 +153,16 @@ func (l *Lexer) NextToken() Token {
 		token.Type = TOKEN_IDENT
 		token.Literal = "~"
 		l.advance()
+	case '-':
+		// Only handle '-' if it's not the start of a number
+		if !unicode.IsDigit(rune(l.peek())) {
+			token.Type = TOKEN_MINUS
+			token.Literal = "-"
+			l.advance()
+		} else {
+			token.Type = TOKEN_NUMBER
+			token.Literal = l.readNumber()
+		}
 	case ':':
 		if l.peek() == ':' {
 			token.Type = TOKEN_CAST
@@ -160,7 +182,7 @@ func (l *Lexer) NextToken() Token {
 		if unicode.IsLetter(rune(ch)) {
 			token.Literal = l.readIdentifier()
 			token.Type = LookupKeyword(strings.ToUpper(token.Literal))
-		} else if unicode.IsDigit(rune(ch)) || (ch == '-' && unicode.IsDigit(rune(l.peek()))) {
+		} else if unicode.IsDigit(rune(ch)) {
 			token.Type = TOKEN_NUMBER
 			token.Literal = l.readNumber()
 		} else {

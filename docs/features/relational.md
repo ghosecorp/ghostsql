@@ -47,3 +47,31 @@ SELECT e.name, d.name
 FROM employees e 
 LEFT JOIN departments d ON e.dept_id = d.id;
 ```
+
+## Aggregates & Grouping
+
+GhostSQL supports standard aggregate functions and grouping:
+
+*   **COUNT(*) / COUNT(column)**
+*   **SUM(column)**
+*   **AVG(column)**
+*   **MIN(column) / MAX(column)**
+
+### Example: Salary Analysis
+```sql
+SELECT dept_id, AVG(salary), COUNT(*) 
+FROM employees 
+GROUP BY dept_id 
+HAVING AVG(salary) > 50000;
+```
+
+## Mathematical Expressions
+
+You can perform arithmetic operations directly in your queries:
+
+```sql
+-- Calculate bonus and total compensation
+SELECT name, salary * 0.1 AS bonus, salary + (salary * 0.1) AS total 
+FROM employees 
+WHERE (salary + 5000) < 100000;
+```

@@ -2,6 +2,28 @@
 
 All notable changes to GhostSQL will be documented in this file.
 
+## [0.1.4] - 2026-04-26
+
+### Added
+- **Arithmetic Expressions Support**:
+  - Implemented a shared expression evaluator supporting basic arithmetic (`+`, `-`, `*`, `/`) in both `SELECT` list and `WHERE` clauses.
+  - Added support for complex expressions like `(salary + 5000) * 1.1`.
+- **Enhanced `SELECT` Capabilities**:
+  - Implemented `IN` and `LIKE` operators for flexible filtering.
+  - Added support for multiple columns in `ORDER BY` (e.g., `ORDER BY dept_id ASC, salary DESC`).
+  - Improved `GROUP BY` and `HAVING` logic, specifically allowing aggregate functions in `HAVING` clauses (e.g., `HAVING COUNT(*) > 1`).
+- **PostgreSQL `DROP ... IF EXISTS` Syntax**:
+  - Implemented `IF EXISTS` for `DROP TABLE`, `DROP DATABASE`, `DROP INDEX`, and `DROP ROLE`, making cleanup scripts more reliable.
+- **RBAC Ownership Bypass**:
+  - Aligned table access control with PostgreSQL standards by implementing automatic owner bypass; table creators always have full permissions regardless of explicit GRANTs.
+
+### Testing
+- **New Comprehensive Query Test Suite**: Added `tests/comprehensive_query_test.go` covering all advanced SQL features (joins, aggregates, arithmetic, filtering).
+- **Integration Test Isolation**: Refactored `psql` and `psycopg2` integration tests to use distinct table/role suffixes (`_psql` and `_py`) to avoid namespace collisions during concurrent execution.
+
+### Documentation
+- Updated `README.md`, `CHANGELOG.md`, and SQL reference guides with new arithmetic and query features.
+
 ## [0.1.3] - 2026-04-26
 
 ### Added

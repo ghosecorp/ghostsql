@@ -463,6 +463,20 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Fetch rows from main table
 	initialColumns := stmt.Columns
+	needsAll := len(stmt.Aggregates) > 0 || where != nil
+	if !needsAll {
+		for _, sc := range stmt.SelectColumns {
+			if strings.ContainsAny(sc.Expression, "+-*/%(") {
+				needsAll = true
+				break
+			}
+		}
+	}
+
+	if needsAll {
+		initialColumns = []string{"*"}
+	}
+
 	effectiveWhere := where
 	if len(stmt.Joins) > 0 {
 		initialColumns = []string{"*"}
@@ -513,7 +527,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		if len(stmt.Joins) > 0 && where != nil {
 			filteredRows := make([]storage.Row, 0)
 			for _, row := range rows {
-				if evaluateWhereOnRow(row, where) {
+				if e.evaluateWhereOnRow(row, where) {
 					filteredRows = append(filteredRows, row)
 				}
 			}
@@ -542,16 +556,14 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			projectedRows := make([]storage.Row, len(rows))
 			for i, row := range rows {
 				projectedRow := make(storage.Row)
-				for _, colSpec := range stmt.Columns {
+				for _, sc := range stmt.SelectColumns {
+					colSpec := sc.Expression
 					val, ok := row[colSpec]
-					if !ok && strings.Contains(colSpec, ".") {
-						// Fallback: if they used table name but it's aliased, try to resolve?
-						// Actually, standard SQL requires using the alias.
-						// But let's try to find it in the row.
-						projectedRow[colSpec] = nil
-					} else {
-						projectedRow[colSpec] = val
+					if !ok {
+						// Try evaluate as expression
+						val = storage.EvaluateExpression(colSpec, row)
 					}
+					projectedRow[colSpec] = val
 				}
 				projectedRows[i] = projectedRow
 			}
@@ -635,6 +647,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 							ok = true
 							break
 						}
+					}
+				}
+				if !ok {
+					// Try evaluate as arithmetic expression
+					val = storage.EvaluateExpression(expr, row)
+					if val != nil {
+						ok = true
 					}
 				}
 				if !ok {
@@ -1092,7 +1111,7 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 
 		if stmt.Having != nil {
 			having := convertWhereClause(stmt.Having)
-			if !evaluateWhereOnRow(row, having) {
+			if !e.evaluateWhereOnRow(row, having) {
 				continue
 			}
 		}
@@ -1118,16 +1137,26 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, a
 	}, nil
 }
 
-func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
+func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
 	// Base condition evaluation
 	match := false
 
-	// Skip system function calls - always evaluate to true for catalog visibility
 	// Detect any function-like call (containing parentheses)
-	if strings.Contains(where.Column, "(") {
+	val, exists := row[where.Column]
+	if !exists && strings.Contains(where.Column, "(") {
+		// If it's a function call NOT in the row, we assume it's a system function
+		// like current_user() that should be handled during variable resolution
+		// or catalog visibility checks.
 		match = true
 	} else {
-		val, exists := row[where.Column]
+		if !exists {
+			// Try evaluate as arithmetic expression
+			val = storage.EvaluateExpression(where.Column, row)
+			if val != nil {
+				exists = true
+			}
+		}
+
 		if !exists {
 			// Try fuzzy matching for joined columns (e.g. c.relname)
 			for k, v := range row {
@@ -1188,10 +1217,10 @@ func evaluateWhereOnRow(row storage.Row, where *storage.WhereClause) bool {
 
 	// Handle AND/OR chains
 	if where.And != nil {
-		return match && evaluateWhereOnRow(row, where.And)
+		return match && e.evaluateWhereOnRow(row, where.And)
 	}
 	if where.Or != nil {
-		return match || evaluateWhereOnRow(row, where.Or)
+		return match || e.evaluateWhereOnRow(row, where.Or)
 	}
 
 	return match
@@ -1264,6 +1293,9 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 	}
 
 	if _, exists := dbInstance.GetTable(stmt.TableName); !exists {
+		if stmt.IfExists {
+			return &Result{Message: fmt.Sprintf("NOTICE: table %s does not exist, skipping", stmt.TableName)}, nil
+		}
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
@@ -1281,6 +1313,9 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 
 func (e *Executor) executeDropDatabase(stmt *parser.DropDatabaseStmt) (*Result, error) {
 	if err := e.db.DropDatabase(stmt.DatabaseName); err != nil {
+		if stmt.IfExists && strings.Contains(err.Error(), "does not exist") {
+			return &Result{Message: fmt.Sprintf("NOTICE: database %s does not exist, skipping", stmt.DatabaseName)}, nil
+		}
 		return nil, err
 	}
 
@@ -1598,6 +1633,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 }
 
 func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
+	// Index support is partial, but respect IfExists anyway
 	return &Result{
 		Message: fmt.Sprintf("DROP INDEX %s (not fully implemented)", stmt.IndexName),
 	}, nil
@@ -1675,8 +1711,8 @@ func (e *Executor) validateWhereColumns(table *storage.Table, where *storage.Whe
 		return nil
 	}
 
-	// Skip function calls and system stubs
-	if !strings.Contains(where.Column, "(") {
+	// Skip function calls, arithmetic expressions, and system stubs
+	if !strings.Contains(where.Column, "(") && !strings.ContainsAny(where.Column, "+-*/%") {
 		exists := false
 		for _, col := range table.Columns {
 			if col.Name == where.Column {
@@ -1778,6 +1814,13 @@ func (e *Executor) executeDropRole(stmt *parser.DropRoleStmt) (*Result, error) {
 	role, exists := e.db.RoleStore.GetRole(user)
 	if user != "ghost" && (!exists || !role.CanCreateRole) {
 		return nil, fmt.Errorf("permission denied to drop role")
+	}
+
+	if _, exists := e.db.RoleStore.GetRole(stmt.RoleName); !exists {
+		if stmt.IfExists {
+			return &Result{Message: fmt.Sprintf("NOTICE: role %s does not exist, skipping", stmt.RoleName)}, nil
+		}
+		return nil, fmt.Errorf("role %s does not exist", stmt.RoleName)
 	}
 
 	if err := e.db.RoleStore.DeleteRole(stmt.RoleName); err != nil {
@@ -1929,4 +1972,5 @@ func (e *Executor) resolveWhereClauseVariables(where *storage.WhereClause) {
 		e.resolveWhereClauseVariables(where.Or)
 	}
 }
+
 

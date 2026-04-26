@@ -12,13 +12,15 @@
 - **Relational integrity**: JOIN (INNER, LEFT, RIGHT, FULL OUTER, CROSS), FOREIGN KEY, PRIMARY KEY, NOT NULL
 - **Data types**: INT, BIGINT, TEXT, VARCHAR(n), VECTOR(n), FLOAT, BOOLEAN
 - **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY/HAVING
+- **Mathematical Operations**: Arithmetic support (`+`, `-`, `*`, `/`) in both `SELECT` list and `WHERE` clauses
+- **Advanced Querying**: `IN`, `LIKE`, multiple `ORDER BY` columns, and aggregate functions in `HAVING`
 - **Advanced Security**:
   - **RBAC**: PostgreSQL-compatible roles, privileges, `GRANT`/`REVOKE`, and `DROP ROLE`
   - **Table Ownership**: Creator is automatically the owner — bypasses ACL checks (like `pg_aclcheck`)
   - **RLS**: Row-Level Security with `CREATE POLICY` and `current_user()` session filtering
   - **HBA**: IP-based access control via `pg_hba.conf`
 - **Driver Compatibility**: Handles `SET`, `BEGIN`, `COMMIT`, `ROLLBACK` — works with `psycopg2`, `pgx`, and standard `psql`
-- **Other SQL**: WHERE, ORDER BY, LIMIT, OFFSET, LIKE
+- **Other SQL**: WHERE, ORDER BY, LIMIT, OFFSET, LIKE, `DROP ... IF EXISTS`
 - **Transaction-safe storage**: Binary format, slotted pages, persistence to disk
 
 ## Getting Started
@@ -161,8 +163,16 @@ FROM employees
 GROUP BY dept_id
 HAVING COUNT(*) > 1;
 
--- Filtering
-SELECT name FROM employees WHERE name LIKE '%Ali%';
+-- Arithmetic and filtering
+SELECT name, (salary + 5000) * 1.1 AS projected_salary 
+FROM employees 
+WHERE (salary + 5000) > 80000;
+
+-- Advanced filtering
+SELECT name FROM employees WHERE name LIKE 'Ali%' OR id IN (2, 3, 4);
+
+-- Multi-column sorting
+SELECT name, salary FROM employees ORDER BY dept_id ASC, salary DESC;
 ```
 
 ## Security & Authentication

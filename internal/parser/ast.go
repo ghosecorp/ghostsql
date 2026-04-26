@@ -120,6 +120,7 @@ func (s *DeleteStmt) StatementNode() {}
 // DropTableStmt represents DROP TABLE
 type DropTableStmt struct {
 	TableName string
+	IfExists  bool
 }
 
 func (s *DropTableStmt) StatementNode() {}
@@ -127,6 +128,7 @@ func (s *DropTableStmt) StatementNode() {}
 // DropDatabaseStmt represents DROP DATABASE
 type DropDatabaseStmt struct {
 	DatabaseName string
+	IfExists     bool
 }
 
 func (s *DropDatabaseStmt) StatementNode() {}
@@ -202,6 +204,7 @@ func (s *CreateIndexStmt) StatementNode() {}
 // DropIndexStmt represents DROP INDEX
 type DropIndexStmt struct {
 	IndexName string
+	IfExists  bool
 }
 
 func (s *DropIndexStmt) StatementNode() {}
@@ -294,6 +297,7 @@ func (s *TransactionStmt) StatementNode() {}
 // DropRoleStmt represents DROP ROLE
 type DropRoleStmt struct {
 	RoleName string
+	IfExists bool
 }
 
 func (s *DropRoleStmt) StatementNode() {}
