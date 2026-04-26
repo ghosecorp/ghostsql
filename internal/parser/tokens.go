@@ -131,6 +131,9 @@ const (
 	TOKEN_NOT_MATCH_CI
 	TOKEN_CAST
 	TOKEN_COLON
+	TOKEN_BEGIN
+	TOKEN_COMMIT
+	TOKEN_ROLLBACK
 )
 
 type Token struct {
@@ -236,6 +239,9 @@ func (t TokenType) String() string {
 		TOKEN_NOT_MATCH_CI: "!~*",
 		TOKEN_CAST:         "::",
 		TOKEN_COLON:        ":",
+		TOKEN_BEGIN:        "BEGIN",
+		TOKEN_COMMIT:       "COMMIT",
+		TOKEN_ROLLBACK:     "ROLLBACK",
  
 		TOKEN_GRANT:     "GRANT",
 		TOKEN_REVOKE:    "REVOKE",
@@ -349,6 +355,9 @@ var keywords = map[string]TokenType{
 	"LEVEL":           TOKEN_LEVEL,
 	"DISABLE":         TOKEN_DISABLE,
 	"CURRENT_USER":    TOKEN_CURRENT_USER,
+	"BEGIN":           TOKEN_BEGIN,
+	"COMMIT":          TOKEN_COMMIT,
+	"ROLLBACK":        TOKEN_ROLLBACK,
 }
 
 func LookupKeyword(ident string) TokenType {

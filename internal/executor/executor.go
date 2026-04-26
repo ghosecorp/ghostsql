@@ -91,6 +91,12 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeRevoke(s)
 	case *parser.CreatePolicyStmt:
 		return e.executeCreatePolicy(s)
+	case *parser.SetStmt:
+		return &Result{Message: "SET"}, nil
+	case *parser.TransactionStmt:
+		return &Result{Message: s.Command}, nil
+	case *parser.DropRoleStmt:
+		return e.executeDropRole(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -98,8 +104,23 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 
 func (e *Executor) checkPrivilege(objectType, objectName, privilege string) error {
 	user := e.session.GetUser()
+
+	// Superuser bypass (like pg_aclcheck)
+	if role, ok := e.db.RoleStore.GetRole(user); ok && role.IsSuperuser {
+		return nil
+	}
+	// Legacy superuser check for the default 'ghost' account
 	if user == "ghost" {
-		return nil // Superuser
+		return nil
+	}
+
+	// Owner bypass for TABLE objects (PostgreSQL standard: owner always has access)
+	if objectType == "TABLE" {
+		if dbInstance, err := e.getActiveDatabase(); err == nil {
+			if table, exists := dbInstance.GetTable(objectName); exists && table.Owner == user {
+				return nil
+			}
+		}
 	}
 
 	objectKey := fmt.Sprintf("%s:%s", objectType, objectName)
@@ -265,7 +286,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		)
 	}
 
-	table := storage.NewTable(stmt.TableName, columns, tableMeta)
+	// Set owner: the creator is the table owner (PostgreSQL standard)
+	owner := e.session.GetUser()
+	table := storage.NewTable(stmt.TableName, owner, columns, tableMeta)
 	dbInstance.SetTable(stmt.TableName, table)
 
 	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
@@ -404,7 +427,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	}
 
 	return &Result{
-		Message: fmt.Sprintf("INSERT %d row(s)", len(stmt.Values)),
+		Message: fmt.Sprintf("INSERT 0 %d", len(stmt.Values)),
 	}, nil
 }
 
@@ -1747,6 +1770,26 @@ func (e *Executor) executeCreateRole(stmt *parser.CreateRoleStmt) (*Result, erro
 
 	return &Result{
 		Message: fmt.Sprintf("CREATE ROLE %s", stmt.RoleName),
+	}, nil
+}
+
+func (e *Executor) executeDropRole(stmt *parser.DropRoleStmt) (*Result, error) {
+	user := e.session.GetUser()
+	role, exists := e.db.RoleStore.GetRole(user)
+	if user != "ghost" && (!exists || !role.CanCreateRole) {
+		return nil, fmt.Errorf("permission denied to drop role")
+	}
+
+	if err := e.db.RoleStore.DeleteRole(stmt.RoleName); err != nil {
+		return nil, err
+	}
+
+	if err := e.db.RoleStore.Save(); err != nil {
+		return nil, fmt.Errorf("failed to persist role deletion: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("DROP ROLE %s", stmt.RoleName),
 	}, nil
 }
 

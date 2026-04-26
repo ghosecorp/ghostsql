@@ -37,6 +37,7 @@ type Policy struct {
 // Table represents a database table with binary storage
 type Table struct {
 	Name          string
+	Owner         string                // PostgreSQL-standard: creator/owner of the table
 	Columns       []Column
 	Rows          []Row // In-memory cache
 	Pages         []*SlottedPage
@@ -55,9 +56,10 @@ type ForeignKeyConstraint struct {
 }
 
 // NewTable creates a new table
-func NewTable(name string, columns []Column, meta *metadata.Metadata) *Table {
+func NewTable(name, owner string, columns []Column, meta *metadata.Metadata) *Table {
 	return &Table{
 		Name:          name,
+		Owner:         owner,
 		Columns:       columns,
 		Rows:          make([]Row, 0),
 		Pages:         make([]*SlottedPage, 0),

@@ -59,6 +59,17 @@ func (p *Parser) Parse() (Statement, error) {
 		stmt, err = p.parseGrant()
 	case TOKEN_REVOKE:
 		stmt, err = p.parseRevoke()
+	case TOKEN_SET:
+		stmt, err = p.parseSet()
+	case TOKEN_BEGIN:
+		p.nextToken()
+		stmt = &TransactionStmt{Command: "BEGIN"}
+	case TOKEN_COMMIT:
+		p.nextToken()
+		stmt = &TransactionStmt{Command: "COMMIT"}
+	case TOKEN_ROLLBACK:
+		p.nextToken()
+		stmt = &TransactionStmt{Command: "ROLLBACK"}
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
@@ -203,9 +214,21 @@ func (p *Parser) parseDrop() (Statement, error) {
 		return p.parseDropDatabase()
 	case TOKEN_INDEX:
 		return p.parseDropIndex()
+	case TOKEN_ROLE:
+		return p.parseDropRole()
 	default:
-		return nil, fmt.Errorf("expected TABLE, DATABASE, or INDEX after DROP")
+		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, or ROLE after DROP")
 	}
+}
+
+func (p *Parser) parseDropRole() (*DropRoleStmt, error) {
+	p.nextToken() // consume ROLE
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected role name after DROP ROLE")
+	}
+	stmt := &DropRoleStmt{RoleName: p.current.Literal}
+	p.nextToken()
+	return stmt, nil
 }
 
 func (p *Parser) parseDropTable() (*DropTableStmt, error) {
@@ -1901,9 +1924,8 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	return join, nil
 }
 
-
 func (p *Parser) parseCreateRole() (*CreateRoleStmt, error) {
-	stmt := &CreateRoleStmt{CanLogin: true} 
+	stmt := &CreateRoleStmt{CanLogin: true}
 	p.nextToken() // consume ROLE
 	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
 		return nil, fmt.Errorf("expected role name")
@@ -1969,7 +1991,7 @@ func (p *Parser) parseGrant() (*GrantStmt, error) {
 		}
 	} else {
 		for {
-			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE {
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE && p.current.Type != TOKEN_CREATE {
 				break
 			}
 			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
@@ -2026,7 +2048,7 @@ func (p *Parser) parseRevoke() (*RevokeStmt, error) {
 		}
 	} else {
 		for {
-			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE {
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE && p.current.Type != TOKEN_CREATE {
 				break
 			}
 			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
@@ -2072,28 +2094,27 @@ func (p *Parser) parseRevoke() (*RevokeStmt, error) {
 	return stmt, nil
 }
 
-
 func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
 	stmt := &CreatePolicyStmt{}
 	p.nextToken() // consume POLICY
-	
+
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected policy name")
 	}
 	stmt.PolicyName = p.current.Literal
 	p.nextToken()
-	
+
 	if p.current.Type != TOKEN_ON {
 		return nil, fmt.Errorf("expected ON after policy name")
 	}
 	p.nextToken()
-	
+
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected table name")
 	}
 	stmt.TableName = p.current.Literal
 	p.nextToken()
-	
+
 	if p.current.Type == TOKEN_FOR {
 		p.nextToken()
 		// Action: SELECT, INSERT, etc.
@@ -2106,7 +2127,7 @@ func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
 	} else {
 		stmt.Action = "ALL"
 	}
-	
+
 	if p.current.Type == TOKEN_TO {
 		p.nextToken()
 		if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
@@ -2117,27 +2138,48 @@ func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
 	} else {
 		stmt.Role = "all"
 	}
-	
+
 	if p.current.Type == TOKEN_USING {
 		p.nextToken()
 		if p.current.Type != TOKEN_LPAREN {
 			return nil, fmt.Errorf("expected ( after USING")
 		}
 		p.nextToken()
-		
+
 		// Parse expression as WhereClause
 		where, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
 		stmt.Using = where
-		
+
 		if p.current.Type != TOKEN_RPAREN {
 			return nil, fmt.Errorf("expected ) after USING expression")
 		}
 		p.nextToken()
 	}
-	
+
 	return stmt, nil
 }
 
+func (p *Parser) parseSet() (*SetStmt, error) {
+	p.nextToken() // consume SET
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected variable name after SET")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type == TOKEN_TO || p.current.Type == TOKEN_EQUALS {
+		p.nextToken()
+	}
+
+	var value string
+	if p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
+		value = p.current.Literal
+		p.nextToken()
+	}
+
+	return &SetStmt{Name: name, Value: value}, nil
+}

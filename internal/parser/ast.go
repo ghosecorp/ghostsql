@@ -275,3 +275,25 @@ type CreatePolicyStmt struct {
 }
 
 func (s *CreatePolicyStmt) StatementNode() {}
+
+// SetStmt represents SET commands
+type SetStmt struct {
+	Name  string
+	Value string
+}
+
+func (s *SetStmt) StatementNode() {}
+
+// TransactionStmt represents BEGIN, COMMIT, ROLLBACK
+type TransactionStmt struct {
+	Command string // "BEGIN", "COMMIT", "ROLLBACK"
+}
+
+func (s *TransactionStmt) StatementNode() {}
+
+// DropRoleStmt represents DROP ROLE
+type DropRoleStmt struct {
+	RoleName string
+}
+
+func (s *DropRoleStmt) StatementNode() {}
