@@ -2,11 +2,26 @@
 
 Follow these steps to get GhostSQL up and running on your machine.
 
-## Installation
+## Quick Start with Docker (Recommended)
+
+The easiest way to run GhostSQL is using our official Docker image.
+
+### Using Docker Run
+```bash
+docker run -d -p 5433:5433 --name ghostsql ghosecorp/ghostsql:latest
+```
+
+### Using Docker Compose
+If you have the GhostSQL repository cloned, you can simply run:
+```bash
+docker compose up -d
+```
+
+## Local Installation
 
 ### Prerequisites
-*   Go 1.21 or higher
-*   Make (optional, but recommended)
+*   **Go 1.25** or higher
+*   **Make** (optional, but recommended)
 
 ### Build from Source
 Clone the repository and build the binary:
