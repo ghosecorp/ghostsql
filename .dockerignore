@@ -1,0 +1,42 @@
+# Binaries
+bin/
+bin_json/
+bin_*
+*.exe
+
+# Data directory (runtime and test)
+data/
+test_comprehensive_dir/
+test_db/
+*.log
+
+# Test files
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Version Control
+.git
+.gitignore
+
+# Docker configuration
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation and project files (not needed for runtime)
+docs/
+CHANGELOG.md
+README.md
+LICENSE
+tests/
+scripts/
+
+conf/
