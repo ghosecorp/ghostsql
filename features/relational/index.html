@@ -607,6 +607,45 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#aggregates-grouping" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Aggregates &amp; Grouping
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Aggregates &amp; Grouping">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#example-salary-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example: Salary Analysis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mathematical-expressions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mathematical Expressions
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -954,6 +993,45 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#aggregates-grouping" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Aggregates &amp; Grouping
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Aggregates &amp; Grouping">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#example-salary-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example: Salary Analysis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mathematical-expressions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mathematical Expressions
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1009,6 +1087,27 @@
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">name</span><span class="w"> </span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">employees</span><span class="w"> </span><span class="n">e</span><span class="w"> </span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">LEFT</span><span class="w"> </span><span class="k">JOIN</span><span class="w"> </span><span class="n">departments</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">dept_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">id</span><span class="p">;</span>
+</code></pre></div>
+<h2 id="aggregates-grouping">Aggregates &amp; Grouping</h2>
+<p>GhostSQL supports standard aggregate functions and grouping:</p>
+<ul>
+<li><strong>COUNT(*) / COUNT(column)</strong></li>
+<li><strong>SUM(column)</strong></li>
+<li><strong>AVG(column)</strong></li>
+<li><strong>MIN(column) / MAX(column)</strong></li>
+</ul>
+<h3 id="example-salary-analysis">Example: Salary Analysis</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">dept_id</span><span class="p">,</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">salary</span><span class="p">),</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">employees</span><span class="w"> </span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">dept_id</span><span class="w"> </span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">HAVING</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">salary</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">50000</span><span class="p">;</span>
+</code></pre></div>
+<h2 id="mathematical-expressions">Mathematical Expressions</h2>
+<p>You can perform arithmetic operations directly in your queries:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1">-- Calculate bonus and total compensation</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">salary</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">bonus</span><span class="p">,</span><span class="w"> </span><span class="n">salary</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">(</span><span class="n">salary</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">total</span><span class="w"> </span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">employees</span><span class="w"> </span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">WHERE</span><span class="w"> </span><span class="p">(</span><span class="n">salary</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">5000</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">100000</span><span class="p">;</span>
 </code></pre></div>
 
 

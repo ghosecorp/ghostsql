@@ -642,6 +642,45 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#expressions-operators" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Expressions &amp; Operators
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Expressions &amp; Operators">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#arithmetic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Arithmetic
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#comparison-pattern-matching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Comparison &amp; Pattern Matching
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-manipulation-dml" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1121,6 +1160,45 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#expressions-operators" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Expressions &amp; Operators
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Expressions &amp; Operators">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#arithmetic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Arithmetic
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#comparison-pattern-matching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Comparison &amp; Pattern Matching
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-manipulation-dml" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1407,7 +1485,22 @@
 
 
 <h1 id="sql-reference">SQL Reference</h1>
-<p>GhostSQL supports a broad subset of PostgreSQL-compatible SQL.</p>
+<p>GhostSQL supports a broad subset of PostgreSQL-compatible SQL, including arithmetic and advanced filtering.</p>
+<h2 id="expressions-operators">Expressions &amp; Operators</h2>
+<h3 id="arithmetic">Arithmetic</h3>
+<p>GhostSQL supports standard arithmetic operators in <code>SELECT</code> and <code>WHERE</code> clauses:
+- <code>+</code> (Addition)
+- <code>-</code> (Subtraction)
+- <code>*</code> (Multiplication)
+- <code>/</code> (Division)</p>
+<p>Example: <code>SELECT (salary + 5000) * 1.1 AS bonus FROM employees;</code></p>
+<h3 id="comparison-pattern-matching">Comparison &amp; Pattern Matching</h3>
+<ul>
+<li><code>=</code>, <code>!=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code></li>
+<li><code>IN (val1, val2, ...)</code></li>
+<li><code>LIKE 'pattern'</code> (use <code>%</code> for any string, <code>_</code> for single character)</li>
+</ul>
+<p>Example: <code>SELECT * FROM users WHERE name LIKE 'A%' AND id IN (1, 10, 100);</code></p>
 <h2 id="data-manipulation-dml">Data Manipulation (DML)</h2>
 <h3 id="insert">INSERT</h3>
 <p><div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="p">(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="n">val1</span><span class="p">,</span><span class="w"> </span><span class="n">val2</span><span class="p">);</span>
@@ -1435,7 +1528,7 @@ The executing role becomes the <strong>owner</strong> of the table and has full 
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="n">ENABLE</span><span class="w"> </span><span class="k">ROW</span><span class="w"> </span><span class="k">LEVEL</span><span class="w"> </span><span class="k">SECURITY</span><span class="p">;</span>
 </code></pre></div>
 <h3 id="drop-table">DROP TABLE</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="p">[</span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="p">]</span><span class="w"> </span><span class="k">table_name</span><span class="p">;</span>
 </code></pre></div>
 <h2 id="access-control-dcl">Access Control (DCL)</h2>
 <h3 id="create-role">CREATE ROLE</h3>
@@ -1443,7 +1536,7 @@ The executing role becomes the <strong>owner</strong> of the table and has full 
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">rolename</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="n">LOGIN</span><span class="w"> </span><span class="n">PASSWORD</span><span class="w"> </span><span class="s1">&#39;pass&#39;</span><span class="w"> </span><span class="n">SUPERUSER</span><span class="p">;</span>
 </code></pre></div>
 <h3 id="drop-role">DROP ROLE</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">rolename</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="p">[</span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="p">]</span><span class="w"> </span><span class="n">rolename</span><span class="p">;</span>
 </code></pre></div>
 <h3 id="grant">GRANT</h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1">-- Database-level</span>
