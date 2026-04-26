@@ -34,6 +34,23 @@ func (s *Session) GetDatabase() string {
 	return s.CurrentDatabase
 }
 
+// SetUser sets the current user for this session
+func (s *Session) SetUser(user string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.User = user
+}
+
+// GetUser gets the current user for this session
+func (s *Session) GetUser() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.User == "" {
+		return "anonymous"
+	}
+	return s.User
+}
+
 // SessionManager manages all active client sessions
 type SessionManager struct {
 	sessions map[string]*Session

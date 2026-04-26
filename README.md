@@ -12,6 +12,12 @@
 - **Relational integrity**: JOIN (INNER, LEFT, RIGHT, FULL OUTER, CROSS), FOREIGN KEY, PRIMARY KEY, NOT NULL
 - **Data types**: INT, BIGINT, TEXT, VARCHAR(n), VECTOR(n), FLOAT, BOOLEAN
 - **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY/HAVING
+- **Advanced Security**:
+  - **RBAC**: PostgreSQL-compatible roles, privileges, `GRANT`/`REVOKE`, and `DROP ROLE`
+  - **Table Ownership**: Creator is automatically the owner — bypasses ACL checks (like `pg_aclcheck`)
+  - **RLS**: Row-Level Security with `CREATE POLICY` and `current_user()` session filtering
+  - **HBA**: IP-based access control via `pg_hba.conf`
+- **Driver Compatibility**: Handles `SET`, `BEGIN`, `COMMIT`, `ROLLBACK` — works with `psycopg2`, `pgx`, and standard `psql`
 - **Other SQL**: WHERE, ORDER BY, LIMIT, OFFSET, LIKE
 - **Transaction-safe storage**: Binary format, slotted pages, persistence to disk
 
@@ -21,10 +27,68 @@
 
 ```bash
 make build
-make run
+./ghostsql-server
 ```
 
-### Example Database Creation
+### Docker (Recommended)
+
+Run GhostSQL in a containerized environment:
+
+```bash
+docker-compose up -d
+```
+
+This will start the server on port `5433` and persist data in a Docker volume.
+
+## RBAC & Row-Level Security
+
+GhostSQL implements robust PostgreSQL-style access control.
+
+### 1. Role-Based Access Control (RBAC)
+
+Create roles and manage privileges:
+
+```sql
+-- Create a new user
+CREATE ROLE alice WITH LOGIN PASSWORD 'secret_pass';
+
+-- Grant connection and creation privileges
+GRANT CONNECT ON DATABASE my_db TO alice;
+GRANT CREATE ON DATABASE my_db TO alice;
+
+-- Grant object-level privileges
+GRANT SELECT ON TABLE sensitive_data TO alice;
+GRANT ALL PRIVILEGES ON DATABASE my_db TO analysts;
+
+-- Revoke privileges
+REVOKE INSERT ON TABLE logs FROM alice;
+
+-- Drop a role
+DROP ROLE alice;
+```
+
+**Table Ownership**: When a user creates a table, they are automatically its owner and have full access — no explicit `GRANT` needed. This matches PostgreSQL's `pg_aclcheck` behavior. Ownership can be checked via the `Owner` field in the system catalog.
+
+### 2. Row-Level Security (RLS)
+
+Filter rows dynamically based on the session user:
+
+```sql
+-- Enable RLS on a table
+ALTER TABLE secrets ENABLE ROW LEVEL SECURITY;
+
+-- Create a policy allowing users to see only their own data
+CREATE POLICY own_secrets ON secrets 
+FOR SELECT 
+TO all 
+USING (owner = current_user());
+```
+
+### 3. IP Access Control (HBA)
+
+GhostSQL uses `pg_hba.conf` (located in the data directory) to manage connection rules. Default rules allow local `trust` but require `password` for the `ghost` superuser.
+
+## Example Database Creation
 
 ```sql
 -- Create tables for employees and departments
@@ -103,33 +167,27 @@ SELECT name FROM employees WHERE name LIKE '%Ali%';
 
 ## Security & Authentication
 
-GhostSQL supports PostgreSQL-compatible authentication. By default, the server operates in a dual-mode:
+By default, the server operates in a secure-by-default mode:
 
-- **Trusted Mode**: Connections using any username other than the administrative account are trusted (no password required). This is ideal for local development and testing.
-- **Password Mode**: Connections using the administrative account (`ghost`) require password verification.
+- **Trusted Mode**: Local loopback connections (127.0.0.1) for non-superuser accounts are trusted.
+- **Password Mode**: The administrative account (`ghost`) and remote connections always require password verification.
 
 **Default Credentials:**
 - **Username**: `ghost`
-* **Password**: `ghostsql`
+- **Password**: `ghost`
 
 ### Connecting via psql
 ```bash
-# Trusted (skip password)
+# Trusted (skip password if connecting locally)
 psql -h localhost -p 5433 -d ghostsql
 
 # Authenticated
 psql -h localhost -p 5433 -d ghostsql -U ghost -W
 ```
 
-## Getting Help
-
-- Run `SHOW TABLES` to list tables
-- Run `SHOW COLUMNS FROM table_name` for schema
-- Use `exit` or `quit` to leave the shell
-
 ## Status
 
-**Beta** — GhostSQL is suitable for prototyping, RAG setups, local semantic search, and scalable microservice data. Production features (index persistence, full ACID transactions) coming soon.
+**Beta** — GhostSQL is suitable for prototyping, RAG setups, local semantic search, and scalable microservice data. Works with `psycopg2`, `pgx`, and standard `psql`. Production features (full ACID transactions, index persistence) coming soon.
 
 ***
 

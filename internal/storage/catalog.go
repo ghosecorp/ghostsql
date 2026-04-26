@@ -100,6 +100,61 @@ func (cp *CatalogProvider) GetPGAttributeRows(dbInstance *DatabaseInstance) []Ro
 	return rows
 }
 
+// GetPGAuthIDRows returns rows for pg_catalog.pg_authid
+func (cp *CatalogProvider) GetPGAuthIDRows() []Row {
+	rows := make([]Row, 0)
+	cp.db.RoleStore.mu.RLock()
+	defer cp.db.RoleStore.mu.RUnlock()
+
+	for _, role := range cp.db.RoleStore.Roles {
+		rows = append(rows, Row{
+			"oid":             role.OID,
+			"rolname":         role.Name,
+			"rolsuper":        role.IsSuperuser,
+			"rolinherit":      role.Inherits,
+			"rolcreaterole":   role.CanCreateRole,
+			"rolcreatedb":     role.CanCreateDB,
+			"rolcanlogin":     role.CanLogin,
+			"rolreplication":  role.Replication,
+			"rolbypassrls":    role.BypassRLS,
+			"rolconnlimit":    int32(role.ConnLimit),
+			"rolpassword":     role.PasswordHash,
+			"rolvaliduntil":   role.ValidUntil.Format("2006-01-02 15:04:05"),
+		})
+	}
+	return rows
+}
+
+// GetPGRolesRows returns rows for pg_catalog.pg_roles (sanitized pg_authid)
+func (cp *CatalogProvider) GetPGRolesRows() []Row {
+	rows := cp.GetPGAuthIDRows()
+	for i := range rows {
+		rows[i]["rolpassword"] = "********" // Sanitize
+	}
+	return rows
+}
+
+func (cp *CatalogProvider) GetPGAuthIDColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: TypeInt},
+		{Name: "rolname", Type: TypeText},
+		{Name: "rolsuper", Type: TypeBoolean},
+		{Name: "rolinherit", Type: TypeBoolean},
+		{Name: "rolcreaterole", Type: TypeBoolean},
+		{Name: "rolcreatedb", Type: TypeBoolean},
+		{Name: "rolcanlogin", Type: TypeBoolean},
+		{Name: "rolreplication", Type: TypeBoolean},
+		{Name: "rolbypassrls", Type: TypeBoolean},
+		{Name: "rolconnlimit", Type: TypeInt},
+		{Name: "rolpassword", Type: TypeText},
+		{Name: "rolvaliduntil", Type: TypeText},
+	}
+}
+
+func (cp *CatalogProvider) GetPGRolesColumns() []Column {
+	return cp.GetPGAuthIDColumns()
+}
+
 func (cp *CatalogProvider) mapTypeToOID(t DataType) int64 {
 	switch t {
 	case TypeInt:
@@ -108,6 +163,8 @@ func (cp *CatalogProvider) mapTypeToOID(t DataType) int64 {
 		return 25 // text
 	case TypeVarChar:
 		return 1043 // varchar
+	case TypeBoolean:
+		return 16 // bool
 	case TypeVector:
 		return 25 // Map to text for now for compatibility
 	default:

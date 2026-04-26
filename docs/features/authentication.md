@@ -1,63 +1,125 @@
 # Security & Authentication
 
-GhostSQL implements a robust authentication layer compatible with the standard PostgreSQL wire protocol. This allows you to secure your data while maintaining compatibility with your favorite database tools and libraries.
+GhostSQL implements a robust authentication and authorization layer compatible with the standard PostgreSQL wire protocol.
 
 ## Authentication Overview
 
-GhostSQL uses a **Dual-Mode Authentication** strategy to balance security with developer productivity.
+GhostSQL uses a **Host-Based Authentication (HBA)** system, controlled by `pg_hba.conf` in the data directory.
 
-### Trusted Mode (Default for Development)
-In **Trusted Mode**, the server permits connections without a password if the provided username does *not* match the internal administrative account. 
-
-- **Behavior**: Bypasses the password challenge.
-- **Use Case**: Local development, CI/CD pipelines, and rapid prototyping.
-- **Example**: `psql -h localhost -d ghostsql` (uses your current OS username).
-
-### Password Mode
-When connecting as the administrative user (`ghost`), the server enforces a **Cleartext Password Challenge**. 
-
-- **Behavior**: Requests a password before granting access.
-- **Use Case**: Shared environments, production-lite setups, and administrative tasks.
-- **Example**: `psql -h localhost -U ghost -W`
+### Authentication Modes
+- **Trust**: Permits connections without a password. Default for local loopback (127.0.0.1) connections for non-superusers.
+- **Password**: Enforces a cleartext password challenge. Required for the administrative account (`ghost`) and remote connections.
 
 ## Default Credentials
 
 | Parameter | Value |
 | :--- | :--- |
 | **Username** | `ghost` |
-| **Password** | `ghostsql` |
+| **Password** | `ghost` |
 
-> [!WARNING]
-> While currently established as a specialized development initiative, future versions of GhostSQL will introduce Role-Based Access Control (RBAC) and IP-based filtering for enhanced security.
+## Role-Based Access Control (RBAC)
+
+GhostSQL uses roles to manage database access and privileges.
+
+### Role Types
+- **Login Roles (Users)**: Created with the `LOGIN` attribute.
+- **Group Roles**: Roles that act as groups to manage permissions for multiple users.
+- **Superusers**: Administrative roles (like `ghost`) that bypass all permission checks.
+
+### Table Ownership
+
+When a user creates a table, they become its **owner** automatically — matching PostgreSQL's `pg_aclcheck` behavior. The owner always has full access without needing explicit `GRANT` entries. This means:
+
+- `REVOKE` from the owner has no effect (the owner always wins)
+- Ownership is stored in the table's `Owner` field (analogous to `pg_class.relowner`)
+- Superusers bypass ownership and ACL checks regardless
+
+### Example: Managing Roles
+```sql
+-- Create a user with a password
+CREATE ROLE alice WITH LOGIN PASSWORD 'secret';
+
+-- Grant connection and creation privileges (PostgreSQL standard order)
+GRANT CONNECT ON DATABASE my_db TO alice;
+GRANT CREATE ON DATABASE my_db TO alice;
+
+-- Grant object-level privileges
+GRANT SELECT ON TABLE users TO alice;
+
+-- Revoke a privilege
+REVOKE UPDATE ON TABLE orders FROM bob;
+
+-- Drop a role
+DROP ROLE alice;
+```
+
+### Supported Privileges
+
+| Privilege | Object Type | Description |
+|:---|:---|:---|
+| `SELECT` | `TABLE` | Read rows |
+| `INSERT` | `TABLE` | Insert rows |
+| `UPDATE` | `TABLE` | Update rows |
+| `DELETE` | `TABLE` | Delete rows |
+| `CREATE` | `DATABASE` | Create tables in a database |
+| `CONNECT` | `DATABASE` | Connect to a database |
+| `ALL PRIVILEGES` | `TABLE`, `DATABASE` | All of the above |
+
+## Row-Level Security (RLS)
+
+Row-Level Security allows you to define policies that restrict which rows a user can see or modify.
+
+### How it Works
+1. **Enable RLS**: `ALTER TABLE my_table ENABLE ROW LEVEL SECURITY;`
+2. **Define Policies**: Use `CREATE POLICY` to define the filtering logic.
+
+### Example: Private Data
+```sql
+-- Users can only see rows where they are the owner
+CREATE POLICY own_records ON documents
+FOR SELECT
+TO all
+USING (owner = current_user());
+```
+
+## Driver Compatibility
+
+GhostSQL handles the initialization queries that standard PostgreSQL drivers send automatically:
+
+| Statement | Behavior |
+|:---|:---|
+| `SET datestyle TO 'ISO'` | Accepted as no-op |
+| `BEGIN` | Accepted (no-op — transactions not yet ACID) |
+| `COMMIT` | Accepted as no-op |
+| `ROLLBACK` | Accepted as no-op |
+
+This ensures compatibility with:
+- **`psycopg2`** (Python)
+- **`pgx`** (Go)
+- **`psql`** (CLI)
+- Any standard PostgreSQL wire-protocol client
 
 ## Connection Examples
 
 ### Using psql (Command Line)
-
-**Unauthenticated (Trusted):**
 ```bash
-psql -h localhost -p 5433 -d my_app
+# Trusted (local — no password required)
+psql -h localhost -p 5433 -d ghostsql
+
+# Authenticated (as ghost)
+PGPASSWORD=ghost psql -h localhost -p 5433 -U ghost -d ghostsql
 ```
 
-**Authenticated (Ghost User):**
-```bash
-psql -h localhost -p 5433 -U ghost -d my_app -W
+### Using psycopg2 (Python)
+```python
+import psycopg2
+conn = psycopg2.connect(
+    host="localhost", port=5433,
+    database="ghostsql", user="ghost", password="ghost"
+)
+conn.autocommit = True
 ```
 
-### Using Connection Strings
-
-You can also connect using standard PostgreSQL URI strings:
-
-**Trusted:**
-`postgresql://localhost:5433/my_app`
-
-**Authenticated:**
-`postgresql://ghost:ghostsql@localhost:5433/my_app`
-
-## Future Roadmap
-
-The Ghosecorp team is planning several security enhancements:
-1. **SCRAM-SHA-256 Support**: More secure password hashing for the wire protocol.
-2. **RBAC**: Define granular permissions for different users and roles.
-3. **TLS/SSL Encryption**: Secure data in transit.
-4. **IP White-listing**: Restrict access to specific network ranges.
+## Security Files
+- **`pg_hba.conf`**: Connection rules (IP, database, user, method).
+- **`global/pg_authid`**: Binary role store (analogous to PostgreSQL's `pg_authid` catalog).

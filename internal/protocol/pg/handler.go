@@ -18,6 +18,7 @@ type Handler struct {
 	session  *storage.Session
 	executor *executor.Executor
 	user     string
+	role     *storage.Role
 }
 
 // NewHandler creates a new PG protocol handler
@@ -37,18 +38,65 @@ func (h *Handler) Handle() error {
 		return err
 	}
 
-	// 2. Authentication
-	// Only require password if the user is the configured 'ghost' user
-	if h.user == h.db.Config.Username {
-		if err := h.requestPassword(); err != nil {
-			h.sendError(err)
-			return err
-		}
+	// 2. HBA Check
+	var remoteIP net.IP
+	if tcpAddr, ok := h.conn.RemoteAddr().(*net.TCPAddr); ok {
+		remoteIP = tcpAddr.IP
 	} else {
-		// Trust other users (or anonymous) for now as requested
-		if err := h.sendAuthenticationOk(); err != nil {
-			return err
+		remoteIP = net.ParseIP("127.0.0.1") // Fallback for pipes/local
+	}
+
+	hba, _ := LoadHBAConfig("pg_hba.conf") // Reload for now or cache?
+	method, err := hba.Check(remoteIP, h.session.GetDatabase(), h.user)
+	if err != nil {
+		h.sendError(err)
+		return err
+	}
+
+	if method == MethodReject {
+		err := fmt.Errorf("connection rejected by pg_hba.conf")
+		h.sendError(err)
+		return err
+	}
+
+	// 3. Authentication
+	role, exists := h.db.RoleStore.GetRole(h.user)
+	if !exists {
+		// If user doesn't exist, we can either reject or trust.
+		// PostgreSQL by default rejects. We'll trust if not 'ghost' for now (per user req)
+		if h.user == "ghost" {
+			h.sendError(fmt.Errorf("role 'ghost' not found in system catalog"))
+			return fmt.Errorf("ghost role missing")
 		}
+		
+		// If HBA says trust, we trust. If it says password, we might need a password even for non-existent?
+		// Actually if HBA says password, we MUST have a role to check against.
+		if method == MethodTrust {
+			if err := h.sendAuthenticationOk(); err != nil {
+				return err
+			}
+		} else {
+			h.sendError(fmt.Errorf("role %s does not exist and trust is not enabled", h.user))
+			return fmt.Errorf("role not found")
+		}
+	} else if role.CanLogin {
+		if method == MethodTrust {
+			if err := h.sendAuthenticationOk(); err != nil {
+				return err
+			}
+		} else {
+			if err := h.requestPassword(role); err != nil {
+				h.sendError(err)
+				return err
+			}
+		}
+		h.role = role
+		h.session.SetUser(h.user)
+	} else {
+		// Role cannot login
+		err := fmt.Errorf("role %s is not permitted to log in", h.user)
+		h.sendError(err)
+		return err
 	}
 
 	// 3. Send Parameter Status & ReadyForQuery
@@ -173,7 +221,7 @@ func (h *Handler) sendAuthenticationOk() error {
 	return err
 }
 
-func (h *Handler) requestPassword() error {
+func (h *Handler) requestPassword(role *storage.Role) error {
 	// Send AuthenticationCleartextPassword (3)
 	msg := make([]byte, 9)
 	msg[0] = ResAuthentication
@@ -194,7 +242,7 @@ func (h *Handler) requestPassword() error {
 	}
 
 	password := string(payload[:len(payload)-1]) // Remove null terminator
-	if password != h.db.Config.Password {
+	if !role.VerifyPassword(password) {
 		return fmt.Errorf("invalid password for user %s", h.user)
 	}
 

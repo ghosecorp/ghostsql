@@ -27,6 +27,14 @@ func NewExecutor(db *storage.Database, session *storage.Session) *Executor {
 	}
 }
 
+func (e *Executor) GetSession() *storage.Session {
+	return e.session
+}
+
+func (e *Executor) SetSession(s *storage.Session) {
+	e.session = s
+}
+
 type Result struct {
 	Message string
 	Rows    []storage.Row
@@ -73,9 +81,54 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeCreateIndex(s)
 	case *parser.DropIndexStmt:
 		return e.executeDropIndex(s)
+	case *parser.CreateRoleStmt:
+		return e.executeCreateRole(s)
+	case *parser.AlterRoleStmt:
+		return e.executeAlterRole(s)
+	case *parser.GrantStmt:
+		return e.executeGrant(s)
+	case *parser.RevokeStmt:
+		return e.executeRevoke(s)
+	case *parser.CreatePolicyStmt:
+		return e.executeCreatePolicy(s)
+	case *parser.SetStmt:
+		return &Result{Message: "SET"}, nil
+	case *parser.TransactionStmt:
+		return &Result{Message: s.Command}, nil
+	case *parser.DropRoleStmt:
+		return e.executeDropRole(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
+}
+
+func (e *Executor) checkPrivilege(objectType, objectName, privilege string) error {
+	user := e.session.GetUser()
+
+	// Superuser bypass (like pg_aclcheck)
+	if role, ok := e.db.RoleStore.GetRole(user); ok && role.IsSuperuser {
+		return nil
+	}
+	// Legacy superuser check for the default 'ghost' account
+	if user == "ghost" {
+		return nil
+	}
+
+	// Owner bypass for TABLE objects (PostgreSQL standard: owner always has access)
+	if objectType == "TABLE" {
+		if dbInstance, err := e.getActiveDatabase(); err == nil {
+			if table, exists := dbInstance.GetTable(objectName); exists && table.Owner == user {
+				return nil
+			}
+		}
+	}
+
+	objectKey := fmt.Sprintf("%s:%s", objectType, objectName)
+	if e.db.RoleStore.HasPrivilege(user, objectKey, privilege) {
+		return nil
+	}
+
+	return fmt.Errorf("permission denied for %s on %s %s", privilege, objectType, objectName)
 }
 
 func (e *Executor) executeCreateDatabase(stmt *parser.CreateDatabaseStmt) (*Result, error) {
@@ -196,6 +249,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	if err != nil {
 		return nil, err
 	}
+	if err := e.checkPrivilege("DATABASE", dbInstance.Name, "CREATE"); err != nil {
+		return nil, err
+	}
 
 	columns := make([]storage.Column, len(stmt.Columns))
 	for i, colDef := range stmt.Columns {
@@ -230,7 +286,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		)
 	}
 
-	table := storage.NewTable(stmt.TableName, columns, tableMeta)
+	// Set owner: the creator is the table owner (PostgreSQL standard)
+	owner := e.session.GetUser()
+	table := storage.NewTable(stmt.TableName, owner, columns, tableMeta)
 	dbInstance.SetTable(stmt.TableName, table)
 
 	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
@@ -243,6 +301,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 }
 
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
+	if err := e.checkPrivilege("TABLE", stmt.TableName, "INSERT"); err != nil {
+		return nil, err
+	}
 	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
@@ -366,11 +427,14 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	}
 
 	return &Result{
-		Message: fmt.Sprintf("INSERT %d row(s)", len(stmt.Values)),
+		Message: fmt.Sprintf("INSERT 0 %d", len(stmt.Values)),
 	}, nil
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
+		return nil, err
+	}
 	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
 		return nil, err
@@ -385,6 +449,17 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if stmt.Where != nil {
 		where = convertWhereClause(stmt.Where)
 	}
+	if table.RLSEnabled && e.session.GetUser() != "ghost" {
+		user := e.session.GetUser()
+		for _, policy := range table.Policies {
+			if (policy.Action == "SELECT" || policy.Action == "ALL") && (policy.Role == "all" || policy.Role == user) {
+				if policy.Where != nil {
+					where = combineWhere(policy.Where.Clone(), where)
+				}
+			}
+		}
+	}
+	e.resolveWhereClauseVariables(where)
 
 	// Fetch rows from main table
 	initialColumns := stmt.Columns
@@ -1269,6 +1344,21 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		}, nil
 	}
 
+	if stmt.Action == "ENABLE_RLS" {
+		table.RLSEnabled = true
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
+	}
+
+	if stmt.Action == "DISABLE_RLS" {
+		table.RLSEnabled = false
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DISABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
+	}
 	return nil, fmt.Errorf("unsupported ALTER TABLE action: %s", stmt.Action)
 }
 
@@ -1653,3 +1743,190 @@ func toComparableInt(val interface{}) (int64, bool) {
 		return 0, false
 	}
 }
+
+func (e *Executor) executeCreateRole(stmt *parser.CreateRoleStmt) (*Result, error) {
+	// Check if current user has CREATEROLE privilege or is superuser
+	user := e.session.GetUser()
+	role, exists := e.db.RoleStore.GetRole(user)
+	if user != "ghost" && (!exists || !role.CanCreateRole) {
+		return nil, fmt.Errorf("permission denied to create roles")
+	}
+
+	newRole := &storage.Role{
+		OID:           e.db.Catalog.GenerateOID(stmt.RoleName),
+		Name:          stmt.RoleName,
+		IsSuperuser:   stmt.IsSuperuser,
+		CanLogin:      stmt.CanLogin,
+		CanCreateRole: stmt.CanCreateRole,
+		CanCreateDB:   stmt.CanCreateDB,
+		PasswordHash:  storage.HashPassword(stmt.Password),
+		Privileges:    make(map[string]map[string]bool),
+	}
+
+	if err := e.db.RoleStore.CreateRole(newRole); err != nil {
+		return nil, err
+	}
+	e.db.RoleStore.Save()
+
+	return &Result{
+		Message: fmt.Sprintf("CREATE ROLE %s", stmt.RoleName),
+	}, nil
+}
+
+func (e *Executor) executeDropRole(stmt *parser.DropRoleStmt) (*Result, error) {
+	user := e.session.GetUser()
+	role, exists := e.db.RoleStore.GetRole(user)
+	if user != "ghost" && (!exists || !role.CanCreateRole) {
+		return nil, fmt.Errorf("permission denied to drop role")
+	}
+
+	if err := e.db.RoleStore.DeleteRole(stmt.RoleName); err != nil {
+		return nil, err
+	}
+
+	if err := e.db.RoleStore.Save(); err != nil {
+		return nil, fmt.Errorf("failed to persist role deletion: %w", err)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("DROP ROLE %s", stmt.RoleName),
+	}, nil
+}
+
+func (e *Executor) executeAlterRole(stmt *parser.AlterRoleStmt) (*Result, error) {
+	user := e.session.GetUser()
+	if user != "ghost" && user != stmt.RoleName {
+		// Only superuser or the role itself can alter its password for now
+		return nil, fmt.Errorf("permission denied to alter role %s", stmt.RoleName)
+	}
+
+	role, exists := e.db.RoleStore.GetRole(stmt.RoleName)
+	if !exists {
+		return nil, fmt.Errorf("role %s does not exist", stmt.RoleName)
+	}
+
+	if stmt.Password != "" {
+		role.PasswordHash = storage.HashPassword(stmt.Password)
+	}
+
+	e.db.RoleStore.Save()
+	return &Result{
+		Message: fmt.Sprintf("ALTER ROLE %s", stmt.RoleName),
+	}, nil
+}
+
+func (e *Executor) executeGrant(stmt *parser.GrantStmt) (*Result, error) {
+	// Simple implementation: only superuser can GRANT for now
+	user := e.session.GetUser()
+	if user != "ghost" {
+		return nil, fmt.Errorf("only superuser can GRANT privileges")
+	}
+
+	privs := stmt.Privileges
+	if stmt.All {
+		privs = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+	}
+
+	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+	for _, priv := range privs {
+		if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
+			return nil, err
+		}
+	}
+
+	e.db.RoleStore.Save()
+	return &Result{
+		Message: "GRANT successful",
+	}, nil
+}
+
+func (e *Executor) executeRevoke(stmt *parser.RevokeStmt) (*Result, error) {
+	user := e.session.GetUser()
+	if user != "ghost" {
+		return nil, fmt.Errorf("only superuser can REVOKE privileges")
+	}
+
+	role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+	if !exists {
+		return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+	}
+
+	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+	if stmt.All {
+		delete(role.Privileges, objectKey)
+	} else {
+		if role.Privileges != nil && role.Privileges[objectKey] != nil {
+			for _, priv := range stmt.Privileges {
+				delete(role.Privileges[objectKey], priv)
+			}
+		}
+	}
+
+	e.db.RoleStore.Save()
+	return &Result{
+		Message: "REVOKE successful",
+	}, nil
+}
+
+
+func combineWhere(p, w *storage.WhereClause) *storage.WhereClause {
+	if p == nil {
+		return w
+	}
+	if w == nil {
+		return p
+	}
+	
+	// P is already cloned by the caller if needed
+	curr := p
+	for curr.And != nil {
+		curr = curr.And
+	}
+	curr.And = w
+	return p
+}
+
+func (e *Executor) executeCreatePolicy(stmt *parser.CreatePolicyStmt) (*Result, error) {
+	if err := e.checkPrivilege("TABLE", stmt.TableName, "ALL"); err != nil {
+		return nil, err
+	}
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+	
+	table, exists := dbInstance.GetTable(stmt.TableName)
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	}
+	
+	policy := storage.Policy{
+		Name:      stmt.PolicyName,
+		Action:    stmt.Action,
+		Role:      stmt.Role,
+		UsingExpr: "...", 
+		Where:     convertWhereClause(stmt.Using),
+	}
+	
+	table.Policies = append(table.Policies, policy)
+	return &Result{Message: "CREATE POLICY"}, nil
+}
+
+
+func (e *Executor) resolveWhereClauseVariables(where *storage.WhereClause) {
+	if where == nil {
+		return
+	}
+	if s, ok := where.Value.(string); ok {
+		if s == "current_user()" {
+			where.Value = e.session.GetUser()
+		}
+	}
+	if where.And != nil {
+		e.resolveWhereClauseVariables(where.And)
+	}
+	if where.Or != nil {
+		e.resolveWhereClauseVariables(where.Or)
+	}
+}
+
