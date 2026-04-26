@@ -2,6 +2,30 @@
 
 All notable changes to GhostSQL will be documented in this file.
 
+## [0.1.2] - 2026-04-26
+
+### Added
+- **PostgreSQL RBAC (Role-Based Access Control)**: Implemented a robust role and privilege system.
+  - Support for `CREATE ROLE` with `LOGIN`, `SUPERUSER`, and `PASSWORD` attributes.
+  - Expanded `GRANT/REVOKE` support for `TABLE`, `DATABASE`, and `SCHEMA` objects.
+  - Cluster-wide role persistence in `global/pg_auth.json`.
+- **Row-Level Security (RLS)**: Implemented a powerful security engine for granular data access.
+  - Support for `CREATE POLICY` with `USING` expressions.
+  - Runtime policy injection and session-aware filtering using `current_user()`.
+  - Recursive logic merging for complex security policies.
+- **HBA (Host-Based Authentication)**: Added `pg_hba.conf` support for IP-based access control.
+  - Secure-by-default configuration (local trust for users, password for superuser).
+- **Docker Integration**: Added `Dockerfile` and `docker-compose.yml` for containerized deployments.
+- **Enhanced Parser**: Added support for `CURRENT_USER` keyword and function calls in expressions.
+- **New Integration Tests**: Added dedicated suites for RBAC (`tests/rbac_test.go`) and RLS (`tests/rls_test.go`).
+
+### Fixed
+- **.gitignore Scoping**: Fixed root-level binary ignore rules that were accidentally hiding source directories.
+- **Recursive Expression Safety**: Implemented `Clone()` for `WhereClause` to prevent cross-session security filter leakage.
+
+### Documentation
+- Updated `README.md` and `docs/features/authentication.md` with RBAC, RLS, and Docker instructions.
+
 ## [0.1.1] - 2026-04-25
 
 ### Added

@@ -55,6 +55,28 @@ const (
 	TOKEN_HNSW
 	TOKEN_BTREE
 	TOKEN_WITH
+ 
+	// RBAC Keywords
+	TOKEN_GRANT
+	TOKEN_REVOKE
+	TOKEN_ROLE
+	TOKEN_PASSWORD
+	TOKEN_LOGIN
+	TOKEN_SUPERUSER
+	TOKEN_TO
+	TOKEN_PRIVILEGES
+	TOKEN_ALL
+ 
+	// RLS and Schema Keywords
+	TOKEN_POLICY
+	TOKEN_ENABLE
+	TOKEN_SECURITY
+	TOKEN_FOR
+	TOKEN_SCHEMA
+	TOKEN_ROW
+	TOKEN_LEVEL
+	TOKEN_DISABLE
+	TOKEN_CURRENT_USER
 
 	// Literals
 	TOKEN_IDENT
@@ -214,6 +236,26 @@ func (t TokenType) String() string {
 		TOKEN_NOT_MATCH_CI: "!~*",
 		TOKEN_CAST:         "::",
 		TOKEN_COLON:        ":",
+ 
+		TOKEN_GRANT:     "GRANT",
+		TOKEN_REVOKE:    "REVOKE",
+		TOKEN_ROLE:      "ROLE",
+		TOKEN_PASSWORD:  "PASSWORD",
+		TOKEN_LOGIN:     "LOGIN",
+		TOKEN_SUPERUSER: "SUPERUSER",
+		TOKEN_TO:        "TO",
+		TOKEN_PRIVILEGES: "PRIVILEGES",
+		TOKEN_ALL:       "ALL",
+ 
+		TOKEN_POLICY:   "POLICY",
+		TOKEN_ENABLE:   "ENABLE",
+		TOKEN_SECURITY: "SECURITY",
+		TOKEN_FOR:      "FOR",
+		TOKEN_SCHEMA:   "SCHEMA",
+		TOKEN_ROW:      "ROW",
+		TOKEN_LEVEL:    "LEVEL",
+		TOKEN_DISABLE:  "DISABLE",
+		TOKEN_CURRENT_USER: "CURRENT_USER",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -289,6 +331,24 @@ var keywords = map[string]TokenType{
 	"END":             TOKEN_END,
 	"OPERATOR":        TOKEN_OPERATOR,
 	"IN":              TOKEN_IN,
+	"GRANT":           TOKEN_GRANT,
+	"REVOKE":          TOKEN_REVOKE,
+	"ROLE":            TOKEN_ROLE,
+	"PASSWORD":        TOKEN_PASSWORD,
+	"LOGIN":           TOKEN_LOGIN,
+	"SUPERUSER":       TOKEN_SUPERUSER,
+	"TO":              TOKEN_TO,
+	"PRIVILEGES":      TOKEN_PRIVILEGES,
+	"ALL":             TOKEN_ALL,
+	"POLICY":          TOKEN_POLICY,
+	"ENABLE":          TOKEN_ENABLE,
+	"SECURITY":        TOKEN_SECURITY,
+	"FOR":             TOKEN_FOR,
+	"SCHEMA":          TOKEN_SCHEMA,
+	"ROW":             TOKEN_ROW,
+	"LEVEL":           TOKEN_LEVEL,
+	"DISABLE":         TOKEN_DISABLE,
+	"CURRENT_USER":    TOKEN_CURRENT_USER,
 }
 
 func LookupKeyword(ident string) TokenType {

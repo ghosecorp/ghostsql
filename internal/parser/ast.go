@@ -141,7 +141,7 @@ func (s *TruncateStmt) StatementNode() {}
 // AlterTableStmt represents ALTER TABLE
 type AlterTableStmt struct {
 	TableName string
-	Action    string // "ADD_COLUMN", "DROP_COLUMN"
+	Action    string // "ADD_COLUMN", "DROP_COLUMN", "ENABLE_RLS", "DISABLE_RLS"
 	Column    *ColumnDef
 }
 
@@ -222,3 +222,56 @@ type JoinCondition struct {
 	RightTable  string
 	RightColumn string
 }
+
+// CreateRoleStmt represents CREATE ROLE
+type CreateRoleStmt struct {
+	RoleName      string
+	IsSuperuser   bool
+	CanLogin      bool
+	CanCreateRole bool
+	CanCreateDB   bool
+	Password      string
+}
+
+func (s *CreateRoleStmt) StatementNode() {}
+
+// AlterRoleStmt represents ALTER ROLE
+type AlterRoleStmt struct {
+	RoleName string
+	Password string // New password if specified
+}
+
+func (s *AlterRoleStmt) StatementNode() {}
+
+// GrantStmt represents GRANT privileges
+type GrantStmt struct {
+	Privileges []string // SELECT, INSERT, etc.
+	All        bool
+	ObjectType string   // TABLE, DATABASE, etc.
+	ObjectName string   // employees, my_app, etc.
+	ToRole     string
+}
+
+func (s *GrantStmt) StatementNode() {}
+
+// RevokeStmt represents REVOKE privileges
+type RevokeStmt struct {
+	Privileges []string
+	All        bool
+	ObjectType string
+	ObjectName string
+	FromRole   string
+}
+
+func (s *RevokeStmt) StatementNode() {}
+
+// CreatePolicyStmt represents CREATE POLICY
+type CreatePolicyStmt struct {
+	PolicyName string
+	TableName  string
+	Action     string // "SELECT", "INSERT", "UPDATE", "DELETE"
+	Role       string // "all", or specific role
+	Using      *WhereClause
+}
+
+func (s *CreatePolicyStmt) StatementNode() {}

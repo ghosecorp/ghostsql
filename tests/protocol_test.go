@@ -71,7 +71,7 @@ func TestPostgreSQLAuthentication(t *testing.T) {
 		}
 
 		// Send PasswordMessage ('p')
-		password := "ghostsql"
+		password := "ghost"
 		payload := append([]byte(password), 0)
 		header := make([]byte, 5)
 		header[0] = 'p'

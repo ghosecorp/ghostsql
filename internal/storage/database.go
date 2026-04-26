@@ -55,6 +55,14 @@ func (di *DatabaseInstance) GetTable(name string) (*Table, bool) {
 		rows := di.db.Catalog.GetPGConstraintRows()
 		return &Table{Name: "pg_constraint", Rows: rows, Columns: di.db.Catalog.GetPGConstraintColumns()}, true
 	}
+	if name == "pg_authid" || name == "pg_catalog.pg_authid" {
+		rows := di.db.Catalog.GetPGAuthIDRows()
+		return &Table{Name: "pg_authid", Rows: rows, Columns: di.db.Catalog.GetPGAuthIDColumns()}, true
+	}
+	if name == "pg_roles" || name == "pg_catalog.pg_roles" {
+		rows := di.db.Catalog.GetPGRolesRows()
+		return &Table{Name: "pg_roles", Rows: rows, Columns: di.db.Catalog.GetPGRolesColumns()}, true
+	}
 
 	di.mu.RLock()
 	defer di.mu.RUnlock()
@@ -102,6 +110,7 @@ type Database struct {
 	mu            sync.RWMutex
 	SessionMgr    *SessionManager
 	Catalog       *CatalogProvider
+	RoleStore     *RoleStore
 	Config        DatabaseConfig
 }
 
@@ -122,9 +131,10 @@ func Initialize(rootPath string) (*Database, error) {
 		Databases:  make(map[string]*DatabaseInstance),
 		LockFile:   filepath.Join(dd.RootPath, "ghostsql.pid"),
 		SessionMgr: NewSessionManager(),
+		RoleStore:  NewRoleStore(dd.RootPath),
 		Config: DatabaseConfig{
 			Username: "ghost",
-			Password: "ghostsql",
+			Password: "ghost",
 		},
 	}
 	db.Catalog = NewCatalogProvider(db)
@@ -134,7 +144,39 @@ func Initialize(rootPath string) (*Database, error) {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
-	// Load existing databases
+	// Load roles (cluster-wide)
+	if err := db.RoleStore.Load(); err != nil {
+		logger.Error("Failed to load roles: %v", err)
+	}
+
+	// Ensure default ghost superuser exists
+	if _, exists := db.RoleStore.GetRole("ghost"); !exists {
+		logger.Info("Creating default superuser 'ghost'...")
+		ghost := &Role{
+			OID:           db.Catalog.GenerateOID("ghost"),
+			Name:          "ghost",
+			IsSuperuser:   true,
+			CanLogin:      true,
+			PasswordHash:  HashPassword("ghost"),
+			CanCreateRole: true,
+			CanCreateDB:   true,
+		}
+		if err := db.RoleStore.CreateRole(ghost); err != nil {
+			logger.Error("Failed to create default ghost role: %v", err)
+		} else {
+			db.RoleStore.Save()
+		}
+	}
+
+	// Ensure 'all' role exists
+	if _, exists := db.RoleStore.GetRole("all"); !exists {
+		allRole := &Role{
+			Name: "all",
+		}
+		db.RoleStore.CreateRole(allRole)
+	}
+
+	// Load databases from disk
 	logger.Info("Loading databases from disk...")
 	if err := db.LoadAllDatabases(); err != nil {
 		logger.Error("Failed to load databases: %v", err)

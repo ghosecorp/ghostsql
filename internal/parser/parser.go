@@ -55,6 +55,10 @@ func (p *Parser) Parse() (Statement, error) {
 		stmt, err = p.parseTruncate()
 	case TOKEN_COMMENT:
 		stmt, err = p.parseComment()
+	case TOKEN_GRANT:
+		stmt, err = p.parseGrant()
+	case TOKEN_REVOKE:
+		stmt, err = p.parseRevoke()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
@@ -81,8 +85,12 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return p.parseCreateTable()
 	case TOKEN_INDEX:
 		return p.parseCreateIndex()
+	case TOKEN_ROLE:
+		return p.parseCreateRole()
+	case TOKEN_POLICY:
+		return p.parseCreatePolicy()
 	default:
-		return nil, fmt.Errorf("expected DATABASE, TABLE, or INDEX after CREATE")
+		return nil, fmt.Errorf("expected DATABASE, TABLE, INDEX, ROLE, or POLICY after CREATE")
 	}
 }
 
@@ -246,15 +254,23 @@ func (p *Parser) parseTruncate() (*TruncateStmt, error) {
 	return stmt, nil
 }
 
-func (p *Parser) parseAlter() (*AlterTableStmt, error) {
-	stmt := &AlterTableStmt{}
-
+func (p *Parser) parseAlter() (Statement, error) {
 	p.nextToken() // consume ALTER
 
-	if p.current.Type != TOKEN_TABLE {
-		return nil, fmt.Errorf("expected TABLE after ALTER")
+	switch p.current.Type {
+	case TOKEN_TABLE:
+		return p.parseAlterTable()
+	case TOKEN_ROLE:
+		return p.parseAlterRole()
+	default:
+		return nil, fmt.Errorf("expected TABLE or ROLE after ALTER")
 	}
-	p.nextToken()
+}
+
+func (p *Parser) parseAlterTable() (*AlterTableStmt, error) {
+	stmt := &AlterTableStmt{}
+
+	p.nextToken() // consume TABLE
 
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected table name")
@@ -262,22 +278,38 @@ func (p *Parser) parseAlter() (*AlterTableStmt, error) {
 	stmt.TableName = p.current.Literal
 	p.nextToken()
 
-	if p.current.Type != TOKEN_ADD {
-		return nil, fmt.Errorf("expected ADD (only ADD COLUMN supported for now)")
+	switch p.current.Type {
+	case TOKEN_ADD:
+		p.nextToken()
+		if p.current.Type == TOKEN_COLUMN {
+			p.nextToken()
+		}
+		stmt.Action = "ADD_COLUMN"
+		col, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Column = &col
+	case TOKEN_ENABLE, TOKEN_DISABLE:
+		action := "ENABLE_RLS"
+		if p.current.Type == TOKEN_DISABLE {
+			action = "DISABLE_RLS"
+		}
+		p.nextToken()
+		if p.current.Type == TOKEN_ROW {
+			p.nextToken()
+			if p.current.Type == TOKEN_LEVEL {
+				p.nextToken()
+			}
+		}
+		if p.current.Type != TOKEN_SECURITY {
+			return nil, fmt.Errorf("expected SECURITY after ENABLE/DISABLE [ROW LEVEL]")
+		}
+		p.nextToken()
+		stmt.Action = action
+	default:
+		return nil, fmt.Errorf("expected ADD, ENABLE, or DISABLE after ALTER TABLE")
 	}
-	p.nextToken()
-
-	if p.current.Type == TOKEN_COLUMN {
-		p.nextToken() // consume COLUMN (optional)
-	}
-
-	stmt.Action = "ADD_COLUMN"
-	col, err := p.parseColumnDef()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Column = &col
-
 	return stmt, nil
 }
 
@@ -1276,12 +1308,15 @@ func (p *Parser) parseAggregate() (AggregateFunc, error) {
 func (p *Parser) parseWhere() (*WhereClause, error) {
 	where := &WhereClause{}
 
-	// Parse LHS (may be column, table.column, or function_call())
-	if p.current.Type != TOKEN_IDENT {
-		return nil, fmt.Errorf("expected identifier in WHERE")
+	// Parse LHS (may be column, table.column, function_call(), or CURRENT_USER)
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_CURRENT_USER {
+		return nil, fmt.Errorf("expected identifier in WHERE, got %s", p.current.Type)
 	}
 
 	lhs := p.current.Literal
+	if p.current.Type == TOKEN_CURRENT_USER {
+		lhs = "current_user()"
+	}
 	p.nextToken()
 
 	// Handle dots and function calls
@@ -1302,7 +1337,10 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 				}
 				p.nextToken()
 			}
-			lhs += "()"
+			// If LHS was current_user, it already has parens if we want them normalized
+			if !strings.HasSuffix(lhs, "()") {
+				lhs += "()"
+			}
 		}
 	}
 
@@ -1427,9 +1465,22 @@ func (p *Parser) parseLiteralValue() (interface{}, error) {
 		}
 	case TOKEN_STRING:
 		val = p.current.Literal
-	case TOKEN_IDENT:
-		// Treat as string for now if it's an alias in WHERE
+	case TOKEN_IDENT, TOKEN_CURRENT_USER:
+		// Treat as string literal for variable resolution later
 		val = p.current.Literal
+		if p.current.Type == TOKEN_CURRENT_USER {
+			val = "current_user()"
+			p.nextToken()
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken()
+				if p.current.Type == TOKEN_RPAREN {
+					p.nextToken()
+				} else {
+					return nil, fmt.Errorf("expected ) after current_user(")
+				}
+			}
+			return val, nil
+		}
 	case TOKEN_NULL:
 		val = nil
 	default:
@@ -1848,5 +1899,245 @@ func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	}
 
 	return join, nil
+}
+
+
+func (p *Parser) parseCreateRole() (*CreateRoleStmt, error) {
+	stmt := &CreateRoleStmt{CanLogin: true} 
+	p.nextToken() // consume ROLE
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
+		return nil, fmt.Errorf("expected role name")
+	}
+	stmt.RoleName = p.current.Literal
+	p.nextToken()
+	if p.current.Type == TOKEN_WITH {
+		p.nextToken()
+	}
+	for {
+		switch p.current.Type {
+		case TOKEN_LOGIN:
+			stmt.CanLogin = true
+			p.nextToken()
+		case TOKEN_SUPERUSER:
+			stmt.IsSuperuser = true
+			p.nextToken()
+		case TOKEN_PASSWORD:
+			p.nextToken()
+			if p.current.Type != TOKEN_STRING {
+				return nil, fmt.Errorf("expected password string")
+			}
+			stmt.Password = p.current.Literal
+			p.nextToken()
+		case TOKEN_SEMICOLON, TOKEN_EOF:
+			return stmt, nil
+		default:
+			return stmt, nil
+		}
+	}
+}
+
+func (p *Parser) parseAlterRole() (*AlterRoleStmt, error) {
+	stmt := &AlterRoleStmt{}
+	p.nextToken() // consume ROLE
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
+		return nil, fmt.Errorf("expected role name")
+	}
+	stmt.RoleName = p.current.Literal
+	p.nextToken()
+	if p.current.Type == TOKEN_WITH {
+		p.nextToken()
+	}
+	if p.current.Type == TOKEN_PASSWORD {
+		p.nextToken()
+		if p.current.Type != TOKEN_STRING {
+			return nil, fmt.Errorf("expected password string")
+		}
+		stmt.Password = p.current.Literal
+		p.nextToken()
+	}
+	return stmt, nil
+}
+
+func (p *Parser) parseGrant() (*GrantStmt, error) {
+	stmt := &GrantStmt{}
+	p.nextToken() // consume GRANT
+	if p.current.Type == TOKEN_ALL {
+		stmt.All = true
+		p.nextToken()
+		if p.current.Type == TOKEN_PRIVILEGES {
+			p.nextToken()
+		}
+	} else {
+		for {
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE {
+				break
+			}
+			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
+			p.nextToken()
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+				continue
+			}
+			break
+		}
+	}
+	if p.current.Type != TOKEN_ON {
+		return nil, fmt.Errorf("expected ON after privileges")
+	}
+	p.nextToken()
+	switch p.current.Type {
+	case TOKEN_TABLE:
+		stmt.ObjectType = "TABLE"
+		p.nextToken()
+	case TOKEN_DATABASE:
+		stmt.ObjectType = "DATABASE"
+		p.nextToken()
+	case TOKEN_SCHEMA:
+		stmt.ObjectType = "SCHEMA"
+		p.nextToken()
+	default:
+		stmt.ObjectType = "TABLE"
+	}
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected object name")
+	}
+	stmt.ObjectName = p.current.Literal
+	p.nextToken()
+	if p.current.Type != TOKEN_TO {
+		return nil, fmt.Errorf("expected TO after object name")
+	}
+	p.nextToken()
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
+		return nil, fmt.Errorf("expected role name")
+	}
+	stmt.ToRole = p.current.Literal
+	p.nextToken()
+	return stmt, nil
+}
+
+func (p *Parser) parseRevoke() (*RevokeStmt, error) {
+	stmt := &RevokeStmt{}
+	p.nextToken() // consume REVOKE
+	if p.current.Type == TOKEN_ALL {
+		stmt.All = true
+		p.nextToken()
+		if p.current.Type == TOKEN_PRIVILEGES {
+			p.nextToken()
+		}
+	} else {
+		for {
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE {
+				break
+			}
+			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
+			p.nextToken()
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+				continue
+			}
+			break
+		}
+	}
+	if p.current.Type != TOKEN_ON {
+		return nil, fmt.Errorf("expected ON after privileges")
+	}
+	p.nextToken()
+	switch p.current.Type {
+	case TOKEN_TABLE:
+		stmt.ObjectType = "TABLE"
+		p.nextToken()
+	case TOKEN_DATABASE:
+		stmt.ObjectType = "DATABASE"
+		p.nextToken()
+	case TOKEN_SCHEMA:
+		stmt.ObjectType = "SCHEMA"
+		p.nextToken()
+	default:
+		stmt.ObjectType = "TABLE"
+	}
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected object name")
+	}
+	stmt.ObjectName = p.current.Literal
+	p.nextToken()
+	if p.current.Type != TOKEN_FROM {
+		return nil, fmt.Errorf("expected FROM after object name")
+	}
+	p.nextToken()
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
+		return nil, fmt.Errorf("expected role name")
+	}
+	stmt.FromRole = p.current.Literal
+	p.nextToken()
+	return stmt, nil
+}
+
+
+func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
+	stmt := &CreatePolicyStmt{}
+	p.nextToken() // consume POLICY
+	
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected policy name")
+	}
+	stmt.PolicyName = p.current.Literal
+	p.nextToken()
+	
+	if p.current.Type != TOKEN_ON {
+		return nil, fmt.Errorf("expected ON after policy name")
+	}
+	p.nextToken()
+	
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name")
+	}
+	stmt.TableName = p.current.Literal
+	p.nextToken()
+	
+	if p.current.Type == TOKEN_FOR {
+		p.nextToken()
+		// Action: SELECT, INSERT, etc.
+		if p.current.Type == TOKEN_SELECT || p.current.Type == TOKEN_INSERT || p.current.Type == TOKEN_UPDATE || p.current.Type == TOKEN_DELETE {
+			stmt.Action = strings.ToUpper(p.current.Literal)
+			p.nextToken()
+		} else {
+			stmt.Action = "ALL"
+		}
+	} else {
+		stmt.Action = "ALL"
+	}
+	
+	if p.current.Type == TOKEN_TO {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_ALL {
+			return nil, fmt.Errorf("expected role name or ALL")
+		}
+		stmt.Role = strings.ToLower(p.current.Literal)
+		p.nextToken()
+	} else {
+		stmt.Role = "all"
+	}
+	
+	if p.current.Type == TOKEN_USING {
+		p.nextToken()
+		if p.current.Type != TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected ( after USING")
+		}
+		p.nextToken()
+		
+		// Parse expression as WhereClause
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Using = where
+		
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ) after USING expression")
+		}
+		p.nextToken()
+	}
+	
+	return stmt, nil
 }
 

@@ -25,6 +25,15 @@ type Column struct {
 // Row represents a single row of data
 type Row map[string]interface{}
 
+// Policy represents a Row-Level Security policy
+type Policy struct {
+	Name       string
+	Action     string // "SELECT", "INSERT", "UPDATE", "DELETE"
+	Role       string // "all", or specific role name
+	UsingExpr  string // SQL expression
+	Where      *WhereClause
+}
+
 // Table represents a database table with binary storage
 type Table struct {
 	Name          string
@@ -34,6 +43,8 @@ type Table struct {
 	PageMgr       *PageManager
 	Metadata      *metadata.Metadata
 	VectorIndexes map[string]*HNSWIndex // column_name -> index
+	RLSEnabled    bool                  // Row-Level Security enabled
+	Policies      []Policy              // RLS policies
 	mu            sync.RWMutex
 }
 
@@ -143,14 +154,31 @@ type WhereClause struct {
 	Or       *WhereClause
 }
 
+func (w *WhereClause) Clone() *WhereClause {
+	if w == nil {
+		return nil
+	}
+	newW := &WhereClause{
+		Column:   w.Column,
+		Operator: w.Operator,
+		Value:    w.Value,
+	}
+	if w.And != nil {
+		newW.And = w.And.Clone()
+	}
+	if w.Or != nil {
+		newW.Or = w.Or.Clone()
+	}
+	return newW
+}
+
 // evaluateWhere evaluates a WHERE clause against a row
 func evaluateWhere(row Row, where *WhereClause) bool {
 	// Base condition evaluation
 	match := false
 
-	// Skip system function calls - always evaluate to true for catalog visibility
-	// Detect any function-like call (containing parentheses)
-	if strings.Contains(where.Column, "(") {
+	// Skip system function calls or empty column containers
+	if where.Column == "" || strings.Contains(where.Column, "(") {
 		match = true
 	} else {
 		val, exists := row[where.Column]

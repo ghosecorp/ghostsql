@@ -23,8 +23,9 @@ func TestFullDatabaseLifecycle(t *testing.T) {
 
 	// Create a session for the executor
 	session := storage.NewSession("test-session")
+	session.SetUser("ghost")
 	exec := executor.NewExecutor(db, session)
-	
+
 	// Create and switch to a test database
 	dbName := "test_db"
 	db.CreateDatabase(dbName)

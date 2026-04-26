@@ -2,8 +2,8 @@
 bin/
 bin_json/
 bin_*
-ghostsql-server
-ghostsql-client
+/ghostsql-server
+/ghostsql-client
 *.exe
 
 # Data directory (runtime)
