@@ -2,7 +2,7 @@
 
 ## Communication
 
-*   **Website**: [ghosecorp.github.io](https://ghosecorp.github.io/)
+*   **Website**: [ghosecorp.github.io/ghosecorp](https://ghosecorp.github.io/ghosecorp/)
 *   **GitHub**: [github.com/ghosecorp](https://github.com/ghosecorp)
 *   **LinkedIn**: [Ghosecorp](https://www.linkedin.com/company/107066512/)
 *   **Email**: [ghosecorp@gmail.com](mailto:ghosecorp@gmail.com)
