@@ -474,15 +474,54 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#installation" class="md-nav__link">
+  <a href="#quick-start-with-docker-recommended" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Installation
+        Quick Start with Docker (Recommended)
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Installation">
+    <nav class="md-nav" aria-label="Quick Start with Docker (Recommended)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#using-docker-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Docker Run
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Docker Compose
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#local-installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Local Installation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Local Installation">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -924,15 +963,54 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#installation" class="md-nav__link">
+  <a href="#quick-start-with-docker-recommended" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Installation
+        Quick Start with Docker (Recommended)
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Installation">
+    <nav class="md-nav" aria-label="Quick Start with Docker (Recommended)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#using-docker-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Docker Run
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-docker-compose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Using Docker Compose
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#local-installation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Local Installation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Local Installation">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1017,31 +1095,40 @@
 
 <h1 id="getting-started">Getting Started</h1>
 <p>Follow these steps to get GhostSQL up and running on your machine.</p>
-<h2 id="installation">Installation</h2>
+<h2 id="quick-start-with-docker-recommended">Quick Start with Docker (Recommended)</h2>
+<p>The easiest way to run GhostSQL is using our official Docker image.</p>
+<h3 id="using-docker-run">Using Docker Run</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>-p<span class="w"> </span><span class="m">5433</span>:5433<span class="w"> </span>--name<span class="w"> </span>ghostsql<span class="w"> </span>ghosecorp/ghostsql:latest
+</code></pre></div>
+<h3 id="using-docker-compose">Using Docker Compose</h3>
+<p>If you have the GhostSQL repository cloned, you can simply run:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d
+</code></pre></div></p>
+<h2 id="local-installation">Local Installation</h2>
 <h3 id="prerequisites">Prerequisites</h3>
 <ul>
-<li>Go 1.21 or higher</li>
-<li>Make (optional, but recommended)</li>
+<li><strong>Go 1.25</strong> or higher</li>
+<li><strong>Make</strong> (optional, but recommended)</li>
 </ul>
 <h3 id="build-from-source">Build from Source</h3>
 <p>Clone the repository and build the binary:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/ghosecorp/ghostsql.git
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">cd</span><span class="w"> </span>ghostsql
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>make<span class="w"> </span>build
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/ghosecorp/ghostsql.git
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nb">cd</span><span class="w"> </span>ghostsql
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>make<span class="w"> </span>build
 </code></pre></div>
 <h2 id="running-the-server">Running the Server</h2>
 <p>Start the GhostSQL server on the default port (5433):</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>./bin/ghostsql-server
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>./bin/ghostsql-server
 </code></pre></div>
 <h2 id="connecting-with-psql">Connecting with psql</h2>
 <p>You can use the standard PostgreSQL CLI to connect to GhostSQL:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>psql<span class="w"> </span>-h<span class="w"> </span>localhost<span class="w"> </span>-p<span class="w"> </span><span class="m">5433</span><span class="w"> </span>-d<span class="w"> </span>ghostsql
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>psql<span class="w"> </span>-h<span class="w"> </span>localhost<span class="w"> </span>-p<span class="w"> </span><span class="m">5433</span><span class="w"> </span>-d<span class="w"> </span>ghostsql
 </code></pre></div>
 <h2 id="first-steps">First Steps</h2>
 <p>Once connected, try creating a table and inserting some data:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">items</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="w"> </span><span class="nb">INT</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">);</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">items</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;First Item&#39;</span><span class="p">);</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">items</span><span class="p">;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">items</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="w"> </span><span class="nb">INT</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">);</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">items</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;First Item&#39;</span><span class="p">);</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">items</span><span class="p">;</span>
 </code></pre></div>
 
 
