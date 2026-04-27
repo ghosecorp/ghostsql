@@ -2,7 +2,7 @@
 
 # GhostSQL
 
-**GhostSQL** is a high-performance, PostgreSQL-compatible SQL database by **Ghosecorp**, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
+**GhostSQL** is a high-performance, PostgreSQL-Client-compatible SQL database by **Ghosecorp**, designed for modern applications that need scalable relational data _and_ fast vector search for AI/ML workloads.
 
 ## Features
 
@@ -25,22 +25,30 @@
 
 ## Getting Started
 
-### Build & Run
+### 1. Run with Docker (Recommended)
+GhostSQL is available on [Docker Hub](https://hub.docker.com/r/ghosecorp/ghostsql). You can start a persistent instance with one command:
+
+```bash
+docker run -d \
+  --name ghostsql \
+  -p 5433:5433 \
+  -v ghostsql_data:/app/data \
+  ghosecorp/ghostsql:latest
+```
+
+Alternatively, use **Docker Compose** for a structured setup:
+
+```bash
+docker compose up -d
+```
+
+### 2. Build from Source
+If you prefer to build locally, ensure you have **Go 1.25+** installed:
 
 ```bash
 make build
-./ghostsql-server
+./bin/ghostsql-server
 ```
-
-### Docker (Recommended)
-
-Run GhostSQL in a containerized environment:
-
-```bash
-docker-compose up -d
-```
-
-This will start the server on port `5433` and persist data in a Docker volume.
 
 ## RBAC & Row-Level Security
 
