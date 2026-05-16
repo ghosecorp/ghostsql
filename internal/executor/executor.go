@@ -63,6 +63,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeInsert(s)
 	case *parser.SelectStmt:
 		return e.executeSelect(s)
+	case *parser.CompoundSelectStmt:
+		return e.executeCompoundSelect(s)
 	case *parser.UpdateStmt:
 		return e.executeUpdate(s)
 	case *parser.DeleteStmt:
@@ -426,12 +428,29 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
+	// Handle RETURNING
+	if len(stmt.Returning) > 0 {
+		// Get last inserted rows — re-read the table and take the last N rows
+		allRows, _ := table.Select([]string{"*"}, nil)
+		n := len(stmt.Values)
+		if n > len(allRows) {
+			n = len(allRows)
+		}
+		returnedRows := allRows[len(allRows)-n:]
+		return e.projectReturning(returnedRows, stmt.Returning, table), nil
+	}
+
 	return &Result{
 		Message: fmt.Sprintf("INSERT 0 %d", len(stmt.Values)),
 	}, nil
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	// If this is a CTE query, route to CTE executor
+	if len(stmt.CTEs) > 0 {
+		return e.executeSelectWithCTEs(stmt)
+	}
+
 	if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
 		return nil, err
 	}
@@ -447,7 +466,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	var where *storage.WhereClause
 	if stmt.Where != nil {
-		where = convertWhereClause(stmt.Where)
+		where = e.convertWhereClauseWithSubquery(stmt.Where)
 	}
 	if table.RLSEnabled && e.session.GetUser() != "ghost" {
 		user := e.session.GetUser()
@@ -486,6 +505,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	rows, err := table.Select(initialColumns, effectiveWhere)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply TABLESAMPLE if requested
+	if stmt.TableSamplePercent > 0 {
+		rows = applyTableSample(rows, stmt.TableSamplePercent)
 	}
 
 	// Validate columns in WHERE clause (if not a JOIN where columns might be from other tables)
@@ -581,6 +605,18 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return e.executeAggregateSelect(stmt, rows)
 	}
 
+	// Apply window functions before ORDER BY
+	hasWindowFuncs := false
+	for _, sc := range stmt.SelectColumns {
+		if sc.Window != nil {
+			hasWindowFuncs = true
+			break
+		}
+	}
+	if hasWindowFuncs {
+		rows = executeWindowFunctions(rows, stmt.SelectColumns)
+	}
+
 	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
 		rows = e.applyOrderBy(rows, stmt.OrderBy)
@@ -650,15 +686,22 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					}
 				}
 				if !ok {
-					// Try evaluate as arithmetic expression
-					val = storage.EvaluateExpression(expr, row)
-					if val != nil {
-						ok = true
+					// Try evaluate as arithmetic/function expression
+					// Use a sentinel to know it was evaluated (even if result is nil)
+					evaluated := false
+					if strings.Contains(expr, "(") || strings.ContainsAny(expr, "+-*/") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(expr)), "CASE") {
+						val = storage.EvaluateExpression(expr, row)
+						evaluated = true
+					} else {
+						val = storage.EvaluateExpression(expr, row)
+						if val != nil {
+							evaluated = true
+						}
 					}
-				}
-				if !ok {
-					// Stub: function calls and computed columns return empty string
-					val = ""
+					if !evaluated {
+						// Unknown column/expression — leave as nil (NULL)
+						val = nil
+					}
 				}
 				newRow[outName] = val
 			}
@@ -680,6 +723,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				}
 			}
 		}
+	}
+
+	// Apply DISTINCT ON (after ORDER BY is applied)
+	if len(stmt.DistinctOn) > 0 {
+		rows = applyDistinctOn(rows, stmt.DistinctOn)
+	}
+
+	// Apply DISTINCT deduplication
+	if stmt.Distinct && len(columns) > 0 {
+		rows = applyDistinct(rows, columns)
 	}
 
 	return &Result{
@@ -1141,6 +1194,20 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 	// Base condition evaluation
 	match := false
 
+	// Handle pre-resolved EXISTS/NOT EXISTS subqueries
+	if where.Operator == "EXISTS_RESOLVED" {
+		if b, ok := where.Value.(bool); ok {
+			match = b
+		}
+		if where.And != nil {
+			return match && e.evaluateWhereOnRow(row, where.And)
+		}
+		if where.Or != nil {
+			return match || e.evaluateWhereOnRow(row, where.Or)
+		}
+		return match
+	}
+
 	// Detect any function-like call (containing parentheses)
 	val, exists := row[where.Column]
 	if !exists && strings.Contains(where.Column, "(") {
@@ -1239,7 +1306,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 
 	var where *storage.WhereClause
 	if stmt.Where != nil {
-		where = convertWhereClause(stmt.Where)
+		where = e.convertWhereClauseWithSubquery(stmt.Where)
 	}
 
 	count, err := table.Update(stmt.Updates, where)
@@ -1249,6 +1316,12 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 
 	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	// Handle RETURNING
+	if len(stmt.Returning) > 0 {
+		allRows, _ := table.Select([]string{"*"}, where)
+		return e.projectReturning(allRows, stmt.Returning, table), nil
 	}
 
 	return &Result{
@@ -1269,7 +1342,13 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 	var where *storage.WhereClause
 	if stmt.Where != nil {
-		where = convertWhereClause(stmt.Where)
+		where = e.convertWhereClauseWithSubquery(stmt.Where)
+	}
+
+	// For RETURNING, capture matching rows before deletion
+	var deletedRows []storage.Row
+	if len(stmt.Returning) > 0 {
+		deletedRows, _ = table.Select([]string{"*"}, where)
 	}
 
 	count, err := table.Delete(where)
@@ -1279,6 +1358,11 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
+	}
+
+	// Handle RETURNING
+	if len(stmt.Returning) > 0 {
+		return e.projectReturning(deletedRows, stmt.Returning, table), nil
 	}
 
 	return &Result{
@@ -1711,6 +1795,32 @@ func (e *Executor) validateWhereColumns(table *storage.Table, where *storage.Whe
 		return nil
 	}
 
+	// Skip EXISTS/NOT EXISTS checks — no column LHS
+	if where.Operator == "EXISTS" || where.Operator == "NOT EXISTS" || where.Operator == "EXISTS_RESOLVED" {
+		if where.And != nil {
+			return e.validateWhereColumns(table, where.And)
+		}
+		if where.Or != nil {
+			return e.validateWhereColumns(table, where.Or)
+		}
+		return nil
+	}
+
+	// Skip empty column names
+	if where.Column == "" {
+		if where.And != nil {
+			if err := e.validateWhereColumns(table, where.And); err != nil {
+				return err
+			}
+		}
+		if where.Or != nil {
+			if err := e.validateWhereColumns(table, where.Or); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Skip function calls, arithmetic expressions, and system stubs
 	if !strings.Contains(where.Column, "(") && !strings.ContainsAny(where.Column, "+-*/%") {
 		exists := false
@@ -1973,4 +2083,407 @@ func (e *Executor) resolveWhereClauseVariables(where *storage.WhereClause) {
 	}
 }
 
+// convertWhereClauseWithSubquery converts parser WHERE to storage WHERE,
+// resolving subqueries for IN and EXISTS operators.
+func (e *Executor) convertWhereClauseWithSubquery(where *parser.WhereClause) *storage.WhereClause {
+	if where == nil {
+		return nil
+	}
 
+	sw := &storage.WhereClause{
+		Column:   where.Column,
+		Operator: where.Operator,
+		Value:    where.Value,
+	}
+
+	// Resolve IN (SELECT ...) subquery
+	if (where.Operator == "IN" || where.Operator == "NOT IN") && where.Subquery != nil {
+		subResult, err := e.executeSelect(where.Subquery)
+		if err == nil && subResult != nil {
+			values := make([]interface{}, 0, len(subResult.Rows))
+			for _, row := range subResult.Rows {
+				for _, v := range row {
+					values = append(values, v)
+					break // take first column
+				}
+			}
+			sw.Value = values
+		}
+	}
+
+	// Resolve EXISTS / NOT EXISTS subquery
+	if where.Operator == "EXISTS" || where.Operator == "NOT EXISTS" {
+		subResult, err := e.executeSelect(where.Subquery)
+		hasRows := err == nil && subResult != nil && len(subResult.Rows) > 0
+		if where.Operator == "EXISTS" {
+			sw.Value = hasRows
+			sw.Operator = "EXISTS_RESOLVED"
+		} else {
+			sw.Value = !hasRows
+			sw.Operator = "EXISTS_RESOLVED"
+		}
+	}
+
+	if where.And != nil {
+		sw.And = e.convertWhereClauseWithSubquery(where.And)
+	}
+	if where.Or != nil {
+		sw.Or = e.convertWhereClauseWithSubquery(where.Or)
+	}
+
+	return sw
+}
+
+// projectReturning projects rows through RETURNING column specs
+func (e *Executor) projectReturning(rows []storage.Row, returning []parser.SelectColumn, table *storage.Table) *Result {
+	if len(returning) == 1 && returning[0].Expression == "*" {
+		cols := table.GetColumnNames()
+		return &Result{Rows: rows, Columns: cols}
+	}
+
+	cols := make([]string, len(returning))
+	for i, sc := range returning {
+		if sc.Alias != "" {
+			cols[i] = sc.Alias
+		} else {
+			cols[i] = sc.Expression
+		}
+	}
+
+	projected := make([]storage.Row, len(rows))
+	for i, row := range rows {
+		newRow := make(storage.Row)
+		for j, sc := range returning {
+			val, ok := row[sc.Expression]
+			if !ok {
+				val = storage.EvaluateExpression(sc.Expression, row)
+			}
+			newRow[cols[j]] = val
+		}
+		projected[i] = newRow
+	}
+
+	return &Result{Rows: projected, Columns: cols}
+}
+
+// executeCompoundSelect handles UNION / UNION ALL / INTERSECT / EXCEPT
+func (e *Executor) executeCompoundSelect(stmt *parser.CompoundSelectStmt) (*Result, error) {
+	leftResult, err := e.executeSelect(stmt.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightResult, err := e.executeSelect(stmt.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	var resultRows []storage.Row
+	columns := leftResult.Columns
+
+	rowKey := func(row storage.Row, cols []string) string {
+		parts := make([]string, len(cols))
+		for i, c := range cols {
+			parts[i] = fmt.Sprintf("%v", row[c])
+		}
+		return strings.Join(parts, "\x00")
+	}
+
+	switch stmt.Op {
+	case "UNION ALL":
+		resultRows = append(leftResult.Rows, rightResult.Rows...)
+	case "UNION":
+		seen := make(map[string]bool)
+		for _, row := range append(leftResult.Rows, rightResult.Rows...) {
+			k := rowKey(row, columns)
+			if !seen[k] {
+				seen[k] = true
+				resultRows = append(resultRows, row)
+			}
+		}
+	case "INTERSECT":
+		rightKeys := make(map[string]bool)
+		for _, row := range rightResult.Rows {
+			rightKeys[rowKey(row, columns)] = true
+		}
+		seen := make(map[string]bool)
+		for _, row := range leftResult.Rows {
+			k := rowKey(row, columns)
+			if rightKeys[k] && !seen[k] {
+				seen[k] = true
+				resultRows = append(resultRows, row)
+			}
+		}
+	case "EXCEPT":
+		rightKeys := make(map[string]bool)
+		for _, row := range rightResult.Rows {
+			rightKeys[rowKey(row, columns)] = true
+		}
+		seen := make(map[string]bool)
+		for _, row := range leftResult.Rows {
+			k := rowKey(row, columns)
+			if !rightKeys[k] && !seen[k] {
+				seen[k] = true
+				resultRows = append(resultRows, row)
+			}
+		}
+	}
+
+	if len(stmt.OrderBy) > 0 {
+		resultRows = e.applyOrderBy(resultRows, stmt.OrderBy)
+	}
+	if stmt.Offset > 0 && stmt.Offset < len(resultRows) {
+		resultRows = resultRows[stmt.Offset:]
+	}
+	if stmt.Limit > 0 && stmt.Limit < len(resultRows) {
+		resultRows = resultRows[:stmt.Limit]
+	}
+
+	return &Result{Rows: resultRows, Columns: columns}, nil
+}
+
+// applyDistinct removes duplicate rows from results
+func applyDistinct(rows []storage.Row, columns []string) []storage.Row {
+	seen := make(map[string]bool)
+	result := make([]storage.Row, 0, len(rows))
+	for _, row := range rows {
+		parts := make([]string, len(columns))
+		for i, c := range columns {
+			parts[i] = fmt.Sprintf("%v", row[c])
+		}
+		key := strings.Join(parts, "\x00")
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// applyDistinctOn keeps first row per DISTINCT ON key (requires rows to be pre-sorted)
+func applyDistinctOn(rows []storage.Row, distinctOn []string) []storage.Row {
+	seen := make(map[string]bool)
+	result := make([]storage.Row, 0)
+	for _, row := range rows {
+		parts := make([]string, len(distinctOn))
+		for i, c := range distinctOn {
+			parts[i] = fmt.Sprintf("%v", row[c])
+		}
+		key := strings.Join(parts, "\x00")
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// applyTableSample samples rows randomly at the given percentage
+func applyTableSample(rows []storage.Row, percent float64) []storage.Row {
+	if percent <= 0 {
+		return []storage.Row{}
+	}
+	if percent >= 100 {
+		return rows
+	}
+	result := make([]storage.Row, 0)
+	for i, row := range rows {
+		// Use modular deterministic selection (not truly random but reproducible)
+		threshold := int(100.0 / percent)
+		if threshold < 1 {
+			threshold = 1
+		}
+		if i%threshold == 0 {
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// executeWindowFunctions computes window functions (ROW_NUMBER, RANK, DENSE_RANK)
+func executeWindowFunctions(rows []storage.Row, selectCols []parser.SelectColumn) []storage.Row {
+	for _, sc := range selectCols {
+		if sc.Window == nil {
+			continue
+		}
+
+		fnUpper := strings.ToUpper(sc.Expression)
+		outName := sc.Expression
+
+		// Group rows into partitions
+		type partition struct {
+			key  string
+			rows []int // indices into rows slice
+		}
+		partMap := make(map[string]*partition)
+		var partOrder []string
+
+		for i, row := range rows {
+			keyParts := make([]string, len(sc.Window.PartitionBy))
+			for j, col := range sc.Window.PartitionBy {
+				keyParts[j] = fmt.Sprintf("%v", row[col])
+			}
+			key := strings.Join(keyParts, "\x00")
+			if _, exists := partMap[key]; !exists {
+				partMap[key] = &partition{key: key}
+				partOrder = append(partOrder, key)
+			}
+			partMap[key].rows = append(partMap[key].rows, i)
+		}
+
+		// Sort each partition by the window ORDER BY
+		for _, key := range partOrder {
+			part := partMap[key]
+			if len(sc.Window.OrderBy) > 0 {
+				sort.SliceStable(part.rows, func(a, b int) bool {
+					ia, ib := part.rows[a], part.rows[b]
+					for _, ob := range sc.Window.OrderBy {
+						valA := rows[ia][ob.Column]
+						valB := rows[ib][ob.Column]
+						cmp := compareValues(valA, valB)
+						if cmp != 0 {
+							if ob.Descending {
+								return cmp > 0
+							}
+							return cmp < 0
+						}
+					}
+					return false
+				})
+			}
+		}
+
+		// Assign row numbers per partition
+		for _, key := range partOrder {
+			part := partMap[key]
+			rank := 0
+			denseRank := 0
+			lastOrderKey := ""
+
+			for pos, idx := range part.rows {
+				// Compute order key for RANK
+				orderParts := make([]string, len(sc.Window.OrderBy))
+				for j, ob := range sc.Window.OrderBy {
+					orderParts[j] = fmt.Sprintf("%v", rows[idx][ob.Column])
+				}
+				orderKey := strings.Join(orderParts, "\x00")
+
+				if orderKey != lastOrderKey {
+					denseRank++
+					rank = pos + 1
+					lastOrderKey = orderKey
+				}
+
+				switch {
+				case strings.HasPrefix(fnUpper, "ROW_NUMBER"):
+					rows[idx][outName] = pos + 1
+				case strings.HasPrefix(fnUpper, "DENSE_RANK"):
+					rows[idx][outName] = denseRank
+				case strings.HasPrefix(fnUpper, "RANK"):
+					rows[idx][outName] = rank
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// executeSelectWithCTE wraps executeSelect with CTE virtual table support
+func (e *Executor) executeSelectWithCTEs(stmt *parser.SelectStmt) (*Result, error) {
+	if len(stmt.CTEs) == 0 {
+		return e.executeSelectCore(stmt)
+	}
+
+	// Build virtual CTE tables in-memory
+	cteResults := make(map[string]*Result)
+	for _, cte := range stmt.CTEs {
+		result, err := e.executeSelect(cte.Query)
+		if err != nil {
+			return nil, fmt.Errorf("CTE %s failed: %w", cte.Name, err)
+		}
+		cteResults[cte.Name] = result
+	}
+
+	// If the main query references a CTE as its table name, resolve it
+	if result, ok := cteResults[stmt.TableName]; ok {
+		// Filter + project from the CTE result
+		return e.applySelectOnRows(stmt, result.Rows, result.Columns), nil
+	}
+
+	return e.executeSelectCore(stmt)
+}
+
+// applySelectOnRows applies WHERE/ORDER BY/LIMIT/OFFSET/DISTINCT on an in-memory row set
+func (e *Executor) applySelectOnRows(stmt *parser.SelectStmt, rows []storage.Row, _ []string) *Result {
+	var where *storage.WhereClause
+	if stmt.Where != nil {
+		where = e.convertWhereClauseWithSubquery(stmt.Where)
+		e.resolveWhereClauseVariables(where)
+	}
+
+	if where != nil {
+		filtered := make([]storage.Row, 0)
+		for _, row := range rows {
+			if e.evaluateWhereOnRow(row, where) {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
+
+	if len(stmt.OrderBy) > 0 {
+		rows = e.applyOrderBy(rows, stmt.OrderBy)
+	}
+
+	if stmt.Offset > 0 && stmt.Offset < len(rows) {
+		rows = rows[stmt.Offset:]
+	}
+	if stmt.Limit > 0 && stmt.Limit < len(rows) {
+		rows = rows[:stmt.Limit]
+	}
+
+	// Build columns
+	var columns []string
+	if len(stmt.SelectColumns) > 0 && !(len(stmt.SelectColumns) == 1 && stmt.SelectColumns[0].Expression == "*") {
+		columns = make([]string, len(stmt.SelectColumns))
+		for i, sc := range stmt.SelectColumns {
+			if sc.Alias != "" {
+				columns[i] = sc.Alias
+			} else {
+				columns[i] = sc.Expression
+			}
+		}
+		projected := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			newRow := make(storage.Row)
+			for j, sc := range stmt.SelectColumns {
+				val, ok := row[sc.Expression]
+				if !ok {
+					val = storage.EvaluateExpression(sc.Expression, row)
+				}
+				newRow[columns[j]] = val
+			}
+			projected[i] = newRow
+		}
+		rows = projected
+	} else {
+		// Collect all columns from first row
+		if len(rows) > 0 {
+			for k := range rows[0] {
+				columns = append(columns, k)
+			}
+			sort.Strings(columns)
+		}
+	}
+
+	if stmt.Distinct && len(columns) > 0 {
+		rows = applyDistinct(rows, columns)
+	}
+
+	return &Result{Rows: rows, Columns: columns}
+}
+
+// executeSelectCore is the original executeSelect — we need this alias to avoid infinite recursion
+// when CTE resolution calls back into the executor. The original function handles non-CTE queries.
+func (e *Executor) executeSelectCore(stmt *parser.SelectStmt) (*Result, error) {
+	return e.executeSelect(stmt)
+}

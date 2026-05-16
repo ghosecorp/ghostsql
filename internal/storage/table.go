@@ -220,11 +220,28 @@ func evaluateWhere(row Row, where *WhereClause) bool {
 				match = compare(val, where.Value) > 0
 			case ">=":
 				match = compare(val, where.Value) >= 0
+			case "IS NULL":
+				match = val == nil
+			case "IS NOT NULL":
+				match = val != nil
 			case "LIKE":
 				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
 				pattern = strings.ReplaceAll(pattern, "_", ".")
-				// Map LIKE to a case-insensitive anchored regex
 				match, _ = regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+			case "NOT LIKE":
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern = strings.ReplaceAll(pattern, "_", ".")
+				matched, _ := regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+				match = !matched
+			case "ILIKE":
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern = strings.ReplaceAll(pattern, "_", ".")
+				match, _ = regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+			case "NOT ILIKE":
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern = strings.ReplaceAll(pattern, "_", ".")
+				matched, _ := regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
+				match = !matched
 			case "~":
 				match, _ = regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
 			case "~*":
@@ -243,6 +260,24 @@ func evaluateWhere(row Row, where *WhereClause) bool {
 							break
 						}
 					}
+				}
+			case "NOT IN":
+				match = true
+				if list, ok := where.Value.([]interface{}); ok {
+					for _, item := range list {
+						if compare(val, item) == 0 {
+							match = false
+							break
+						}
+					}
+				}
+			case "BETWEEN":
+				if bounds, ok := where.Value.([]interface{}); ok && len(bounds) == 2 {
+					match = compare(val, bounds[0]) >= 0 && compare(val, bounds[1]) <= 0
+				}
+			case "NOT BETWEEN":
+				if bounds, ok := where.Value.([]interface{}); ok && len(bounds) == 2 {
+					match = compare(val, bounds[0]) < 0 || compare(val, bounds[1]) > 0
 				}
 			default:
 				match = false
