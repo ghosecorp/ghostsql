@@ -34,7 +34,9 @@ func (p *Parser) Parse() (Statement, error) {
 
 	switch p.current.Type {
 	case TOKEN_SELECT:
-		stmt, err = p.parseSelect()
+		stmt, err = p.parseSelectOrCompound()
+	case TOKEN_WITH:
+		stmt, err = p.parseWithCTE()
 	case TOKEN_INSERT:
 		stmt, err = p.parseInsert()
 	case TOKEN_CREATE:
@@ -84,6 +86,134 @@ func (p *Parser) Parse() (Statement, error) {
 	}
 
 	return stmt, nil
+}
+
+// parseSelectOrCompound parses SELECT or SELECT ... UNION/INTERSECT/EXCEPT SELECT
+func (p *Parser) parseSelectOrCompound() (Statement, error) {
+	left, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.current.Type == TOKEN_UNION || p.current.Type == TOKEN_INTERSECT || p.current.Type == TOKEN_EXCEPT {
+		op := strings.ToUpper(p.current.Literal)
+		p.nextToken()
+		// Check for ALL after UNION
+		if op == "UNION" && p.current.Type == TOKEN_ALL {
+			op = "UNION ALL"
+			p.nextToken()
+		}
+		if p.current.Type != TOKEN_SELECT {
+			return nil, fmt.Errorf("expected SELECT after %s", op)
+		}
+		right, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		compound := &CompoundSelectStmt{Left: left, Op: op, Right: right}
+		// Parse optional trailing ORDER BY, LIMIT, OFFSET
+		if p.current.Type == TOKEN_ORDER {
+			p.nextToken()
+			if p.current.Type == TOKEN_BY {
+				p.nextToken()
+			}
+			for p.current.Type == TOKEN_IDENT {
+				col := p.current.Literal
+				p.nextToken()
+				desc := false
+				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
+					desc = true
+					p.nextToken()
+				} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ASC" {
+					p.nextToken()
+				}
+				compound.OrderBy = append(compound.OrderBy, OrderByClause{Column: col, Descending: desc})
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+				} else {
+					break
+				}
+			}
+		}
+		if p.current.Type == TOKEN_LIMIT {
+			p.nextToken()
+			if p.current.Type == TOKEN_NUMBER {
+				compound.Limit, _ = strconv.Atoi(p.current.Literal)
+				p.nextToken()
+			}
+		}
+		if p.current.Type == TOKEN_OFFSET {
+			p.nextToken()
+			if p.current.Type == TOKEN_NUMBER {
+				compound.Offset, _ = strconv.Atoi(p.current.Literal)
+				p.nextToken()
+			}
+		}
+		return compound, nil
+	}
+
+	return left, nil
+}
+
+// parseWithCTE parses WITH [RECURSIVE] name AS (SELECT ...) [, ...] SELECT ...
+func (p *Parser) parseWithCTE() (Statement, error) {
+	p.nextToken() // consume WITH
+
+	recursive := false
+	if p.current.Type == TOKEN_RECURSIVE {
+		recursive = true
+		p.nextToken()
+	}
+
+	var ctes []CTEDefinition
+	for {
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected CTE name")
+		}
+		cteName := p.current.Literal
+		p.nextToken()
+
+		if p.current.Type != TOKEN_AS {
+			return nil, fmt.Errorf("expected AS after CTE name")
+		}
+		p.nextToken()
+
+		if p.current.Type != TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected ( after AS in CTE")
+		}
+		p.nextToken()
+
+		if p.current.Type != TOKEN_SELECT {
+			return nil, fmt.Errorf("expected SELECT in CTE body")
+		}
+		cteQuery, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ) after CTE body")
+		}
+		p.nextToken()
+
+		ctes = append(ctes, CTEDefinition{Name: cteName, Recursive: recursive, Query: cteQuery})
+
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+			continue
+		}
+		break
+	}
+
+	if p.current.Type != TOKEN_SELECT {
+		return nil, fmt.Errorf("expected SELECT after WITH clause")
+	}
+	main, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	main.CTEs = ctes
+	return main, nil
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
@@ -172,6 +302,16 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 		stmt.Where = where
 	}
 
+	// Parse RETURNING clause
+	if p.current.Type == TOKEN_RETURNING {
+		p.nextToken()
+		returning, err := p.parseReturningColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
+	}
+
 	return stmt, nil
 }
 
@@ -201,7 +341,49 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 		stmt.Where = where
 	}
 
+	// Parse RETURNING clause
+	if p.current.Type == TOKEN_RETURNING {
+		p.nextToken()
+		returning, err := p.parseReturningColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
+	}
+
 	return stmt, nil
+}
+
+// parseReturningColumns parses RETURNING col1, col2 or RETURNING *
+func (p *Parser) parseReturningColumns() ([]SelectColumn, error) {
+	var cols []SelectColumn
+	for p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_SEMICOLON {
+		if p.current.Type == TOKEN_ASTERISK {
+			cols = append(cols, SelectColumn{Expression: "*"})
+			p.nextToken()
+			break
+		}
+		if p.current.Type != TOKEN_IDENT {
+			break
+		}
+		name := p.current.Literal
+		p.nextToken()
+		alias := ""
+		if p.current.Type == TOKEN_AS {
+			p.nextToken()
+			if p.current.Type == TOKEN_IDENT {
+				alias = p.current.Literal
+				p.nextToken()
+			}
+		}
+		cols = append(cols, SelectColumn{Expression: name, Alias: alias})
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+		} else {
+			break
+		}
+	}
+	return cols, nil
 }
 
 func (p *Parser) parseDrop() (Statement, error) {
@@ -838,6 +1020,16 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		}
 	}
 
+	// Parse RETURNING clause
+	if p.current.Type == TOKEN_RETURNING {
+		p.nextToken()
+		returning, err := p.parseReturningColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
+	}
+
 	return stmt, nil
 }
 
@@ -845,6 +1037,32 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	stmt := &SelectStmt{}
 
 	p.nextToken() // consume SELECT
+
+	// Handle DISTINCT / DISTINCT ON
+	if p.current.Type == TOKEN_DISTINCT {
+		p.nextToken()
+		if p.current.Type == TOKEN_ON {
+			p.nextToken()
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after DISTINCT ON")
+			}
+			p.nextToken()
+			for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+				if p.current.Type == TOKEN_IDENT {
+					stmt.DistinctOn = append(stmt.DistinctOn, p.current.Literal)
+				}
+				p.nextToken()
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+				}
+			}
+			if p.current.Type == TOKEN_RPAREN {
+				p.nextToken()
+			}
+		} else {
+			stmt.Distinct = true
+		}
+	}
 
 	// Parse columns and aggregates
 	for p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF {
@@ -901,7 +1119,8 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 			// Check for function call or dot
 			if p.current.Type == TOKEN_LPAREN {
-				// Function call — skip args
+				// Function call — capture full args including nested parens
+				args := "("
 				p.nextToken() // consume (
 				depth := 1
 				for depth > 0 && p.current.Type != TOKEN_EOF {
@@ -910,7 +1129,31 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 					} else if p.current.Type == TOKEN_RPAREN {
 						depth--
 					}
+					if depth > 0 {
+						if p.current.Type == TOKEN_STRING {
+							args += "'" + p.current.Literal + "'"
+						} else if p.current.Type == TOKEN_COMMA {
+							args += ","
+						} else if p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_RPAREN {
+							args += p.current.Literal
+						} else {
+							args += p.current.Literal
+						}
+					}
 					p.nextToken()
+				}
+				args += ")"
+				exprFull := name + args
+				// The loop already consumed ) when depth became 0; no need for nextToken()
+				// Check for OVER (window function)
+				var winDef *WindowDef
+				if p.current.Type == TOKEN_OVER {
+					p.nextToken()
+					w, err := p.parseWindowDef()
+					if err != nil {
+						return nil, err
+					}
+					winDef = w
 				}
 				alias := ""
 				if p.current.Type == TOKEN_AS {
@@ -920,8 +1163,11 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 						p.nextToken()
 					}
 				}
+				if winDef != nil && alias == "" {
+					alias = exprFull
+				}
 				stmt.Columns = append(stmt.Columns, name)
-				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: name + "()", Alias: alias})
+				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: exprFull, Alias: alias, Window: winDef})
 			} else if p.current.Type == TOKEN_DOT {
 				// Handle table.column or schema.table.column
 				for p.current.Type == TOKEN_DOT {
@@ -1171,6 +1417,27 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		}
 	}
 
+	// Check for TABLESAMPLE
+	if p.current.Type == TOKEN_TABLESAMPLE {
+		p.nextToken()
+		// Expect method name (BERNOULLI, SYSTEM)
+		if p.current.Type == TOKEN_IDENT {
+			stmt.TableSampleMethod = strings.ToUpper(p.current.Literal)
+			p.nextToken()
+		}
+		if p.current.Type == TOKEN_LPAREN {
+			p.nextToken()
+			if p.current.Type == TOKEN_NUMBER {
+				pct, _ := strconv.ParseFloat(p.current.Literal, 64)
+				stmt.TableSamplePercent = pct
+				p.nextToken()
+			}
+			if p.current.Type == TOKEN_RPAREN {
+				p.nextToken()
+			}
+		}
+	}
+
 	// Parse JOINs
 	for {
 		joinType := ""
@@ -1409,139 +1676,260 @@ func (p *Parser) parseAggregate() (AggregateFunc, error) {
 func (p *Parser) parseWhere() (*WhereClause, error) {
 	where := &WhereClause{}
 
+	// Handle EXISTS / NOT EXISTS subqueries
+	if p.current.Type == TOKEN_EXISTS {
+		p.nextToken()
+		if p.current.Type != TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected ( after EXISTS")
+		}
+		p.nextToken()
+		if p.current.Type != TOKEN_SELECT {
+			return nil, fmt.Errorf("expected SELECT in EXISTS subquery")
+		}
+		subq, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ) after EXISTS subquery")
+		}
+		p.nextToken()
+		where.Operator = "EXISTS"
+		where.Subquery = subq
+		goto parseChain
+	}
+
+	if p.current.Type == TOKEN_NOT {
+		// Peek for NOT EXISTS
+		p.nextToken()
+		if p.current.Type == TOKEN_EXISTS {
+			p.nextToken()
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after NOT EXISTS")
+			}
+			p.nextToken()
+			if p.current.Type != TOKEN_SELECT {
+				return nil, fmt.Errorf("expected SELECT in NOT EXISTS subquery")
+			}
+			subq, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			if p.current.Type != TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected ) after NOT EXISTS subquery")
+			}
+			p.nextToken()
+			where.Operator = "NOT EXISTS"
+			where.Subquery = subq
+			goto parseChain
+		}
+		// If NOT followed by something else, we put it back by treating as error
+		return nil, fmt.Errorf("unexpected NOT in WHERE clause (expected EXISTS)")
+	}
+
 	// Parse LHS (may be column, table.column, function_call(), or CURRENT_USER)
 	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_CURRENT_USER && !p.isAggregateFunction(p.current.Type) {
 		return nil, fmt.Errorf("expected identifier in WHERE, got %s", p.current.Literal)
 	}
 
-	lhs := p.current.Literal
-	if p.current.Type == TOKEN_CURRENT_USER {
-		lhs = "current_user()"
-	} else if p.current.Type == TOKEN_NUMBER {
-		// Start of arithmetic expression
-	}
-	p.nextToken()
+	{
+		lhs := p.current.Literal
+		if p.current.Type == TOKEN_CURRENT_USER {
+			lhs = "current_user()"
+		}
+		p.nextToken()
 
-	// Handle dots, function calls, and arithmetic operators
-	for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
-		if p.current.Type == TOKEN_DOT {
-			p.nextToken()
-			lhs += "." + p.current.Literal
-			p.nextToken()
-		} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
-			lhs += p.current.Literal
-			p.nextToken()
-			if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
+		// Handle dots, function calls, and arithmetic operators
+		for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
+			if p.current.Type == TOKEN_DOT {
+				p.nextToken()
+				lhs += "." + p.current.Literal
+				p.nextToken()
+			} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
 				lhs += p.current.Literal
 				p.nextToken()
-			}
-		} else if p.current.Type == TOKEN_LPAREN {
-			// Preserve function arguments
-			lhs += "("
-			p.nextToken()
-			depth := 1
-			for depth > 0 && p.current.Type != TOKEN_EOF {
-				if p.current.Type == TOKEN_LPAREN {
-					depth++
-				} else if p.current.Type == TOKEN_RPAREN {
-					depth--
-				}
-				if depth > 0 {
+				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
 					lhs += p.current.Literal
 					p.nextToken()
 				}
-			}
-			lhs += ")"
-			p.nextToken() // consume )
-		}
-	}
-
-	where.Column = lhs
-
-	// Parse operator
-	switch p.current.Type {
-	case TOKEN_EQUALS:
-		where.Operator = "="
-	case TOKEN_LT:
-		where.Operator = "<"
-	case TOKEN_GT:
-		where.Operator = ">"
-	case TOKEN_LE:
-		where.Operator = "<="
-	case TOKEN_GE:
-		where.Operator = ">="
-	case TOKEN_NE:
-		where.Operator = "!="
-	case TOKEN_LIKE:
-		where.Operator = "LIKE"
-	case TOKEN_NOT_MATCH:
-		where.Operator = "!~"
-	case TOKEN_NOT_MATCH_CI:
-		where.Operator = "!~*"
-	case TOKEN_IN:
-		where.Operator = "IN"
-	case TOKEN_OPERATOR:
-		// Handle OPERATOR(schema.~)
-		p.nextToken() // consume OPERATOR
-		if p.current.Type == TOKEN_LPAREN {
-			p.nextToken()
-			// Consume until )
-			op := ""
-			for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
-				op += p.current.Literal
+			} else if p.current.Type == TOKEN_LPAREN {
+				// Preserve function arguments
+				lhs += "("
 				p.nextToken()
+				depth := 1
+				for depth > 0 && p.current.Type != TOKEN_EOF {
+					if p.current.Type == TOKEN_LPAREN {
+						depth++
+					} else if p.current.Type == TOKEN_RPAREN {
+						depth--
+					}
+					if depth > 0 {
+						lhs += p.current.Literal
+						p.nextToken()
+					}
+				}
+				lhs += ")"
+				p.nextToken() // consume )
 			}
-			p.nextToken() // consume )
-			where.Operator = op
-			if strings.Contains(op, "~") {
-				where.Operator = "~" // Map to regex match
-			}
+		}
 
-			// Parse value after OPERATOR
+		where.Column = lhs
+
+		// Parse operator
+		switch p.current.Type {
+		case TOKEN_EQUALS:
+			where.Operator = "="
+		case TOKEN_LT:
+			where.Operator = "<"
+		case TOKEN_GT:
+			where.Operator = ">"
+		case TOKEN_LE:
+			where.Operator = "<="
+		case TOKEN_GE:
+			where.Operator = ">="
+		case TOKEN_NE:
+			where.Operator = "!="
+		case TOKEN_LIKE:
+			where.Operator = "LIKE"
+		case TOKEN_ILIKE:
+			where.Operator = "ILIKE"
+		case TOKEN_NOT_MATCH:
+			where.Operator = "!~"
+		case TOKEN_NOT_MATCH_CI:
+			where.Operator = "!~*"
+		case TOKEN_IN:
+			where.Operator = "IN"
+		case TOKEN_BETWEEN:
+			where.Operator = "BETWEEN"
+		case TOKEN_IS:
+			p.nextToken()
+			if p.current.Type == TOKEN_NOT {
+				p.nextToken()
+				if p.current.Type != TOKEN_NULL {
+					return nil, fmt.Errorf("expected NULL after IS NOT")
+				}
+				where.Operator = "IS NOT NULL"
+				p.nextToken()
+				where.Value = nil
+				goto parseChain
+			}
+			if p.current.Type != TOKEN_NULL {
+				return nil, fmt.Errorf("expected NULL after IS")
+			}
+			where.Operator = "IS NULL"
+			p.nextToken()
+			where.Value = nil
+			goto parseChain
+		case TOKEN_NOT:
+			// NOT IN, NOT LIKE, NOT ILIKE, NOT BETWEEN
+			p.nextToken()
+			switch p.current.Type {
+			case TOKEN_IN:
+				where.Operator = "NOT IN"
+			case TOKEN_LIKE:
+				where.Operator = "NOT LIKE"
+			case TOKEN_ILIKE:
+				where.Operator = "NOT ILIKE"
+			case TOKEN_BETWEEN:
+				where.Operator = "NOT BETWEEN"
+			default:
+				return nil, fmt.Errorf("unexpected token after NOT: %s", p.current.Literal)
+			}
+		case TOKEN_OPERATOR:
+			// Handle OPERATOR(schema.~)
+			p.nextToken() // consume OPERATOR
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken()
+				op := ""
+				for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+					op += p.current.Literal
+					p.nextToken()
+				}
+				p.nextToken() // consume )
+				where.Operator = op
+				if strings.Contains(op, "~") {
+					where.Operator = "~"
+				}
+				val, err := p.parseLiteralValue()
+				if err != nil {
+					return nil, err
+				}
+				where.Value = val
+				goto parseChain
+			}
+		default:
+			// If no operator, maybe it's a boolean function call
+			where.Operator = "="
+			where.Value = "true"
+			goto parseChain
+		}
+		p.nextToken()
+
+		// Parse value
+		if where.Operator == "IN" || where.Operator == "NOT IN" {
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after IN/NOT IN")
+			}
+			p.nextToken()
+			// Check for subquery
+			if p.current.Type == TOKEN_SELECT {
+				subq, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				where.Subquery = subq
+				if p.current.Type != TOKEN_RPAREN {
+					return nil, fmt.Errorf("expected ) after IN subquery")
+				}
+				p.nextToken()
+			} else {
+				values := make([]interface{}, 0)
+				for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+					switch p.current.Type {
+					case TOKEN_STRING:
+						values = append(values, p.current.Literal)
+					case TOKEN_NUMBER:
+						if strings.Contains(p.current.Literal, ".") {
+							num, _ := strconv.ParseFloat(p.current.Literal, 64)
+							values = append(values, num)
+						} else {
+							num, _ := strconv.Atoi(p.current.Literal)
+							values = append(values, num)
+						}
+					case TOKEN_NULL:
+						values = append(values, nil)
+					}
+					p.nextToken()
+					if p.current.Type == TOKEN_COMMA {
+						p.nextToken()
+					}
+				}
+				where.Value = values
+				p.nextToken() // consume )
+			}
+		} else if where.Operator == "BETWEEN" || where.Operator == "NOT BETWEEN" {
+			// BETWEEN low AND high
+			low, err := p.parseLiteralValue()
+			if err != nil {
+				return nil, err
+			}
+			// expect AND
+			if p.current.Type != TOKEN_AND {
+				return nil, fmt.Errorf("expected AND in BETWEEN expression")
+			}
+			p.nextToken()
+			high, err := p.parseLiteralValue()
+			if err != nil {
+				return nil, err
+			}
+			where.Value = []interface{}{low, high}
+		} else {
 			val, err := p.parseLiteralValue()
 			if err != nil {
 				return nil, err
 			}
 			where.Value = val
-			goto parseChain
 		}
-	default:
-		// If no operator, maybe it's a boolean function call (like is_visible)
-		// We'll treat it as Column = "true" to skip filtering
-		where.Operator = "="
-		where.Value = "true"
-		goto parseChain
-	}
-	p.nextToken()
-
-	// Parse value
-	if where.Operator == "IN" {
-		if p.current.Type != TOKEN_LPAREN {
-			return nil, fmt.Errorf("expected ( after IN")
-		}
-		p.nextToken()
-		values := make([]interface{}, 0)
-		for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
-			switch p.current.Type {
-			case TOKEN_STRING:
-				values = append(values, p.current.Literal)
-			case TOKEN_NUMBER:
-				num, _ := strconv.Atoi(p.current.Literal)
-				values = append(values, num)
-			}
-			p.nextToken()
-			if p.current.Type == TOKEN_COMMA {
-				p.nextToken()
-			}
-		}
-		where.Value = values
-		p.nextToken() // consume )
-	} else {
-		val, err := p.parseLiteralValue()
-		if err != nil {
-			return nil, err
-		}
-		where.Value = val
 	}
 
 parseChain:
@@ -1563,6 +1951,64 @@ parseChain:
 	}
 
 	return where, nil
+}
+
+// parseWindowDef parses OVER (PARTITION BY ... ORDER BY ...)
+func (p *Parser) parseWindowDef() (*WindowDef, error) {
+	win := &WindowDef{}
+
+	if p.current.Type != TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected ( after OVER")
+	}
+	p.nextToken()
+
+	// Optional PARTITION BY
+	if p.current.Type == TOKEN_PARTITION {
+		p.nextToken()
+		if p.current.Type == TOKEN_BY {
+			p.nextToken()
+		}
+		for p.current.Type == TOKEN_IDENT {
+			win.PartitionBy = append(win.PartitionBy, p.current.Literal)
+			p.nextToken()
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			} else {
+				break
+			}
+		}
+	}
+
+	// Optional ORDER BY
+	if p.current.Type == TOKEN_ORDER {
+		p.nextToken()
+		if p.current.Type == TOKEN_BY {
+			p.nextToken()
+		}
+		for p.current.Type == TOKEN_IDENT {
+			col := p.current.Literal
+			p.nextToken()
+			desc := false
+			if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "DESC" {
+				desc = true
+				p.nextToken()
+			} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ASC" {
+				p.nextToken()
+			}
+			win.OrderBy = append(win.OrderBy, OrderByClause{Column: col, Descending: desc})
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			} else {
+				break
+			}
+		}
+	}
+
+	if p.current.Type == TOKEN_RPAREN {
+		p.nextToken()
+	}
+
+	return win, nil
 }
 func (p *Parser) parseLiteralValue() (interface{}, error) {
 	var val interface{}

@@ -57,6 +57,7 @@ type InsertStmt struct {
 	TableName string
 	Columns   []string
 	Values    [][]interface{}
+	Returning []SelectColumn
 }
 
 // ForeignKeyDef represents FOREIGN KEY constraint
@@ -69,8 +70,10 @@ func (s *InsertStmt) StatementNode() {}
 
 // SelectColumn represents a SELECT list entry with optional alias
 type SelectColumn struct {
-	Expression string // raw expression: "c.relname", "computed_column", etc.
-	Alias      string // AS alias, empty if none
+	Expression string     // raw expression
+	Alias      string     // AS alias, empty if none
+	Subquery   *SelectStmt // for scalar subqueries like (SELECT ...)
+	Window     *WindowDef  // for window functions like ROW_NUMBER() OVER (...)
 }
 
 // SelectStmt represents a SELECT query
@@ -79,16 +82,47 @@ type SelectStmt struct {
 	SelectColumns []SelectColumn
 	Aggregates    []AggregateFunc
 	TableName     string
-	TableAlias    string       // ADD THIS LINE
-	Joins         []JoinClause // Add this
+	TableAlias    string
+	Joins         []JoinClause
 	Where         *WhereClause
 	GroupBy       []string
 	Having        *WhereClause
 	OrderBy       []OrderByClause
-	VectorOrderBy *VectorOrderBy // Add this
+	VectorOrderBy *VectorOrderBy
 	Limit         int
 	Offset        int
+	// New fields
+	Distinct            bool
+	DistinctOn          []string
+	CTEs                []CTEDefinition
+	TableSampleMethod   string  // "BERNOULLI", "SYSTEM"
+	TableSamplePercent  float64 // 0-100
 }
+
+// CTEDefinition represents a WITH clause CTE
+type CTEDefinition struct {
+	Name      string
+	Recursive bool
+	Query     *SelectStmt
+}
+
+// WindowDef represents OVER (PARTITION BY ... ORDER BY ...) for window functions
+type WindowDef struct {
+	PartitionBy []string
+	OrderBy     []OrderByClause
+}
+
+// CompoundSelectStmt represents UNION / INTERSECT / EXCEPT
+type CompoundSelectStmt struct {
+	Left    *SelectStmt
+	Op      string // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
+	Right   *SelectStmt
+	OrderBy []OrderByClause
+	Limit   int
+	Offset  int
+}
+
+func (s *CompoundSelectStmt) StatementNode() {}
 
 // VectorOrderBy represents ORDER BY with vector distance
 type VectorOrderBy struct {
@@ -105,6 +139,7 @@ type UpdateStmt struct {
 	TableName string
 	Updates   map[string]interface{}
 	Where     *WhereClause
+	Returning []SelectColumn
 }
 
 func (s *UpdateStmt) StatementNode() {}
@@ -113,6 +148,7 @@ func (s *UpdateStmt) StatementNode() {}
 type DeleteStmt struct {
 	TableName string
 	Where     *WhereClause
+	Returning []SelectColumn
 }
 
 func (s *DeleteStmt) StatementNode() {}
@@ -154,8 +190,10 @@ type WhereClause struct {
 	Column   string
 	Operator string
 	Value    interface{}
-	And      *WhereClause // For AND conditions
-	Or       *WhereClause // For OR conditions
+	And      *WhereClause
+	Or       *WhereClause
+	// For EXISTS / NOT EXISTS subqueries
+	Subquery *SelectStmt
 }
 
 // OrderByClause represents ORDER BY
