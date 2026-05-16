@@ -163,10 +163,20 @@ func TestComprehensiveQueries(t *testing.T) {
 			"SELECT name, CASE WHEN age > 30 THEN 'Senior' ELSE 'Junior' END AS seniority FROM emps",
 			5,
 			func(t *testing.T, res *executor.Result) {
-				// For now, CASE WHEN might return 'computed_column' if not fully implemented in executor
-				// We just verify it doesn't crash and returns the rows.
 				if res.Columns[1] != "seniority" {
 					t.Errorf("CASE WHEN alias failed: expected 'seniority', got '%s'", res.Columns[1])
+				}
+				// Verify computed values:
+				// Alice (age 30) -> Junior, Bob (age 25) -> Junior, Charlie (age 35) -> Senior
+				for _, row := range res.Rows {
+					name := row["name"]
+					seniority := row["seniority"]
+					if name == "Charlie" && seniority != "Senior" {
+						t.Errorf("CASE WHEN eval failed: expected Charlie to be Senior, got %v", seniority)
+					}
+					if name == "Alice" && seniority != "Junior" {
+						t.Errorf("CASE WHEN eval failed: expected Alice to be Junior, got %v", seniority)
+					}
 				}
 			},
 		},

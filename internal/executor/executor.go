@@ -466,7 +466,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	needsAll := len(stmt.Aggregates) > 0 || where != nil
 	if !needsAll {
 		for _, sc := range stmt.SelectColumns {
-			if strings.ContainsAny(sc.Expression, "+-*/%(") {
+			if strings.ContainsAny(sc.Expression, "+-*/%(") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sc.Expression)), "CASE WHEN") {
 				needsAll = true
 				break
 			}
