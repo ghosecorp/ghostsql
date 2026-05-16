@@ -861,7 +861,8 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: "*"})
 			p.nextToken()
 		} else if p.current.Type == TOKEN_CASE {
-			// Skip CASE ... END, capture alias
+			// Capture full CASE ... END expression
+			expr := "CASE "
 			p.nextToken() // consume CASE
 			depth := 1
 			for depth > 0 && p.current.Type != TOKEN_EOF {
@@ -870,8 +871,15 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				} else if p.current.Type == TOKEN_END {
 					depth--
 				}
+				if p.current.Type == TOKEN_STRING {
+					expr += "'" + p.current.Literal + "' "
+				} else {
+					expr += p.current.Literal + " "
+				}
 				p.nextToken()
 			}
+			expr = strings.TrimSpace(expr)
+
 			alias := ""
 			if p.current.Type == TOKEN_AS {
 				p.nextToken()
@@ -884,8 +892,8 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				alias = p.current.Literal
 				p.nextToken()
 			}
-			stmt.Columns = append(stmt.Columns, "computed_column")
-			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: "computed_column", Alias: alias})
+			stmt.Columns = append(stmt.Columns, expr)
+			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
 		} else if p.current.Type == TOKEN_IDENT {
 			// Parse column name (may be table.column or function_call())
 			name := p.current.Literal

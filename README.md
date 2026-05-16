@@ -179,6 +179,15 @@ WHERE (salary + 5000) > 80000;
 -- Advanced filtering
 SELECT name FROM employees WHERE name LIKE 'Ali%' OR id IN (2, 3, 4);
 
+-- Conditional logic (CASE WHEN)
+SELECT name, 
+       CASE 
+           WHEN salary >= 100000 THEN 'Executive'
+           WHEN salary >= 80000 THEN 'Senior'
+           ELSE 'Standard' 
+       END AS tier
+FROM employees;
+
 -- Multi-column sorting
 SELECT name, salary FROM employees ORDER BY dept_id ASC, salary DESC;
 ```
