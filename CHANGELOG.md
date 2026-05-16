@@ -12,6 +12,7 @@ All notable changes to GhostSQL will be documented in this file.
   - Implemented `IN` and `LIKE` operators for flexible filtering.
   - Added support for multiple columns in `ORDER BY` (e.g., `ORDER BY dept_id ASC, salary DESC`).
   - Improved `GROUP BY` and `HAVING` logic, specifically allowing aggregate functions in `HAVING` clauses (e.g., `HAVING COUNT(*) > 1`).
+  - Added support for conditional branching logic via `CASE WHEN ... THEN ... ELSE ... END` expressions.
 - **PostgreSQL `DROP ... IF EXISTS` Syntax**:
   - Implemented `IF EXISTS` for `DROP TABLE`, `DROP DATABASE`, `DROP INDEX`, and `DROP ROLE`, making cleanup scripts more reliable.
 - **RBAC Ownership Bypass**:

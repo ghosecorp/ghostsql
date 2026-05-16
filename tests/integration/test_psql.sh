@@ -95,6 +95,15 @@ else
 fi
 
 echo ""
+echo "--- 9. evaluate CASE WHEN condition logic ---"
+RESULT=$(ghost -t -c "SELECT CASE WHEN id = 1 THEN 'First' ELSE 'Other' END FROM ghost_secrets_psql WHERE id = 1;")
+if echo "$RESULT" | grep -q "First"; then
+    pass "CASE WHEN condition correctly evaluated to First"
+else
+    fail "CASE WHEN condition failed or returned incorrect result"
+fi
+
+echo ""
 echo "============================================"
 echo " Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 echo "============================================"
