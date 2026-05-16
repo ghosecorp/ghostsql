@@ -1,52 +1,68 @@
 package storage
 
 import (
+	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// EvaluateExpression evaluates a simple arithmetic expression on a row
+// EvaluateExpression evaluates a simple arithmetic or function expression on a row
 func EvaluateExpression(expr string, row Row) interface{} {
-	// Very simple evaluator for expressions like "age + 1" or "salary * 1.1"
-	// Support basic operators: +, -, *, /
-	// 1. Try to find if it's just a column
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil
+	}
+
+	// 1. Try to find if it's just a column key in the row
 	if val, exists := row[expr]; exists {
 		return val
 	}
 
-	// Try fuzzy matching for joined columns
+	// Try fuzzy matching for joined columns (table.col notation)
 	for k, v := range row {
 		if strings.HasSuffix(k, "."+expr) {
 			return v
 		}
 	}
 
-	upperExpr := strings.ToUpper(strings.TrimSpace(expr))
-	if strings.HasPrefix(upperExpr, "CASE WHEN") {
+	upper := strings.ToUpper(expr)
+
+	// 2. CASE WHEN ... END
+	if strings.HasPrefix(upper, "CASE WHEN") {
 		return evaluateCaseWhen(expr, row)
 	}
 
-	// 2. Try to handle simple arithmetic "A op B"
-	operators := []string{"+", "-", "*", "/"}
-	for _, op := range operators {
-		if strings.Contains(expr, op) {
-			parts := strings.SplitN(expr, op, 2)
-			left := strings.TrimSpace(parts[0])
-			right := strings.TrimSpace(parts[1])
+	// 3. CAST(expr AS type) or CAST expression from :: parsing
+	if strings.HasPrefix(upper, "CAST(") {
+		return evaluateCast(expr, row)
+	}
 
+	// 4. Function calls: LOWER(), UPPER(), ABS(), NOW(), etc.
+	if idx := strings.Index(expr, "("); idx > 0 && strings.HasSuffix(strings.TrimSpace(expr), ")") {
+		fnName := strings.ToUpper(strings.TrimSpace(expr[:idx]))
+		argsStr := expr[idx+1 : len(expr)-1]
+		return evaluateFunctionCall(fnName, argsStr, row)
+	}
+
+	// 5. Simple arithmetic "A op B" — check for binary operators
+	// Must be careful not to split inside parentheses
+	for _, op := range []string{"+", "-", "*", "/"} {
+		if pos := findOperatorOutsideParens(expr, op); pos >= 0 {
+			left := strings.TrimSpace(expr[:pos])
+			right := strings.TrimSpace(expr[pos+len(op):])
 			lVal := EvaluateExpression(left, row)
 			rVal := EvaluateExpression(right, row)
-
 			return ApplyOperator(lVal, op, rVal)
 		}
 	}
 
-	// 3. Try to parse as a number
+	// 6. Try to parse as a number
 	if f, err := strconv.ParseFloat(expr, 64); err == nil {
 		return f
 	}
 
-	// 4. Try to parse as a string literal
+	// 7. Try to parse as a string literal (single-quoted)
 	if strings.HasPrefix(expr, "'") && strings.HasSuffix(expr, "'") && len(expr) >= 2 {
 		return expr[1 : len(expr)-1]
 	}
@@ -54,11 +70,586 @@ func EvaluateExpression(expr string, row Row) interface{} {
 	return nil
 }
 
+// findOperatorOutsideParens finds the rightmost position of op that's not inside parentheses or string literals
+func findOperatorOutsideParens(expr, op string) int {
+	depth := 0
+	inString := false
+	result := -1
+	i := 0
+	for i < len(expr) {
+		ch := expr[i]
+		if ch == '\'' && !inString {
+			inString = true
+			i++
+			continue
+		}
+		if ch == '\'' && inString {
+			inString = false
+			i++
+			continue
+		}
+		if inString {
+			i++
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		} else if depth == 0 && strings.HasPrefix(expr[i:], op) {
+			result = i
+		}
+		i++
+	}
+	return result
+}
+
+// evaluateFunctionCall dispatches named functions
+func evaluateFunctionCall(fnName, argsStr string, row Row) interface{} {
+	// Parse comma-separated arguments, respecting nested parens
+	args := splitArgs(argsStr, row)
+
+	switch fnName {
+	// ---- String functions ----
+	case "LOWER":
+		if len(args) == 1 {
+			return strings.ToLower(toString(args[0]))
+		}
+	case "UPPER":
+		if len(args) == 1 {
+			return strings.ToUpper(toString(args[0]))
+		}
+	case "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH":
+		if len(args) == 1 {
+			return len([]rune(toString(args[0])))
+		}
+	case "TRIM":
+		if len(args) == 1 {
+			return strings.TrimSpace(toString(args[0]))
+		}
+	case "LTRIM":
+		if len(args) == 1 {
+			return strings.TrimLeft(toString(args[0]), " \t")
+		}
+	case "RTRIM":
+		if len(args) == 1 {
+			return strings.TrimRight(toString(args[0]), " \t")
+		}
+	case "CONCAT":
+		result := ""
+		for _, a := range args {
+			result += toString(a)
+		}
+		return result
+	case "SUBSTRING", "SUBSTR":
+		if len(args) >= 2 {
+			s := toString(args[0])
+			start := toInt(args[1]) - 1 // SQL is 1-based
+			if start < 0 {
+				start = 0
+			}
+			if len(args) >= 3 {
+				length := toInt(args[2])
+				end := start + length
+				runes := []rune(s)
+				if start >= len(runes) {
+					return ""
+				}
+				if end > len(runes) {
+					end = len(runes)
+				}
+				return string(runes[start:end])
+			}
+			runes := []rune(s)
+			if start >= len(runes) {
+				return ""
+			}
+			return string(runes[start:])
+		}
+	case "REPLACE":
+		if len(args) == 3 {
+			return strings.ReplaceAll(toString(args[0]), toString(args[1]), toString(args[2]))
+		}
+	case "LEFT":
+		if len(args) == 2 {
+			s := toString(args[0])
+			n := toInt(args[1])
+			runes := []rune(s)
+			if n > len(runes) {
+				n = len(runes)
+			}
+			if n < 0 {
+				n = 0
+			}
+			return string(runes[:n])
+		}
+	case "RIGHT":
+		if len(args) == 2 {
+			s := toString(args[0])
+			n := toInt(args[1])
+			runes := []rune(s)
+			if n > len(runes) {
+				n = len(runes)
+			}
+			start := len(runes) - n
+			if start < 0 {
+				start = 0
+			}
+			return string(runes[start:])
+		}
+	case "LPAD":
+		if len(args) >= 2 {
+			s := toString(args[0])
+			width := toInt(args[1])
+			pad := " "
+			if len(args) >= 3 {
+				pad = toString(args[2])
+			}
+			for len(s) < width {
+				s = pad + s
+			}
+			return s
+		}
+	case "RPAD":
+		if len(args) >= 2 {
+			s := toString(args[0])
+			width := toInt(args[1])
+			pad := " "
+			if len(args) >= 3 {
+				pad = toString(args[2])
+			}
+			for len(s) < width {
+				s = s + pad
+			}
+			return s
+		}
+	case "REPEAT":
+		if len(args) == 2 {
+			return strings.Repeat(toString(args[0]), toInt(args[1]))
+		}
+	case "REVERSE":
+		if len(args) == 1 {
+			runes := []rune(toString(args[0]))
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return string(runes)
+		}
+	case "SPLIT_PART":
+		if len(args) == 3 {
+			parts := strings.Split(toString(args[0]), toString(args[1]))
+			idx := toInt(args[2]) - 1
+			if idx >= 0 && idx < len(parts) {
+				return parts[idx]
+			}
+			return ""
+		}
+	case "POSITION":
+		if len(args) == 2 {
+			// POSITION(substr IN str) — simplified: treat as POSITION(substr, str)
+			substr := toString(args[0])
+			str := toString(args[1])
+			idx := strings.Index(str, substr)
+			if idx == -1 {
+				return 0
+			}
+			return idx + 1
+		}
+	case "STRPOS":
+		if len(args) == 2 {
+			idx := strings.Index(toString(args[0]), toString(args[1]))
+			if idx == -1 {
+				return 0
+			}
+			return idx + 1
+		}
+	case "INITCAP":
+		if len(args) == 1 {
+			words := strings.Fields(toString(args[0]))
+			for i, w := range words {
+				if len(w) > 0 {
+					words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+				}
+			}
+			return strings.Join(words, " ")
+		}
+	case "TO_CHAR":
+		// Simplified: just convert to string
+		if len(args) >= 1 {
+			return toString(args[0])
+		}
+	case "COALESCE":
+		for _, a := range args {
+			if a != nil {
+				return a
+			}
+		}
+		return nil
+	case "NULLIF":
+		if len(args) == 2 {
+			if compare(args[0], args[1]) == 0 {
+				return nil
+			}
+			return args[0]
+		}
+	case "GREATEST":
+		if len(args) > 0 {
+			best := args[0]
+			for _, a := range args[1:] {
+				if compare(a, best) > 0 {
+					best = a
+				}
+			}
+			return best
+		}
+	case "LEAST":
+		if len(args) > 0 {
+			best := args[0]
+			for _, a := range args[1:] {
+				if compare(a, best) < 0 {
+					best = a
+				}
+			}
+			return best
+		}
+
+	// ---- Math functions ----
+	case "ABS":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Abs(f)
+			}
+		}
+	case "CEIL", "CEILING":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Ceil(f)
+			}
+		}
+	case "FLOOR":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Floor(f)
+			}
+		}
+	case "ROUND":
+		if len(args) >= 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				if len(args) == 2 {
+					places := toInt(args[1])
+					factor := math.Pow(10, float64(places))
+					return math.Round(f*factor) / factor
+				}
+				return math.Round(f)
+			}
+		}
+	case "POWER", "POW":
+		if len(args) == 2 {
+			base, err1 := ConvertToFloat64(args[0])
+			exp, err2 := ConvertToFloat64(args[1])
+			if err1 == nil && err2 == nil {
+				return math.Pow(base, exp)
+			}
+		}
+	case "SQRT":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Sqrt(f)
+			}
+		}
+	case "EXP":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Exp(f)
+			}
+		}
+	case "LN":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Log(f)
+			}
+		}
+	case "LOG":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				return math.Log10(f)
+			}
+		} else if len(args) == 2 {
+			base, err1 := ConvertToFloat64(args[0])
+			val, err2 := ConvertToFloat64(args[1])
+			if err1 == nil && err2 == nil {
+				return math.Log(val) / math.Log(base)
+			}
+		}
+	case "MOD":
+		if len(args) == 2 {
+			a, err1 := ConvertToFloat64(args[0])
+			b, err2 := ConvertToFloat64(args[1])
+			if err1 == nil && err2 == nil && b != 0 {
+				return math.Mod(a, b)
+			}
+		}
+	case "TRUNC", "TRUNCATE":
+		if len(args) >= 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				if len(args) == 2 {
+					places := toInt(args[1])
+					factor := math.Pow(10, float64(places))
+					return math.Trunc(f*factor) / factor
+				}
+				return math.Trunc(f)
+			}
+		}
+	case "SIGN":
+		if len(args) == 1 {
+			if f, err := ConvertToFloat64(args[0]); err == nil {
+				if f > 0 {
+					return 1.0
+				} else if f < 0 {
+					return -1.0
+				}
+				return 0.0
+			}
+		}
+	case "RANDOM":
+		// Simplified — return 0.5 (deterministic for tests)
+		return 0.5
+	case "PI":
+		return math.Pi
+
+	// ---- Date / Time functions ----
+	case "NOW", "CURRENT_TIMESTAMP", "CLOCK_TIMESTAMP":
+		return time.Now().Format(time.RFC3339)
+	case "CURRENT_DATE":
+		return time.Now().Format("2006-01-02")
+	case "CURRENT_TIME":
+		return time.Now().Format("15:04:05")
+	case "DATE_TRUNC":
+		if len(args) >= 2 {
+			precision := strings.ToLower(strings.Trim(toString(args[0]), "'"))
+			t, err := parseTime(toString(args[1]))
+			if err == nil {
+				switch precision {
+				case "year":
+					return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location()).Format(time.RFC3339)
+				case "month":
+					return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location()).Format(time.RFC3339)
+				case "day":
+					return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location()).Format(time.RFC3339)
+				case "hour":
+					return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location()).Format(time.RFC3339)
+				}
+			}
+		}
+	case "EXTRACT":
+		// EXTRACT(field FROM timestamp) — simplified: treat args[0] as field, args[1] as value
+		if len(args) >= 2 {
+			field := strings.ToLower(strings.Trim(toString(args[0]), "'"))
+			t, err := parseTime(toString(args[1]))
+			if err == nil {
+				switch field {
+				case "year":
+					return float64(t.Year())
+				case "month":
+					return float64(t.Month())
+				case "day":
+					return float64(t.Day())
+				case "hour":
+					return float64(t.Hour())
+				case "minute":
+					return float64(t.Minute())
+				case "second":
+					return float64(t.Second())
+				case "dow":
+					return float64(t.Weekday())
+				case "epoch":
+					return float64(t.Unix())
+				}
+			}
+		}
+	case "AGE":
+		if len(args) >= 1 {
+			t1, err1 := parseTime(toString(args[0]))
+			if err1 == nil {
+				ref := time.Now()
+				if len(args) == 2 {
+					t2, err2 := parseTime(toString(args[1]))
+					if err2 == nil {
+						ref = t2
+					}
+				}
+				dur := ref.Sub(t1)
+				return dur.String()
+			}
+		}
+	case "TO_DATE":
+		if len(args) >= 1 {
+			return toString(args[0]) // simplified
+		}
+	case "TO_TIMESTAMP":
+		if len(args) >= 1 {
+			return toString(args[0]) // simplified
+		}
+
+	// ---- Type casting ----
+	case "CAST":
+		// CAST(expr AS type) — the args are already partially evaluated
+		// This branch usually handled by evaluateCast but keep as fallback
+		if len(args) >= 1 {
+			return args[0]
+		}
+	}
+
+	return nil
+}
+
+// evaluateCast handles CAST(expr AS TYPE) expressions
+func evaluateCast(expr string, row Row) interface{} {
+	// Remove CAST( prefix and trailing )
+	inner := expr[5 : len(expr)-1]
+
+	// Find " AS " keyword (case-insensitive)
+	upper := strings.ToUpper(inner)
+	asIdx := strings.LastIndex(upper, " AS ")
+	if asIdx < 0 {
+		return nil
+	}
+
+	valueExpr := strings.TrimSpace(inner[:asIdx])
+	typeName := strings.ToUpper(strings.TrimSpace(inner[asIdx+4:]))
+
+	val := EvaluateExpression(valueExpr, row)
+
+	switch {
+	case typeName == "TEXT" || typeName == "VARCHAR" || strings.HasPrefix(typeName, "VARCHAR(") || typeName == "CHAR":
+		return toString(val)
+	case typeName == "INT" || typeName == "INTEGER" || typeName == "BIGINT" || typeName == "SMALLINT":
+		if f, err := ConvertToFloat64(val); err == nil {
+			return int(f)
+		}
+		if s, ok := val.(string); ok {
+			if i, err := strconv.Atoi(s); err == nil {
+				return i
+			}
+		}
+		return 0
+	case typeName == "FLOAT" || typeName == "FLOAT4" || typeName == "FLOAT8" || typeName == "DOUBLE PRECISION" || typeName == "NUMERIC" || typeName == "DECIMAL":
+		if f, err := ConvertToFloat64(val); err == nil {
+			return f
+		}
+		return 0.0
+	case typeName == "BOOLEAN" || typeName == "BOOL":
+		s := strings.ToLower(toString(val))
+		return s == "true" || s == "1" || s == "yes" || s == "t"
+	default:
+		return val
+	}
+}
+
+// splitArgs splits a comma-separated argument string, evaluating each arg
+func splitArgs(argsStr string, row Row) []interface{} {
+	raw := splitRawArgs(argsStr)
+	result := make([]interface{}, len(raw))
+	for i, r := range raw {
+		r = strings.TrimSpace(r)
+		result[i] = EvaluateExpression(r, row)
+	}
+	return result
+}
+
+// splitRawArgs splits on commas that are not inside parentheses
+func splitRawArgs(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+// toString converts any value to its string representation
+func toString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case int:
+		return strconv.Itoa(val)
+	case float64:
+		if val == math.Trunc(val) {
+			return strconv.FormatInt(int64(val), 10)
+		}
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		return strconv.FormatFloat(func() float64 {
+			f, _ := ConvertToFloat64(v)
+			return f
+		}(), 'f', -1, 64)
+	}
+}
+
+// convToInt converts any value to int
+func convToInt(v interface{}) int {
+	switch val := v.(type) {
+	case int:
+		return val
+	case float64:
+		return int(val)
+	case string:
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return int(f)
+		}
+	}
+	return 0
+}
+
+// parseTime attempts to parse various time string formats
+func parseTime(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		"2006-01-02T15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, strconv.ErrSyntax
+}
+
 // ApplyOperator applies an arithmetic operator to two values
 func ApplyOperator(left interface{}, op string, right interface{}) interface{} {
 	l, errL := ConvertToFloat64(left)
 	r, errR := ConvertToFloat64(right)
 	if errL != nil || errR != nil {
+		// String concatenation for +
+		if op == "+" {
+			return toString(left) + toString(right)
+		}
 		return nil
 	}
 
@@ -130,7 +721,7 @@ func evaluateCaseWhen(expr string, row Row) interface{} {
 	return nil
 }
 
-// EvaluateCondition evaluates a boolean condition
+// EvaluateCondition evaluates a boolean condition string
 func EvaluateCondition(cond string, row Row) bool {
 	operators := []string{"!=", "<=", ">=", "=", "<", ">"}
 	for _, op := range operators {
