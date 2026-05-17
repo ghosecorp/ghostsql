@@ -98,7 +98,17 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	case *parser.CreatePolicyStmt:
 		return e.executeCreatePolicy(s)
 	case *parser.SetStmt:
-		return &Result{Message: "SET"}, nil
+		return e.executeSet(s)
+	case *parser.ShowVarStmt:
+		return e.executeShowVar(s)
+	case *parser.ResetStmt:
+		return e.executeReset(s)
+	case *parser.SetRoleStmt:
+		return e.executeSetRole(s)
+	case *parser.SetSessionAuthorizationStmt:
+		return e.executeSetSessionAuthorization(s)
+	case *parser.LockTableStmt:
+		return e.executeLockTable(s)
 	case *parser.TransactionStmt:
 		return e.executeTransaction(s)
 	case *parser.SavepointStmt:
@@ -348,6 +358,10 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	}
 	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
+		return nil, err
+	}
+
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
 		return nil, err
 	}
 
@@ -643,6 +657,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			dbInstance, err = e.getActiveDatabase()
 			if err != nil {
 				return nil, err
+			}
+
+			if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+				return nil, err
+			}
+			if stmt.ForUpdate {
+				if e.session == nil {
+					return nil, fmt.Errorf("no active session")
+				}
+				dbInstance.SetLock(stmt.TableName, e.session.ID)
 			}
 
 			// Check if it's a virtual view
@@ -1777,6 +1801,10 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
 	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
@@ -1873,6 +1901,10 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
 	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
@@ -1964,6 +1996,10 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 		return nil, err
 	}
 
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
 	if _, exists := e.getTable(dbInstance, stmt.TableName); !exists {
 		if stmt.IfExists {
 			return &Result{Message: fmt.Sprintf("NOTICE: table %s does not exist, skipping", stmt.TableName)}, nil
@@ -2004,6 +2040,10 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
 	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
@@ -2025,6 +2065,10 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, error) {
 	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
+		return nil, err
+	}
+
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
 		return nil, err
 	}
 
@@ -3429,6 +3473,15 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		return nil, err
 	}
 
+	if err := e.checkTableLock(dbInstance, stmt.TargetTable); err != nil {
+		return nil, err
+	}
+	if stmt.SourceTable != "" {
+		if err := e.checkTableLock(dbInstance, stmt.SourceTable); err != nil {
+			return nil, err
+		}
+	}
+
 	targetTable, exists := e.getTableForModification(dbInstance, stmt.TargetTable)
 	if !exists {
 		return nil, fmt.Errorf("target table %s does not exist", stmt.TargetTable)
@@ -3538,7 +3591,17 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 	}, nil
 }
 
-// --- Transaction and Table Helper Methods ---
+func (e *Executor) checkTableLock(dbInstance *storage.DatabaseInstance, name string) error {
+	if e.session == nil {
+		return nil
+	}
+	if lockOwner, locked := dbInstance.GetLock(name); locked {
+		if lockOwner != e.session.ID {
+			return fmt.Errorf("table %s is locked by session %s", name, lockOwner)
+		}
+	}
+	return nil
+}
 
 func (e *Executor) getTable(dbInstance *storage.DatabaseInstance, name string) (*storage.Table, bool) {
 	if e.session != nil && e.session.TxActive {
@@ -3628,14 +3691,23 @@ func (e *Executor) executeTransaction(stmt *parser.TransactionStmt) (*Result, er
 			}
 		}
 		e.session.TxActive = false
+		dbInstance.ReleaseAllSessionLocks(e.session.ID)
 		e.session.TxTables = make(map[string]*storage.Table)
 		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		e.session.TxLocalVariables = make(map[string]string)
 		return &Result{Message: "COMMIT"}, nil
 
 	case "ROLLBACK":
 		e.session.TxActive = false
+		for name, originalVal := range e.session.TxLocalVariables {
+			e.session.Variables[name] = originalVal
+		}
+		if dbInstance, err := e.getActiveDatabase(); err == nil {
+			dbInstance.ReleaseAllSessionLocks(e.session.ID)
+		}
 		e.session.TxTables = make(map[string]*storage.Table)
 		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		e.session.TxLocalVariables = make(map[string]string)
 		return &Result{Message: "ROLLBACK"}, nil
 
 	default:
@@ -3684,4 +3756,81 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 	default:
 		return nil, fmt.Errorf("unknown savepoint command: %s", stmt.Command)
 	}
+}
+
+func (e *Executor) executeSet(stmt *parser.SetStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	if stmt.IsLocal {
+		e.session.SetLocalVariable(name, stmt.Value)
+	} else {
+		e.session.SetVariable(name, stmt.Value)
+	}
+	return &Result{Message: "SET"}, nil
+}
+
+func (e *Executor) executeShowVar(stmt *parser.ShowVarStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	val := e.session.GetVariable(name)
+	if val == "" {
+		val = storage.DefaultSessionVariables[name]
+	}
+
+	rows := []storage.Row{
+		{name: val},
+	}
+	return &Result{
+		Rows:    rows,
+		Columns: []string{name},
+	}, nil
+}
+
+func (e *Executor) executeReset(stmt *parser.ResetStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	e.session.ResetVariable(name)
+	return &Result{Message: "RESET"}, nil
+}
+
+func (e *Executor) executeSetRole(stmt *parser.SetRoleStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	e.session.SetUser(stmt.Role)
+	return &Result{Message: "SET ROLE"}, nil
+}
+
+func (e *Executor) executeSetSessionAuthorization(stmt *parser.SetSessionAuthorizationStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	e.session.SetSessionUser(stmt.User)
+	e.session.SetUser(stmt.User)
+	return &Result{Message: "SET SESSION AUTHORIZATION"}, nil
+}
+
+func (e *Executor) executeLockTable(stmt *parser.LockTableStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	// Check if already locked by another session
+	if owner, locked := dbInstance.GetLock(stmt.TableName); locked && owner != e.session.ID {
+		return nil, fmt.Errorf("table %s is locked by session %s", stmt.TableName, owner)
+	}
+
+	// Lock it for our session
+	dbInstance.SetLock(stmt.TableName, e.session.ID)
+	return &Result{Message: "LOCK TABLE"}, nil
 }

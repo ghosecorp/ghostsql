@@ -2,6 +2,7 @@ package tests
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ghosecorp/ghostsql/internal/executor"
@@ -232,5 +233,139 @@ func TestTCLTransactions(t *testing.T) {
 	res2 = runQuery(exec2, "SELECT balance FROM accounts WHERE id = 1")
 	if len(res2.Rows) != 1 || (res2.Rows[0]["balance"] != 400 && res2.Rows[0]["balance"] != 400.0) {
 		t.Errorf("Expected committed balance 400, got: %v", res2.Rows)
+	}
+}
+
+func TestSessionControlGaps(t *testing.T) {
+	dataDir := "test_data_session"
+	_ = os.RemoveAll(dataDir)
+	defer os.RemoveAll(dataDir)
+
+	db, err := storage.Initialize(dataDir)
+	if err != nil {
+		t.Fatalf("Failed to initialize storage: %v", err)
+	}
+
+	sess1 := db.SessionMgr.CreateSession("session_1")
+	sess1.SetUser("ghost")
+	sess1.SetDatabase("ghostsql")
+	exec1 := executor.NewExecutor(db, sess1)
+
+	sess2 := db.SessionMgr.CreateSession("session_2")
+	sess2.SetUser("ghost")
+	sess2.SetDatabase("ghostsql")
+	exec2 := executor.NewExecutor(db, sess2)
+
+	// Helper to execute query and expect success
+	runQuery := func(exec *executor.Executor, q string) *executor.Result {
+		p := parser.NewParser(q)
+		stmt, err := p.Parse()
+		if err != nil {
+			t.Fatalf("Failed to parse query '%s': %v", q, err)
+		}
+		res, err := exec.Execute(stmt)
+		if err != nil {
+			t.Fatalf("Failed to execute query '%s': %v", q, err)
+		}
+		return res
+	}
+
+	parseQuery := func(q string) parser.Statement {
+		p := parser.NewParser(q)
+		stmt, err := p.Parse()
+		if err != nil {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+		return stmt
+	}
+
+	// Create a test table first
+	runQuery(exec1, "CREATE TABLE items (id INT, name TEXT)")
+
+	// 1. Test SET and SHOW
+	runQuery(exec1, "SET search_path TO myschema, public")
+	res := runQuery(exec1, "SHOW search_path")
+	if len(res.Rows) != 1 || res.Rows[0]["search_path"] != "myschema, public" {
+		t.Errorf("Expected SHOW search_path to return 'myschema, public', got: %v", res.Rows)
+	}
+
+	runQuery(exec1, "SET work_mem = '64MB'")
+	res = runQuery(exec1, "SHOW work_mem")
+	if len(res.Rows) != 1 || res.Rows[0]["work_mem"] != "64MB" {
+		t.Errorf("Expected SHOW work_mem to return '64MB', got: %v", res.Rows)
+	}
+
+	// 2. Test RESET
+	runQuery(exec1, "RESET search_path")
+	res = runQuery(exec1, "SHOW search_path")
+	if len(res.Rows) != 1 || res.Rows[0]["search_path"] != "public" {
+		t.Errorf("Expected SHOW search_path to return default 'public' after RESET, got: %v", res.Rows)
+	}
+
+	// 3. Test SET LOCAL (Transaction scoped variable)
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "SET LOCAL work_mem = '128MB'")
+	res = runQuery(exec1, "SHOW work_mem")
+	if len(res.Rows) != 1 || res.Rows[0]["work_mem"] != "128MB" {
+		t.Errorf("Expected SHOW work_mem to return transaction-scoped '128MB', got: %v", res.Rows)
+	}
+
+	runQuery(exec1, "ROLLBACK")
+	res = runQuery(exec1, "SHOW work_mem")
+	if len(res.Rows) != 1 || res.Rows[0]["work_mem"] != "64MB" {
+		t.Errorf("Expected SHOW work_mem to restore back to '64MB' after ROLLBACK, got: %v", res.Rows)
+	}
+
+	// 4. Test SET ROLE
+	runQuery(exec1, "SET ROLE analyst")
+	if sess1.GetUser() != "analyst" {
+		t.Errorf("Expected active user to be 'analyst', got: %s", sess1.GetUser())
+	}
+
+	// 5. Test SET SESSION AUTHORIZATION
+	runQuery(exec1, "SET SESSION AUTHORIZATION alice")
+	if sess1.GetUser() != "alice" || sess1.SessionUser != "alice" {
+		t.Errorf("Expected active user & session user to be 'alice', got: user=%s, session_user=%s", sess1.GetUser(), sess1.SessionUser)
+	}
+
+	// Restore session authorization back to ghost to allow table operations
+	runQuery(exec1, "SET SESSION AUTHORIZATION ghost")
+
+	// 6. Test LOCK TABLE Conflict
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "LOCK TABLE items IN EXCLUSIVE MODE")
+
+	// Session 2 tries to read the table - should fail with lock error
+	_, err = exec2.Execute(parseQuery("SELECT * FROM items"))
+	if err == nil || !strings.Contains(err.Error(), "locked by session session_1") {
+		t.Errorf("Expected lock conflict error for Session 2, got: %v", err)
+	}
+
+	// Session 1 commits the transaction, releasing the lock
+	runQuery(exec1, "COMMIT")
+
+	// Session 2 should now be able to query the table successfully
+	_, err = exec2.Execute(parseQuery("SELECT * FROM items"))
+	if err != nil {
+		t.Errorf("Expected Session 2 query to succeed after lock release, got error: %v", err)
+	}
+
+	// 7. Test FOR UPDATE lock conflict
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "SELECT * FROM items FOR UPDATE")
+
+	// Session 2 tries to modify the table - should fail
+	_, err = exec2.Execute(parseQuery("INSERT INTO items VALUES (1, 'box')"))
+	if err == nil || !strings.Contains(err.Error(), "locked by session session_1") {
+		t.Errorf("Expected lock conflict error on insert for Session 2, got: %v", err)
+	}
+
+	// Session 1 rolls back
+	runQuery(exec1, "ROLLBACK")
+
+	// Session 2 can now modify
+	_, err = exec2.Execute(parseQuery("INSERT INTO items VALUES (1, 'box')"))
+	if err != nil {
+		t.Errorf("Expected Session 2 insert to succeed after lock rollback, got error: %v", err)
 	}
 }

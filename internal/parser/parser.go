@@ -2148,6 +2148,17 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		p.nextToken()
 	}
 
+	// Parse FOR UPDATE
+	if p.current.Type == TOKEN_FOR || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FOR") {
+		p.nextToken()
+		if p.current.Type == TOKEN_UPDATE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "UPDATE") {
+			stmt.ForUpdate = true
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected UPDATE after FOR")
+		}
+	}
+
 	return stmt, nil
 }
 
@@ -3269,6 +3280,12 @@ func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
 func (p *Parser) parseSet() (Statement, error) {
 	p.nextToken() // consume SET
 
+	isLocal := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "LOCAL" {
+		isLocal = true
+		p.nextToken()
+	}
+
 	// Check SET ROLE
 	if p.current.Type == TOKEN_ROLE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ROLE") {
 		p.nextToken()
@@ -3323,7 +3340,7 @@ func (p *Parser) parseSet() (Statement, error) {
 		}
 	}
 
-	return &SetStmt{Name: name, Value: value}, nil
+	return &SetStmt{Name: name, Value: value, IsLocal: isLocal}, nil
 }
 
 func (p *Parser) parseCreateView(orReplace bool) (*CreateViewStmt, error) {

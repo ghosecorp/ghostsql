@@ -19,22 +19,35 @@ type Session struct {
 	CurrentDatabase string
 	User            string
 	SessionUser     string // Initially authenticated user
-	Variables       map[string]string
-	TxActive        bool
-	TxTables        map[string]*Table            // Table copies modified during transaction
-	TxSavepoints    map[string]map[string]*Table // Table copies cloned at savepoints
-	Cursors         map[string]*Cursor
-	mu              sync.RWMutex
+	Variables        map[string]string
+	TxLocalVariables map[string]string            // Original variable values saved before SET LOCAL
+	TxActive         bool
+	TxTables         map[string]*Table            // Table copies modified during transaction
+	TxSavepoints     map[string]map[string]*Table // Table copies cloned at savepoints
+	Cursors          map[string]*Cursor
+	mu               sync.RWMutex
+}
+
+var DefaultSessionVariables = map[string]string{
+	"search_path": "public",
+	"work_mem":    "4MB",
+	"timezone":    "UTC",
 }
 
 // NewSession creates a new client session
 func NewSession(id string) *Session {
+	vars := make(map[string]string)
+	for k, v := range DefaultSessionVariables {
+		vars[k] = v
+	}
+
 	return &Session{
-		ID:           id,
-		Variables:    make(map[string]string),
-		TxTables:     make(map[string]*Table),
-		TxSavepoints: make(map[string]map[string]*Table),
-		Cursors:      make(map[string]*Cursor),
+		ID:               id,
+		Variables:        vars,
+		TxLocalVariables: make(map[string]string),
+		TxTables:         make(map[string]*Table),
+		TxSavepoints:     make(map[string]map[string]*Table),
+		Cursors:          make(map[string]*Cursor),
 	}
 }
 
@@ -57,6 +70,13 @@ func (s *Session) SetUser(user string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.User = user
+}
+
+// SetSessionUser sets the authenticated session user
+func (s *Session) SetSessionUser(user string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.SessionUser = user
 }
 
 // GetUser gets the current user for this session
@@ -123,5 +143,33 @@ func (s *Session) SetVariable(name, val string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Variables[name] = val
+}
+
+// SetLocalVariable sets a transaction-scoped local variable.
+// It stores the original value in s.TxLocalVariables if not already present,
+// so that it can be restored on COMMIT or ROLLBACK.
+func (s *Session) SetLocalVariable(name, val string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.TxActive {
+		// SET LOCAL acts as normal SET if not in a transaction
+		s.Variables[name] = val
+		return
+	}
+	if _, saved := s.TxLocalVariables[name]; !saved {
+		s.TxLocalVariables[name] = s.Variables[name]
+	}
+	s.Variables[name] = val
+}
+
+// ResetVariable restores a variable to its default value
+func (s *Session) ResetVariable(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if defVal, exists := DefaultSessionVariables[name]; exists {
+		s.Variables[name] = defVal
+	} else {
+		delete(s.Variables, name)
+	}
 }
 

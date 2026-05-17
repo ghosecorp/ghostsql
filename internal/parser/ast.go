@@ -110,6 +110,7 @@ type SelectStmt struct {
 	CTEs                []CTEDefinition
 	TableSampleMethod   string  // "BERNOULLI", "SYSTEM"
 	TableSamplePercent  float64 // 0-100
+	ForUpdate           bool
 }
 
 // CTEDefinition represents a WITH clause CTE
@@ -345,8 +346,9 @@ func (s *CreatePolicyStmt) StatementNode() {}
 
 // SetStmt represents SET commands
 type SetStmt struct {
-	Name  string
-	Value string
+	Name    string
+	Value   string
+	IsLocal bool
 }
 
 func (s *SetStmt) StatementNode() {}

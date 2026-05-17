@@ -17,11 +17,12 @@ type MetadataStore = metadata.MetadataStore
 
 // DatabaseInstance represents a single database
 type DatabaseInstance struct {
-	Name     string
-	Tables   map[string]*Table
-	BasePath string
-	mu       sync.RWMutex
-	db       *Database
+	Name       string
+	Tables     map[string]*Table
+	TableLocks map[string]string // maps tableName -> sessionID
+	BasePath   string
+	mu         sync.RWMutex
+	db         *Database
 }
 
 // GetTable retrieves a table by name safely, including virtual system tables
@@ -84,13 +85,47 @@ func (di *DatabaseInstance) DeleteTable(name string) {
 	delete(di.Tables, name)
 }
 
+// GetLock retrieves the session ID that has locked the table, if any
+func (di *DatabaseInstance) GetLock(table string) (string, bool) {
+	di.mu.RLock()
+	defer di.mu.RUnlock()
+	owner, locked := di.TableLocks[table]
+	return owner, locked
+}
+
+// SetLock locks a table for a session
+func (di *DatabaseInstance) SetLock(table string, sessionID string) {
+	di.mu.Lock()
+	defer di.mu.Unlock()
+	di.TableLocks[table] = sessionID
+}
+
+// ReleaseLock unlocks a table
+func (di *DatabaseInstance) ReleaseLock(table string) {
+	di.mu.Lock()
+	defer di.mu.Unlock()
+	delete(di.TableLocks, table)
+}
+
+// ReleaseAllSessionLocks releases all locks owned by a session
+func (di *DatabaseInstance) ReleaseAllSessionLocks(sessionID string) {
+	di.mu.Lock()
+	defer di.mu.Unlock()
+	for k, v := range di.TableLocks {
+		if v == sessionID {
+			delete(di.TableLocks, k)
+		}
+	}
+}
+
 // NewDatabaseInstance creates a new database instance
 func NewDatabaseInstance(name string, basePath string, db *Database) *DatabaseInstance {
 	return &DatabaseInstance{
-		Name:     name,
-		Tables:   make(map[string]*Table),
-		BasePath: basePath,
-		db:       db,
+		Name:       name,
+		Tables:     make(map[string]*Table),
+		TableLocks: make(map[string]string),
+		BasePath:   basePath,
+		db:         db,
 	}
 }
 
