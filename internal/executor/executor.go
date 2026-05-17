@@ -131,6 +131,14 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeRefreshMaterializedView(s)
 	case *parser.MergeStmt:
 		return e.executeMerge(s)
+	case *parser.DeclareCursorStmt:
+		return e.executeDeclareCursor(s)
+	case *parser.FetchCursorStmt:
+		return e.executeFetchCursor(s)
+	case *parser.MoveCursorStmt:
+		return e.executeMoveCursor(s)
+	case *parser.CloseCursorStmt:
+		return e.executeCloseCursor(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -3834,3 +3842,122 @@ func (e *Executor) executeLockTable(stmt *parser.LockTableStmt) (*Result, error)
 	dbInstance.SetLock(stmt.TableName, e.session.ID)
 	return &Result{Message: "LOCK TABLE"}, nil
 }
+
+func (e *Executor) executeDeclareCursor(stmt *parser.DeclareCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	// Execute the select query to obtain the full result set
+	res, err := e.executeSelect(stmt.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create and register the cursor in session Cursors
+	cursor := &storage.Cursor{
+		Name:       stmt.Name,
+		Query:      stmt.Query,
+		Rows:       res.Rows,
+		CurrentIdx: 0,
+	}
+
+	e.session.AddCursor(stmt.Name, cursor)
+
+	return &Result{
+		Message: fmt.Sprintf("DECLARE CURSOR %s", stmt.Name),
+	}, nil
+}
+
+func (e *Executor) executeFetchCursor(stmt *parser.FetchCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	cursor, ok := e.session.GetCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	// Determine how many rows to fetch
+	totalRows := len(cursor.Rows)
+	if cursor.CurrentIdx >= totalRows {
+		return &Result{
+			Message: "FETCH 0",
+			Rows:    []storage.Row{},
+		}, nil
+	}
+
+	fetchCount := stmt.Count
+	if fetchCount <= 0 {
+		fetchCount = 1
+	}
+
+	endIdx := cursor.CurrentIdx + fetchCount
+	if endIdx > totalRows {
+		endIdx = totalRows
+	}
+
+	fetchedRows := cursor.Rows[cursor.CurrentIdx:endIdx]
+	cursor.CurrentIdx = endIdx
+
+	// Build column name list to complete columns in Result
+	var cols []string
+	if len(fetchedRows) > 0 {
+		for k := range fetchedRows[0] {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("FETCH %d", len(fetchedRows)),
+		Rows:    fetchedRows,
+		Columns: cols,
+	}, nil
+}
+
+func (e *Executor) executeMoveCursor(stmt *parser.MoveCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	cursor, ok := e.session.GetCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	totalRows := len(cursor.Rows)
+	moveCount := stmt.Count
+	if moveCount <= 0 {
+		moveCount = 1
+	}
+
+	startIdx := cursor.CurrentIdx
+	cursor.CurrentIdx += moveCount
+	if cursor.CurrentIdx > totalRows {
+		cursor.CurrentIdx = totalRows
+	}
+
+	actualMoved := cursor.CurrentIdx - startIdx
+
+	return &Result{
+		Message: fmt.Sprintf("MOVE %d", actualMoved),
+	}, nil
+}
+
+func (e *Executor) executeCloseCursor(stmt *parser.CloseCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	ok := e.session.DeleteCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("CLOSE CURSOR %s", stmt.Name),
+	}, nil
+}
+

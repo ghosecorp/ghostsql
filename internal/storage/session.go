@@ -173,3 +173,33 @@ func (s *Session) ResetVariable(name string) {
 	}
 }
 
+// AddCursor registers a cursor in the session in a thread-safe manner
+func (s *Session) AddCursor(name string, cursor *Cursor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Cursors == nil {
+		s.Cursors = make(map[string]*Cursor)
+	}
+	s.Cursors[name] = cursor
+}
+
+// GetCursor retrieves a cursor from the session in a thread-safe manner
+func (s *Session) GetCursor(name string) (*Cursor, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cursor, exists := s.Cursors[name]
+	return cursor, exists
+}
+
+// DeleteCursor deletes a cursor from the session in a thread-safe manner
+func (s *Session) DeleteCursor(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.Cursors[name]
+	if exists {
+		delete(s.Cursors, name)
+	}
+	return exists
+}
+
+
