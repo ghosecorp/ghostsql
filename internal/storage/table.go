@@ -11,15 +11,17 @@ import (
 
 // Column represents a table column definition
 type Column struct {
-	Name       string
-	Type       DataType
-	Length     int
-	Nullable   bool
-	IsPrimary  bool
-	IsUnique   bool
-	DefaultVal interface{}
-	ForeignKey *ForeignKeyConstraint // Add this
-	Metadata   *metadata.Metadata
+	Name        string
+	Type        DataType
+	Length      int
+	Nullable    bool
+	IsPrimary   bool
+	IsUnique    bool
+	DefaultVal  interface{}
+	DefaultExpr string
+	CheckExpr   string
+	ForeignKey  *ForeignKeyConstraint // Add this
+	Metadata    *metadata.Metadata
 }
 
 // Row represents a single row of data
@@ -509,4 +511,158 @@ func matchLikeRecursive(str, pattern string, sIdx, pIdx int) bool {
 	}
 
 	return false
+}
+
+// DropColumn drops a column from the table
+func (t *Table) DropColumn(colName string, ifExists bool) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	foundIdx := -1
+	for i, col := range t.Columns {
+		if col.Name == colName {
+			foundIdx = i
+			break
+		}
+	}
+
+	if foundIdx == -1 {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("column %s does not exist", colName)
+	}
+
+	// Remove from Columns
+	t.Columns = append(t.Columns[:foundIdx], t.Columns[foundIdx+1:]...)
+
+	// Remove from Rows
+	for i := range t.Rows {
+		delete(t.Rows[i], colName)
+	}
+
+	return nil
+}
+
+// RenameColumn renames a column in the table
+func (t *Table) RenameColumn(oldName, newName string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	found := false
+	for i, col := range t.Columns {
+		if col.Name == oldName {
+			t.Columns[i].Name = newName
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("column %s does not exist", oldName)
+	}
+
+	for i := range t.Rows {
+		if val, exists := t.Rows[i][oldName]; exists {
+			t.Rows[i][newName] = val
+			delete(t.Rows[i], oldName)
+		}
+	}
+
+	return nil
+}
+
+// AlterColumnType alters a column's datatype, converting existing values
+func (t *Table) AlterColumnType(colName string, newType DataType) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	found := false
+	for i, col := range t.Columns {
+		if col.Name == colName {
+			t.Columns[i].Type = newType
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("column %s does not exist", colName)
+	}
+
+	// Convert all existing values
+	for i := range t.Rows {
+		val, exists := t.Rows[i][colName]
+		if !exists || val == nil {
+			continue
+		}
+
+		var converted interface{}
+		var err error
+		switch newType {
+		case TypeInt:
+			switch v := val.(type) {
+			case int:
+				converted = v
+			case int32:
+				converted = int(v)
+			case int64:
+				converted = int(v)
+			case float64:
+				converted = int(v)
+			case string:
+				var iv int
+				_, err = fmt.Sscanf(v, "%d", &iv)
+				converted = iv
+			default:
+				err = fmt.Errorf("cannot convert value %v to INT", val)
+			}
+		case TypeFloat:
+			switch v := val.(type) {
+			case float64:
+				converted = v
+			case int:
+				converted = float64(v)
+			case int32:
+				converted = float64(v)
+			case int64:
+				converted = float64(v)
+			case string:
+				var fv float64
+				_, err = fmt.Sscanf(v, "%f", &fv)
+				converted = fv
+			default:
+				err = fmt.Errorf("cannot convert value %v to FLOAT", val)
+			}
+		case TypeText, TypeVarChar:
+			converted = fmt.Sprintf("%v", val)
+		case TypeBoolean:
+			switch v := val.(type) {
+			case bool:
+				converted = v
+			case string:
+				lower := strings.ToLower(v)
+				if lower == "true" || lower == "t" || lower == "1" || lower == "yes" {
+					converted = true
+				} else if lower == "false" || lower == "f" || lower == "0" || lower == "no" {
+					converted = false
+				} else {
+					err = fmt.Errorf("cannot convert string %s to BOOLEAN", v)
+				}
+			case int:
+				converted = v != 0
+			default:
+				err = fmt.Errorf("cannot convert value %v to BOOLEAN", val)
+			}
+		default:
+			converted = val
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to alter column type for column %s: %w", colName, err)
+		}
+		t.Rows[i][colName] = converted
+	}
+
+	return nil
 }

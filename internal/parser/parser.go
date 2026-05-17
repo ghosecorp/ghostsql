@@ -63,6 +63,10 @@ func (p *Parser) Parse() (Statement, error) {
 		stmt, err = p.parseRevoke()
 	case TOKEN_SET:
 		stmt, err = p.parseSet()
+	case TOKEN_REFRESH:
+		stmt, err = p.parseRefresh()
+	case TOKEN_MERGE:
+		stmt, err = p.parseMerge()
 	case TOKEN_BEGIN:
 		p.nextToken()
 		stmt = &TransactionStmt{Command: "BEGIN"}
@@ -219,11 +223,38 @@ func (p *Parser) parseWithCTE() (Statement, error) {
 func (p *Parser) parseCreate() (Statement, error) {
 	p.nextToken() // consume CREATE
 
+	orReplace := false
+	if p.current.Type == TOKEN_OR {
+		p.nextToken() // consume OR
+		if p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "REPLACE" {
+			return nil, fmt.Errorf("expected REPLACE after CREATE OR")
+		}
+		p.nextToken() // consume REPLACE
+		orReplace = true
+	}
+
+	isMaterialized := false
+	if p.current.Type == TOKEN_MATERIALIZED {
+		p.nextToken() // consume MATERIALIZED
+		isMaterialized = true
+	}
+
 	switch p.current.Type {
 	case TOKEN_DATABASE:
 		return p.parseCreateDatabase()
 	case TOKEN_TABLE:
 		return p.parseCreateTable()
+	case TOKEN_VIEW:
+		if isMaterialized {
+			return p.parseCreateMaterializedView()
+		}
+		return p.parseCreateView(orReplace)
+	case TOKEN_SCHEMA:
+		return p.parseCreateSchema()
+	case TOKEN_SEQUENCE:
+		return p.parseCreateSequence()
+	case TOKEN_TYPE:
+		return p.parseCreateType()
 	case TOKEN_INDEX:
 		return p.parseCreateIndex()
 	case TOKEN_ROLE:
@@ -231,7 +262,7 @@ func (p *Parser) parseCreate() (Statement, error) {
 	case TOKEN_POLICY:
 		return p.parseCreatePolicy()
 	default:
-		return nil, fmt.Errorf("expected DATABASE, TABLE, INDEX, ROLE, or POLICY after CREATE")
+		return nil, fmt.Errorf("expected DATABASE, TABLE, VIEW, SCHEMA, SEQUENCE, TYPE, INDEX, ROLE, or POLICY after CREATE")
 	}
 }
 
@@ -269,7 +300,6 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 		var value interface{}
 		switch p.current.Type {
 		case TOKEN_NUMBER:
-			// Check if it's a float or int
 			if strings.Contains(p.current.Literal, ".") {
 				num, _ := strconv.ParseFloat(p.current.Literal, 64)
 				value = num
@@ -277,19 +307,46 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 				num, _ := strconv.Atoi(p.current.Literal)
 				value = num
 			}
+			p.nextToken()
 		case TOKEN_STRING:
 			value = p.current.Literal
+			p.nextToken()
+		case TOKEN_IDENT:
+			identVal := p.current.Literal
+			p.nextToken()
+			if p.current.Type == TOKEN_DOT {
+				p.nextToken()
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name after .")
+				}
+				identVal += "." + p.current.Literal
+				p.nextToken()
+			}
+			value = identVal
 		default:
 			return nil, fmt.Errorf("expected value")
 		}
 		stmt.Updates[colName] = value
-		p.nextToken()
 
 		if p.current.Type == TOKEN_COMMA {
 			p.nextToken()
 			continue
 		}
 		break
+	}
+
+	// Parse optional FROM clause for join updates
+	if p.current.Type == TOKEN_FROM {
+		p.nextToken() // consume FROM
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected table name after FROM in UPDATE")
+		}
+		stmt.FromTable = p.current.Literal
+		p.nextToken()
+		// Consume optional table alias
+		if p.current.Type != TOKEN_WHERE && p.current.Type != TOKEN_RETURNING && p.current.Type != TOKEN_EOF {
+			p.nextToken()
+		}
 	}
 
 	// Parse WHERE clause
@@ -330,6 +387,20 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 	}
 	stmt.TableName = p.current.Literal
 	p.nextToken()
+
+	// Parse optional USING clause for join deletes
+	if p.current.Type == TOKEN_USING || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "USING") {
+		p.nextToken() // consume USING
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected table name after USING")
+		}
+		stmt.UsingTable = p.current.Literal
+		p.nextToken()
+		// Consume optional table alias
+		if p.current.Type != TOKEN_WHERE && p.current.Type != TOKEN_RETURNING && p.current.Type != TOKEN_EOF {
+			p.nextToken()
+		}
+	}
 
 	// Parse WHERE clause
 	if p.current.Type == TOKEN_WHERE {
@@ -389,10 +460,14 @@ func (p *Parser) parseReturningColumns() ([]SelectColumn, error) {
 func (p *Parser) parseDrop() (Statement, error) {
 	p.nextToken() // consume DROP
 
+	// Support DROP IF EXISTS TABLE / DATABASE / etc.
 	ifExists := false
 	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
 		p.nextToken()
 		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS" {
+			ifExists = true
+			p.nextToken()
+		} else if p.current.Type == TOKEN_EXISTS {
 			ifExists = true
 			p.nextToken()
 		} else {
@@ -400,33 +475,46 @@ func (p *Parser) parseDrop() (Statement, error) {
 		}
 	}
 
-	switch p.current.Type {
+	targetType := p.current.Type
+	targetTypeLiteral := strings.ToUpper(p.current.Literal)
+	p.nextToken() // consume TABLE, DATABASE, INDEX, ROLE, VIEW
+
+	// Support DROP TABLE IF EXISTS
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken()
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS" {
+			ifExists = true
+			p.nextToken()
+		} else if p.current.Type == TOKEN_EXISTS {
+			ifExists = true
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected EXISTS after DROP ... IF")
+		}
+	} else if p.current.Type == TOKEN_EXISTS {
+		ifExists = true
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected name after DROP %s", targetTypeLiteral)
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	switch targetType {
 	case TOKEN_TABLE:
-		stmt, err := p.parseDropTable()
-		if err == nil {
-			stmt.IfExists = ifExists
-		}
-		return stmt, err
+		return &DropTableStmt{TableName: name, IfExists: ifExists}, nil
 	case TOKEN_DATABASE:
-		stmt, err := p.parseDropDatabase()
-		if err == nil {
-			stmt.IfExists = ifExists
-		}
-		return stmt, err
+		return &DropDatabaseStmt{DatabaseName: name, IfExists: ifExists}, nil
 	case TOKEN_INDEX:
-		stmt, err := p.parseDropIndex()
-		if err == nil {
-			stmt.IfExists = ifExists
-		}
-		return stmt, err
+		return &DropIndexStmt{IndexName: name, IfExists: ifExists}, nil
 	case TOKEN_ROLE:
-		stmt, err := p.parseDropRole()
-		if err == nil {
-			stmt.IfExists = ifExists
-		}
-		return stmt, err
+		return &DropRoleStmt{RoleName: name, IfExists: ifExists}, nil
+	case TOKEN_VIEW:
+		return &DropViewStmt{ViewName: name, IfExists: ifExists}, nil
 	default:
-		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, or ROLE after DROP")
+		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, ROLE, or VIEW after DROP")
 	}
 }
 
@@ -513,6 +601,41 @@ func (p *Parser) parseAlterTable() (*AlterTableStmt, error) {
 	switch p.current.Type {
 	case TOKEN_ADD:
 		p.nextToken()
+		// Check for CONSTRAINT: ADD CONSTRAINT constraint_name UNIQUE (column)
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "CONSTRAINT" {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected constraint name")
+			}
+			stmt.AddConstraintName = p.current.Literal
+			p.nextToken()
+		}
+
+		// If ADD UNIQUE (column)
+		if p.current.Type == TOKEN_UNIQUE {
+			p.nextToken()
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after UNIQUE")
+			}
+			p.nextToken()
+			for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name")
+				}
+				stmt.AddConstraintUnique = append(stmt.AddConstraintUnique, p.current.Literal)
+				p.nextToken()
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+				}
+			}
+			if p.current.Type != TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected )")
+			}
+			p.nextToken()
+			stmt.Action = "ADD_CONSTRAINT"
+			return stmt, nil
+		}
+
 		if p.current.Type == TOKEN_COLUMN {
 			p.nextToken()
 		}
@@ -522,6 +645,120 @@ func (p *Parser) parseAlterTable() (*AlterTableStmt, error) {
 			return nil, err
 		}
 		stmt.Column = &col
+
+	case TOKEN_DROP:
+		p.nextToken()
+		if p.current.Type == TOKEN_COLUMN {
+			p.nextToken()
+		}
+		ifExists := false
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+			p.nextToken()
+			if p.current.Type == TOKEN_EXISTS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS") {
+				ifExists = true
+				p.nextToken()
+			} else {
+				return nil, fmt.Errorf("expected EXISTS after IF")
+			}
+		} else if p.current.Type == TOKEN_EXISTS {
+			ifExists = true
+			p.nextToken()
+		}
+
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected column name after DROP COLUMN")
+		}
+		stmt.DropColumn = p.current.Literal
+		p.nextToken()
+		stmt.Action = "DROP_COLUMN"
+		stmt.IfExists = ifExists
+
+	case TOKEN_IDENT, TOKEN_ALTER:
+		keyword := strings.ToUpper(p.current.Literal)
+		if p.current.Type == TOKEN_ALTER {
+			keyword = "ALTER"
+		}
+		switch keyword {
+		case "RENAME":
+			p.nextToken() // consume RENAME
+			if p.current.Type == TOKEN_TO {
+				p.nextToken() // consume TO
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected new table name after RENAME TO")
+				}
+				stmt.RenameTo = p.current.Literal
+				p.nextToken()
+				stmt.Action = "RENAME_TO"
+			} else {
+				if p.current.Type == TOKEN_COLUMN {
+					p.nextToken()
+				}
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name to rename")
+				}
+				stmt.RenameColumnFrom = p.current.Literal
+				p.nextToken()
+
+				if p.current.Type != TOKEN_TO {
+					return nil, fmt.Errorf("expected TO after column name in RENAME COLUMN")
+				}
+				p.nextToken()
+
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected new column name")
+				}
+				stmt.RenameColumnTo = p.current.Literal
+				p.nextToken()
+				stmt.Action = "RENAME_COLUMN"
+			}
+		case "ALTER":
+			p.nextToken() // consume ALTER
+			if p.current.Type == TOKEN_COLUMN {
+				p.nextToken()
+			}
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected column name after ALTER COLUMN")
+			}
+			stmt.AlterColumnName = p.current.Literal
+			p.nextToken()
+
+			actionType := strings.ToUpper(p.current.Literal)
+			p.nextToken() // consume keyword
+
+			if actionType == "TYPE" {
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected new type after ALTER COLUMN TYPE")
+				}
+				typeName := strings.ToUpper(p.current.Literal)
+				var dataType storage.DataType
+				switch typeName {
+				case "INT":
+					dataType = storage.TypeInt
+				case "BIGINT":
+					dataType = storage.TypeBigInt
+				case "TEXT":
+					dataType = storage.TypeText
+				case "VARCHAR":
+					dataType = storage.TypeVarChar
+				case "FLOAT":
+					dataType = storage.TypeFloat
+				case "BOOLEAN":
+					dataType = storage.TypeBoolean
+				case "DATE", "TIMESTAMP":
+					dataType = storage.TypeText
+				default:
+					return nil, fmt.Errorf("unknown type: %s", typeName)
+				}
+				stmt.AlterColumnType = dataType
+				p.nextToken()
+				stmt.Action = "ALTER_COLUMN_TYPE"
+			} else {
+				return nil, fmt.Errorf("expected TYPE after ALTER COLUMN col")
+			}
+		default:
+			return nil, fmt.Errorf("expected ADD, DROP, RENAME, ALTER, ENABLE, or DISABLE after ALTER TABLE")
+		}
+
 	case TOKEN_ENABLE, TOKEN_DISABLE:
 		action := "ENABLE_RLS"
 		if p.current.Type == TOKEN_DISABLE {
@@ -539,8 +776,9 @@ func (p *Parser) parseAlterTable() (*AlterTableStmt, error) {
 		}
 		p.nextToken()
 		stmt.Action = action
+
 	default:
-		return nil, fmt.Errorf("expected ADD, ENABLE, or DISABLE after ALTER TABLE")
+		return nil, fmt.Errorf("expected ADD, DROP, RENAME, ALTER, ENABLE, or DISABLE after ALTER TABLE")
 	}
 	return stmt, nil
 }
@@ -645,6 +883,25 @@ func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 
 	p.nextToken() // consume TABLE
 
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken() // consume IF
+		if p.current.Type == TOKEN_NOT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NOT") {
+			p.nextToken() // consume NOT
+			if p.current.Type == TOKEN_EXISTS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS") {
+				p.nextToken() // consume EXISTS
+				stmt.IfNotExists = true
+			} else {
+				return nil, fmt.Errorf("expected EXISTS after IF NOT")
+			}
+		} else {
+			return nil, fmt.Errorf("expected NOT after IF")
+		}
+	} else if p.current.Type == TOKEN_EXISTS {
+		// Just in case of keyword token tokenization:
+		stmt.IfNotExists = true
+		p.nextToken()
+	}
+
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected table name, got %s", p.current.Type)
 	}
@@ -717,7 +974,7 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	col.Name = p.current.Literal
 	p.nextToken()
 
-	if p.current.Type != TOKEN_IDENT {
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SERIAL && p.current.Type != TOKEN_BIGSERIAL {
 		return col, fmt.Errorf("expected column type after %s, got %s (literal: '%s')", col.Name, p.current.Type, p.current.Literal)
 	}
 
@@ -726,6 +983,12 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	switch typeName {
 	case "INT":
 		col.Type = storage.TypeInt
+		p.nextToken()
+
+	case "SERIAL", "BIGSERIAL":
+		col.Type = storage.TypeInt
+		col.Nullable = false
+		col.DefaultExpr = "nextval"
 		p.nextToken()
 
 	case "BIGINT":
@@ -800,6 +1063,68 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 
 		if p.current.Type == TOKEN_EOF {
 			break
+		}
+
+		// Handle TOKEN_DEFAULT directly
+		if p.current.Type == TOKEN_DEFAULT {
+			p.nextToken() // consume DEFAULT
+			exprStr := ""
+			if p.current.Type == TOKEN_IDENT {
+				exprStr = p.current.Literal
+				p.nextToken()
+				if p.current.Type == TOKEN_LPAREN {
+					exprStr += "("
+					p.nextToken()
+					if p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_IDENT {
+						exprStr += "'" + p.current.Literal + "'"
+						p.nextToken()
+					}
+					if p.current.Type == TOKEN_RPAREN {
+						exprStr += ")"
+						p.nextToken()
+					}
+				}
+			} else if p.current.Type == TOKEN_NUMBER || p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_NULL {
+				exprStr = p.current.Literal
+				p.nextToken()
+			} else {
+				return col, fmt.Errorf("unexpected token in DEFAULT expression: %s", p.current.Type)
+			}
+			col.DefaultExpr = exprStr
+			continue
+		}
+
+		// Handle TOKEN_CHECK directly
+		if p.current.Type == TOKEN_CHECK {
+			p.nextToken() // consume CHECK
+			if p.current.Type != TOKEN_LPAREN {
+				return col, fmt.Errorf("expected ( after CHECK")
+			}
+			p.nextToken()
+			checkExpr := ""
+			parenDepth := 1
+			for parenDepth > 0 && p.current.Type != TOKEN_EOF {
+				if p.current.Type == TOKEN_LPAREN {
+					parenDepth++
+				} else if p.current.Type == TOKEN_RPAREN {
+					parenDepth--
+					if parenDepth == 0 {
+						p.nextToken()
+						break
+					}
+				}
+				checkExpr += p.current.Literal + " "
+				p.nextToken()
+			}
+			col.CheckExpr = strings.TrimSpace(checkExpr)
+			continue
+		}
+
+		// Handle TOKEN_UNIQUE directly
+		if p.current.Type == TOKEN_UNIQUE {
+			col.IsUnique = true
+			p.nextToken()
+			continue
 		}
 
 		// Handle TOKEN_NULL directly
@@ -940,87 +1265,207 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		p.nextToken()
 	}
 
-	if p.current.Type != TOKEN_VALUES {
-		return nil, fmt.Errorf("expected VALUES")
-	}
-	p.nextToken()
-
-	// Parse multiple value sets: VALUES (1, 'a'), (2, 'b'), (3, 'c')
-	for {
-		if p.current.Type != TOKEN_LPAREN {
-			return nil, fmt.Errorf("expected (")
+	if p.current.Type == TOKEN_SELECT || p.current.Type == TOKEN_WITH {
+		selectQuery, err := p.parseSelectOrCompound()
+		if err != nil {
+			return nil, err
 		}
-		p.nextToken()
+		stmt.SelectQuery = selectQuery.(*SelectStmt)
+	} else if p.current.Type == TOKEN_VALUES {
+		p.nextToken() // consume VALUES
 
-		// Parse values for one row
-		values := []interface{}{}
-		for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
-			var val interface{}
+		// Parse multiple value sets: VALUES (1, 'a'), (2, 'b'), (3, 'c')
+		for {
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected (")
+			}
+			p.nextToken()
 
-			if p.current.Type == TOKEN_LBRACKET {
-				// Parse vector array
-				vectorStr := "["
-				p.nextToken()
-				for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
-					vectorStr += p.current.Literal
+			// Parse values for one row
+			values := []interface{}{}
+			for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+				var val interface{}
+
+				if p.current.Type == TOKEN_LBRACKET {
+					// Parse vector array
+					vectorStr := "["
 					p.nextToken()
-					if p.current.Type == TOKEN_COMMA {
-						vectorStr += ","
+					for p.current.Type != TOKEN_RBRACKET && p.current.Type != TOKEN_EOF {
+						vectorStr += p.current.Literal
 						p.nextToken()
+						if p.current.Type == TOKEN_COMMA {
+							vectorStr += ","
+							p.nextToken()
+						}
 					}
-				}
-				if p.current.Type != TOKEN_RBRACKET {
-					return nil, fmt.Errorf("expected ]")
-				}
-				vectorStr += "]"
-				val = vectorStr
-				p.nextToken()
-			} else {
-				switch p.current.Type {
-				case TOKEN_NUMBER:
-					if strings.Contains(p.current.Literal, ".") {
-						num, _ := strconv.ParseFloat(p.current.Literal, 64)
-						val = num
-					} else {
-						num, _ := strconv.Atoi(p.current.Literal)
-						val = num
+					if p.current.Type != TOKEN_RBRACKET {
+						return nil, fmt.Errorf("expected ]")
 					}
-				case TOKEN_STRING:
-					val = p.current.Literal
-				case TOKEN_NULL:
-					val = nil
-				case TOKEN_IDENT:
-					if strings.ToUpper(p.current.Literal) == "NULL" {
+					vectorStr += "]"
+					val = vectorStr
+					p.nextToken()
+				} else {
+					switch p.current.Type {
+					case TOKEN_NUMBER:
+						if strings.Contains(p.current.Literal, ".") {
+							num, _ := strconv.ParseFloat(p.current.Literal, 64)
+							val = num
+						} else {
+							num, _ := strconv.Atoi(p.current.Literal)
+							val = num
+						}
+					case TOKEN_STRING:
+						val = p.current.Literal
+					case TOKEN_NULL:
 						val = nil
-					} else {
-						return nil, fmt.Errorf("unexpected identifier: %s", p.current.Literal)
+					case TOKEN_IDENT:
+						if strings.ToUpper(p.current.Literal) == "NULL" {
+							val = nil
+						} else {
+							return nil, fmt.Errorf("unexpected identifier: %s", p.current.Literal)
+						}
+					default:
+						return nil, fmt.Errorf("unexpected value type: %s", p.current.Type)
 					}
-				default:
-					return nil, fmt.Errorf("unexpected value type: %s", p.current.Type)
+					p.nextToken()
 				}
-				p.nextToken()
+
+				values = append(values, val)
+
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+				}
 			}
 
-			values = append(values, val)
+			if p.current.Type != TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected )")
+			}
+			p.nextToken()
 
+			stmt.Values = append(stmt.Values, values)
+
+			// Check for more rows
 			if p.current.Type == TOKEN_COMMA {
 				p.nextToken()
+				continue
+			} else {
+				break
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("expected VALUES or SELECT statement")
+	}
+
+	// Parse ON CONFLICT
+	if p.current.Type == TOKEN_CONFLICT || p.current.Type == TOKEN_ON || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ON") {
+		hasConflict := false
+		if p.current.Type == TOKEN_CONFLICT {
+			hasConflict = true
+			p.nextToken()
+		} else if p.current.Type == TOKEN_ON || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ON") {
+			p.nextToken()
+			if p.current.Type == TOKEN_CONFLICT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "CONFLICT") {
+				hasConflict = true
+				p.nextToken()
 			}
 		}
 
-		if p.current.Type != TOKEN_RPAREN {
-			return nil, fmt.Errorf("expected )")
-		}
-		p.nextToken()
+		if hasConflict {
+			onConflict := &OnConflictDef{Updates: make(map[string]interface{})}
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken()
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name inside ON CONFLICT (...)")
+				}
+				onConflict.TargetColumn = p.current.Literal
+				p.nextToken()
+				if p.current.Type != TOKEN_RPAREN {
+					return nil, fmt.Errorf("expected )")
+				}
+				p.nextToken()
+			}
 
-		stmt.Values = append(stmt.Values, values)
-
-		// Check for more rows
-		if p.current.Type == TOKEN_COMMA {
+			if p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "DO" {
+				return nil, fmt.Errorf("expected DO after ON CONFLICT")
+			}
 			p.nextToken()
-			continue
-		} else {
-			break
+
+			action := strings.ToUpper(p.current.Literal)
+			p.nextToken()
+			if action == "NOTHING" || p.current.Type == TOKEN_NOTHING {
+				onConflict.DoNothing = true
+				if p.current.Type == TOKEN_NOTHING {
+					p.nextToken()
+				}
+			} else if action == "UPDATE" {
+				onConflict.DoUpdate = true
+				if p.current.Type != TOKEN_SET {
+					return nil, fmt.Errorf("expected SET after DO UPDATE")
+				}
+				p.nextToken()
+
+				for {
+					if p.current.Type != TOKEN_IDENT {
+						return nil, fmt.Errorf("expected column name")
+					}
+					colName := p.current.Literal
+					p.nextToken()
+
+					if p.current.Type != TOKEN_EQUALS {
+						return nil, fmt.Errorf("expected =")
+					}
+					p.nextToken()
+
+					var val interface{}
+					if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXCLUDED" {
+						p.nextToken()
+						if p.current.Type != TOKEN_DOT {
+							return nil, fmt.Errorf("expected . after EXCLUDED")
+						}
+						p.nextToken()
+						if p.current.Type != TOKEN_IDENT {
+							return nil, fmt.Errorf("expected column name after EXCLUDED.")
+						}
+						val = "EXCLUDED." + p.current.Literal
+						p.nextToken()
+					} else {
+						switch p.current.Type {
+						case TOKEN_NUMBER:
+							if strings.Contains(p.current.Literal, ".") {
+								num, _ := strconv.ParseFloat(p.current.Literal, 64)
+								val = num
+							} else {
+								num, _ := strconv.Atoi(p.current.Literal)
+								val = num
+							}
+						case TOKEN_STRING:
+							val = p.current.Literal
+						case TOKEN_NULL:
+							val = nil
+						case TOKEN_IDENT:
+							if strings.ToUpper(p.current.Literal) == "NULL" {
+								val = nil
+							} else {
+								val = p.current.Literal
+							}
+						default:
+							return nil, fmt.Errorf("unexpected value type in DO UPDATE SET: %s", p.current.Type)
+						}
+						p.nextToken()
+					}
+
+					onConflict.Updates[colName] = val
+
+					if p.current.Type == TOKEN_COMMA {
+						p.nextToken()
+						continue
+					}
+					break
+				}
+			} else {
+				return nil, fmt.Errorf("expected NOTHING or UPDATE after DO")
+			}
+			stmt.OnConflict = onConflict
 		}
 	}
 
@@ -2796,4 +3241,477 @@ func (p *Parser) parseSet() (*SetStmt, error) {
 	}
 
 	return &SetStmt{Name: name, Value: value}, nil
+}
+
+func (p *Parser) parseCreateView(orReplace bool) (*CreateViewStmt, error) {
+	p.nextToken() // consume VIEW
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected view name after CREATE VIEW")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_AS {
+		return nil, fmt.Errorf("expected AS after view name")
+	}
+	p.nextToken() // consume AS
+
+	query, err := p.parseSelectOrCompound()
+	if err != nil {
+		return nil, err
+	}
+
+	return &CreateViewStmt{
+		ViewName:  name,
+		Query:     query.(*SelectStmt),
+		OrReplace: orReplace,
+	}, nil
+}
+
+func (p *Parser) parseCreateSchema() (*CreateSchemaStmt, error) {
+	p.nextToken() // consume SCHEMA
+
+	ifNotExists := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken()
+		if p.current.Type == TOKEN_NOT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NOT") {
+			p.nextToken()
+			if p.current.Type == TOKEN_EXISTS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS") {
+				ifNotExists = true
+				p.nextToken()
+			} else {
+				return nil, fmt.Errorf("expected EXISTS after IF NOT")
+			}
+		} else {
+			return nil, fmt.Errorf("expected NOT after IF")
+		}
+	} else if p.current.Type == TOKEN_EXISTS {
+		ifNotExists = true
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected schema name")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	return &CreateSchemaStmt{SchemaName: name, IfNotExists: ifNotExists}, nil
+}
+
+func (p *Parser) parseCreateSequence() (*CreateSequenceStmt, error) {
+	p.nextToken() // consume SEQUENCE
+
+	ifNotExists := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken()
+		if p.current.Type == TOKEN_NOT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NOT") {
+			p.nextToken()
+			if p.current.Type == TOKEN_EXISTS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS") {
+				ifNotExists = true
+				p.nextToken()
+			} else {
+				return nil, fmt.Errorf("expected EXISTS after IF NOT")
+			}
+		} else {
+			return nil, fmt.Errorf("expected NOT after IF")
+		}
+	} else if p.current.Type == TOKEN_EXISTS {
+		ifNotExists = true
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected sequence name")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	startVal := 1
+	incVal := 1
+
+	for {
+		if p.current.Type == TOKEN_EOF {
+			break
+		}
+		keyword := strings.ToUpper(p.current.Literal)
+		if keyword == "START" {
+			p.nextToken()
+			if strings.ToUpper(p.current.Literal) == "WITH" {
+				p.nextToken()
+			}
+			if p.current.Type != TOKEN_NUMBER {
+				return nil, fmt.Errorf("expected sequence start number")
+			}
+			startVal, _ = strconv.Atoi(p.current.Literal)
+			p.nextToken()
+		} else if keyword == "INCREMENT" {
+			p.nextToken()
+			if strings.ToUpper(p.current.Literal) == "BY" {
+				p.nextToken()
+			}
+			if p.current.Type != TOKEN_NUMBER {
+				return nil, fmt.Errorf("expected sequence increment number")
+			}
+			incVal, _ = strconv.Atoi(p.current.Literal)
+			p.nextToken()
+		} else {
+			break
+		}
+	}
+
+	return &CreateSequenceStmt{
+		SequenceName: name,
+		Start:        startVal,
+		Increment:    incVal,
+		IfNotExists:  ifNotExists,
+	}, nil
+}
+
+func (p *Parser) parseCreateType() (*CreateTypeStmt, error) {
+	p.nextToken() // consume TYPE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected type name after CREATE TYPE")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_AS {
+		return nil, fmt.Errorf("expected AS after type name")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_ENUM {
+		return nil, fmt.Errorf("expected ENUM after AS")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected ( after ENUM")
+	}
+	p.nextToken()
+
+	var values []string
+	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+		if p.current.Type != TOKEN_STRING {
+			return nil, fmt.Errorf("expected string literal in ENUM values")
+		}
+		values = append(values, p.current.Literal)
+		p.nextToken()
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+		}
+	}
+
+	if p.current.Type != TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected )")
+	}
+	p.nextToken()
+
+	return &CreateTypeStmt{TypeName: name, Values: values}, nil
+}
+
+func (p *Parser) parseCreateMaterializedView() (*CreateMaterializedViewStmt, error) {
+	p.nextToken() // consume VIEW
+
+	ifNotExists := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IF" {
+		p.nextToken()
+		if p.current.Type == TOKEN_NOT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NOT") {
+			p.nextToken()
+			if p.current.Type == TOKEN_EXISTS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "EXISTS") {
+				ifNotExists = true
+				p.nextToken()
+			} else {
+				return nil, fmt.Errorf("expected EXISTS after IF NOT")
+			}
+		} else {
+			return nil, fmt.Errorf("expected NOT after IF")
+		}
+	} else if p.current.Type == TOKEN_EXISTS {
+		ifNotExists = true
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected view name after CREATE MATERIALIZED VIEW")
+	}
+	name := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_AS {
+		return nil, fmt.Errorf("expected AS after view name")
+	}
+	p.nextToken()
+
+	query, err := p.parseSelectOrCompound()
+	if err != nil {
+		return nil, err
+	}
+
+	return &CreateMaterializedViewStmt{
+		ViewName:    name,
+		Query:       query.(*SelectStmt),
+		IfNotExists: ifNotExists,
+	}, nil
+}
+
+func (p *Parser) parseRefresh() (Statement, error) {
+	p.nextToken() // consume REFRESH
+	if p.current.Type != TOKEN_MATERIALIZED {
+		return nil, fmt.Errorf("expected MATERIALIZED after REFRESH")
+	}
+	p.nextToken()
+	if p.current.Type != TOKEN_VIEW {
+		return nil, fmt.Errorf("expected VIEW after REFRESH MATERIALIZED")
+	}
+	p.nextToken()
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected view name to refresh")
+	}
+	name := p.current.Literal
+	p.nextToken()
+	return &RefreshMaterializedViewStmt{ViewName: name}, nil
+}
+
+func (p *Parser) parseMerge() (*MergeStmt, error) {
+	p.nextToken() // consume MERGE
+
+	if p.current.Type != TOKEN_INTO {
+		return nil, fmt.Errorf("expected INTO after MERGE")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected target table name")
+	}
+	targetTable := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_USING && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "USING") {
+		return nil, fmt.Errorf("expected USING after target table")
+	}
+	p.nextToken()
+
+	var sourceTable string
+	var sourceQuery *SelectStmt
+
+	if p.current.Type == TOKEN_LPAREN {
+		p.nextToken() // consume (
+		subquery, err := p.parseSelectOrCompound()
+		if err != nil {
+			return nil, err
+		}
+		sourceQuery = subquery.(*SelectStmt)
+
+		if p.current.Type != TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ) after subquery in MERGE USING")
+		}
+		p.nextToken()
+
+		if p.current.Type == TOKEN_AS {
+			p.nextToken()
+		}
+		if p.current.Type == TOKEN_IDENT {
+			sourceTable = p.current.Literal
+			p.nextToken()
+		}
+	} else {
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected source table name")
+		}
+		sourceTable = p.current.Literal
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_ON && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "ON") {
+		return nil, fmt.Errorf("expected ON condition in MERGE")
+	}
+	p.nextToken()
+
+	if p.current.Type == TOKEN_LPAREN {
+		p.nextToken()
+	}
+	onCondition, err := p.parseWhere()
+	if err != nil {
+		return nil, err
+	}
+	if p.current.Type == TOKEN_RPAREN {
+		p.nextToken()
+	}
+
+	stmt := &MergeStmt{
+		TargetTable: targetTable,
+		SourceTable: sourceTable,
+		SourceQuery: sourceQuery,
+		OnCondition: onCondition,
+	}
+
+	for {
+		if p.current.Type != TOKEN_WHEN && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "WHEN") {
+			break
+		}
+		p.nextToken() // consume WHEN
+
+		isNotMatched := false
+		if p.current.Type == TOKEN_NOT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NOT") {
+			p.nextToken()
+			isNotMatched = true
+		}
+
+		if p.current.Type != TOKEN_MATCHED && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "MATCHED") {
+			return nil, fmt.Errorf("expected MATCHED after WHEN [NOT]")
+		}
+		p.nextToken()
+
+		if p.current.Type != TOKEN_THEN && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "THEN") {
+			return nil, fmt.Errorf("expected THEN after WHEN [NOT] MATCHED")
+		}
+		p.nextToken()
+
+		action := strings.ToUpper(p.current.Literal)
+		p.nextToken() // consume UPDATE / INSERT / DELETE / DO
+
+		mergeAction := MergeAction{Action: action}
+
+		if action == "UPDATE" {
+			if p.current.Type != TOKEN_SET {
+				return nil, fmt.Errorf("expected SET after UPDATE in MERGE action")
+			}
+			p.nextToken()
+
+			mergeAction.Updates = make(map[string]interface{})
+			for {
+				if p.current.Type != TOKEN_IDENT {
+					return nil, fmt.Errorf("expected column name")
+				}
+				colName := p.current.Literal
+				p.nextToken()
+
+				if p.current.Type != TOKEN_EQUALS {
+					return nil, fmt.Errorf("expected =")
+				}
+				p.nextToken()
+
+				var val interface{}
+				if p.current.Type == TOKEN_NUMBER {
+					if strings.Contains(p.current.Literal, ".") {
+						num, _ := strconv.ParseFloat(p.current.Literal, 64)
+						val = num
+					} else {
+						num, _ := strconv.Atoi(p.current.Literal)
+						val = num
+					}
+					p.nextToken()
+				} else if p.current.Type == TOKEN_STRING {
+					val = p.current.Literal
+					p.nextToken()
+				} else if p.current.Type == TOKEN_IDENT {
+					identVal := p.current.Literal
+					p.nextToken()
+					if p.current.Type == TOKEN_DOT {
+						p.nextToken()
+						if p.current.Type != TOKEN_IDENT {
+							return nil, fmt.Errorf("expected column after .")
+						}
+						identVal += "." + p.current.Literal
+						p.nextToken()
+					}
+					val = identVal
+				} else {
+					return nil, fmt.Errorf("unexpected value in MERGE UPDATE action")
+				}
+
+				mergeAction.Updates[colName] = val
+
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+					continue
+				}
+				break
+			}
+		} else if action == "INSERT" {
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken()
+				for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+					if p.current.Type != TOKEN_IDENT {
+						return nil, fmt.Errorf("expected column name")
+					}
+					mergeAction.Columns = append(mergeAction.Columns, p.current.Literal)
+					p.nextToken()
+					if p.current.Type == TOKEN_COMMA {
+						p.nextToken()
+					}
+				}
+				if p.current.Type != TOKEN_RPAREN {
+					return nil, fmt.Errorf("expected )")
+				}
+				p.nextToken()
+			}
+
+			if p.current.Type != TOKEN_VALUES {
+				return nil, fmt.Errorf("expected VALUES in MERGE INSERT action")
+			}
+			p.nextToken()
+
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after VALUES")
+			}
+			p.nextToken()
+
+			for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+				var val interface{}
+				if p.current.Type == TOKEN_NUMBER {
+					if strings.Contains(p.current.Literal, ".") {
+						num, _ := strconv.ParseFloat(p.current.Literal, 64)
+						val = num
+					} else {
+						num, _ := strconv.Atoi(p.current.Literal)
+						val = num
+					}
+					p.nextToken()
+				} else if p.current.Type == TOKEN_STRING {
+					val = p.current.Literal
+					p.nextToken()
+				} else if p.current.Type == TOKEN_IDENT {
+					identVal := p.current.Literal
+					p.nextToken()
+					if p.current.Type == TOKEN_DOT {
+						p.nextToken()
+						if p.current.Type != TOKEN_IDENT {
+							return nil, fmt.Errorf("expected column after .")
+						}
+						identVal += "." + p.current.Literal
+						p.nextToken()
+					}
+					val = identVal
+				} else {
+					return nil, fmt.Errorf("unexpected value in MERGE INSERT action")
+				}
+				mergeAction.Values = append(mergeAction.Values, val)
+				if p.current.Type == TOKEN_COMMA {
+					p.nextToken()
+				}
+			}
+			if p.current.Type != TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected )")
+			}
+			p.nextToken()
+		} else if action == "DO" {
+			if p.current.Type != TOKEN_NOTHING && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "NOTHING") {
+				return nil, fmt.Errorf("expected NOTHING after DO in MERGE action")
+			}
+			p.nextToken()
+			mergeAction.Action = "DO NOTHING"
+		}
+
+		if isNotMatched {
+			stmt.WhenNotMatched = append(stmt.WhenNotMatched, mergeAction)
+		} else {
+			stmt.WhenMatched = append(stmt.WhenMatched, mergeAction)
+		}
+	}
+
+	return stmt, nil
 }

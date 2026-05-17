@@ -33,31 +33,44 @@ func (s *ShowStmt) StatementNode() {}
 
 // CreateTableStmt represents CREATE TABLE
 type CreateTableStmt struct {
-	TableName string
-	Columns   []ColumnDef
-	Metadata  []string
+	TableName   string
+	Columns     []ColumnDef
+	Metadata    []string
+	IfNotExists bool
 }
 
 func (s *CreateTableStmt) StatementNode() {}
 
 // ColumnDef represents a column definition
 type ColumnDef struct {
-	Name       string
-	Type       storage.DataType
-	Length     int
-	Nullable   bool
-	IsPrimary  bool           // PRIMARY KEY
-	IsUnique   bool           // UNIQUE
-	ForeignKey *ForeignKeyDef // Add this
-	DefaultVal interface{}
+	Name        string
+	Type        storage.DataType
+	Length      int
+	Nullable    bool
+	IsPrimary   bool           // PRIMARY KEY
+	IsUnique    bool           // UNIQUE
+	ForeignKey  *ForeignKeyDef // Add this
+	DefaultVal  interface{}
+	DefaultExpr string         // Expression string like NOW()
+	CheckExpr   string         // CHECK constraint expression
+}
+
+// OnConflictDef represents ON CONFLICT target DO UPDATE / NOTHING
+type OnConflictDef struct {
+	TargetColumn string
+	DoNothing    bool
+	DoUpdate     bool
+	Updates      map[string]interface{}
 }
 
 // InsertStmt represents INSERT INTO
 type InsertStmt struct {
-	TableName string
-	Columns   []string
-	Values    [][]interface{}
-	Returning []SelectColumn
+	TableName   string
+	Columns     []string
+	Values      [][]interface{}
+	Returning   []SelectColumn
+	SelectQuery *SelectStmt    // For INSERT ... SELECT
+	OnConflict  *OnConflictDef // For ON CONFLICT
 }
 
 // ForeignKeyDef represents FOREIGN KEY constraint
@@ -140,15 +153,17 @@ type UpdateStmt struct {
 	Updates   map[string]interface{}
 	Where     *WhereClause
 	Returning []SelectColumn
+	FromTable string // For join-based UPDATE ... FROM
 }
 
 func (s *UpdateStmt) StatementNode() {}
 
 // DeleteStmt represents DELETE
 type DeleteStmt struct {
-	TableName string
-	Where     *WhereClause
-	Returning []SelectColumn
+	TableName  string
+	Where      *WhereClause
+	Returning  []SelectColumn
+	UsingTable string // For join-based DELETE ... USING
 }
 
 func (s *DeleteStmt) StatementNode() {}
@@ -178,9 +193,18 @@ func (s *TruncateStmt) StatementNode() {}
 
 // AlterTableStmt represents ALTER TABLE
 type AlterTableStmt struct {
-	TableName string
-	Action    string // "ADD_COLUMN", "DROP_COLUMN", "ENABLE_RLS", "DISABLE_RLS"
-	Column    *ColumnDef
+	TableName            string
+	Action               string // "ADD_COLUMN", "DROP_COLUMN", "ENABLE_RLS", "DISABLE_RLS", "RENAME_TO", "RENAME_COLUMN", "ALTER_COLUMN_TYPE", "ADD_CONSTRAINT"
+	Column               *ColumnDef
+	DropColumn           string
+	RenameTo             string
+	RenameColumnFrom     string
+	RenameColumnTo       string
+	AlterColumnName      string
+	AlterColumnType      storage.DataType
+	AddConstraintName    string
+	AddConstraintUnique  []string
+	IfExists             bool
 }
 
 func (s *AlterTableStmt) StatementNode() {}
@@ -341,3 +365,82 @@ type DropRoleStmt struct {
 }
 
 func (s *DropRoleStmt) StatementNode() {}
+
+// CreateViewStmt represents CREATE VIEW
+type CreateViewStmt struct {
+	ViewName  string
+	Query     *SelectStmt
+	OrReplace bool
+}
+
+func (s *CreateViewStmt) StatementNode() {}
+
+// DropViewStmt represents DROP VIEW
+type DropViewStmt struct {
+	ViewName string
+	IfExists bool
+}
+
+func (s *DropViewStmt) StatementNode() {}
+
+// CreateSchemaStmt represents CREATE SCHEMA
+type CreateSchemaStmt struct {
+	SchemaName  string
+	IfNotExists bool
+}
+
+func (s *CreateSchemaStmt) StatementNode() {}
+
+// CreateSequenceStmt represents CREATE SEQUENCE
+type CreateSequenceStmt struct {
+	SequenceName string
+	Start        int
+	Increment    int
+	IfNotExists  bool
+}
+
+func (s *CreateSequenceStmt) StatementNode() {}
+
+// CreateTypeStmt represents CREATE TYPE ... AS ENUM (...)
+type CreateTypeStmt struct {
+	TypeName string
+	Values   []string
+}
+
+func (s *CreateTypeStmt) StatementNode() {}
+
+// CreateMaterializedViewStmt represents CREATE MATERIALIZED VIEW
+type CreateMaterializedViewStmt struct {
+	ViewName    string
+	Query       *SelectStmt
+	IfNotExists bool
+}
+
+func (s *CreateMaterializedViewStmt) StatementNode() {}
+
+// RefreshMaterializedViewStmt represents REFRESH MATERIALIZED VIEW
+type RefreshMaterializedViewStmt struct {
+	ViewName string
+}
+
+func (s *RefreshMaterializedViewStmt) StatementNode() {}
+
+// MergeStmt represents MERGE INTO
+type MergeStmt struct {
+	TargetTable    string
+	SourceTable    string
+	SourceQuery    *SelectStmt
+	OnCondition    *WhereClause
+	WhenMatched    []MergeAction
+	WhenNotMatched []MergeAction
+}
+
+func (s *MergeStmt) StatementNode() {}
+
+type MergeAction struct {
+	Action  string // "UPDATE", "INSERT", "DELETE", "DO NOTHING"
+	Updates map[string]interface{}
+	Columns []string
+	Values  []interface{}
+}
+
