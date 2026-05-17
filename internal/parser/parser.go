@@ -186,7 +186,7 @@ func (p *Parser) parseWithCTE() (Statement, error) {
 		if p.current.Type != TOKEN_SELECT {
 			return nil, fmt.Errorf("expected SELECT in CTE body")
 		}
-		cteQuery, err := p.parseSelect()
+		cteQuery, err := p.parseSelectOrCompound()
 		if err != nil {
 			return nil, err
 		}
@@ -765,6 +765,10 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		col.Type = storage.TypeBoolean
 		p.nextToken()
 
+	case "DATE", "TIMESTAMP":
+		col.Type = storage.TypeText
+		p.nextToken()
+
 	case "VECTOR":
 		col.Type = storage.TypeVector
 		col.Length = 0 // dimensions
@@ -1065,7 +1069,7 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	}
 
 	// Parse columns and aggregates
-	for p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF {
+	for p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_UNION && p.current.Type != TOKEN_INTERSECT && p.current.Type != TOKEN_EXCEPT && p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_SEMICOLON {
 		// Check for aggregate functions
 		if p.isAggregateFunction(p.current.Type) {
 			agg, err := p.parseAggregate()
@@ -1078,6 +1082,37 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			stmt.Columns = append(stmt.Columns, "*")
 			stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: "*"})
 			p.nextToken()
+		} else if p.current.Type == TOKEN_LPAREN {
+			// Could be a scalar subquery or parenthesized expression
+			p.nextToken()
+			if p.current.Type == TOKEN_SELECT {
+				subquery, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				if p.current.Type != TOKEN_RPAREN {
+					return nil, fmt.Errorf("expected ) after scalar subquery")
+				}
+				p.nextToken() // consume )
+
+				alias := ""
+				if p.current.Type == TOKEN_AS {
+					p.nextToken()
+					if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_STRING {
+						alias = p.current.Literal
+						p.nextToken()
+					}
+				} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_COMMA {
+					alias = p.current.Literal
+					p.nextToken()
+				}
+
+				stmt.Columns = append(stmt.Columns, alias)
+				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Subquery: subquery, Alias: alias})
+			} else {
+				// We don't support arbitrary parenthesized expressions here yet, so error out for now
+				return nil, fmt.Errorf("expected SELECT inside parenthesized expression in SELECT list")
+			}
 		} else if p.current.Type == TOKEN_CASE {
 			// Capture full CASE ... END expression
 			expr := "CASE "
@@ -1134,10 +1169,17 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 							args += "'" + p.current.Literal + "'"
 						} else if p.current.Type == TOKEN_COMMA {
 							args += ","
+						} else if p.current.Type == TOKEN_FROM {
+							// If it's EXTRACT(YEAR FROM date), replace FROM with a comma
+							if strings.ToUpper(name) == "EXTRACT" {
+								args += ","
+							} else {
+								args += " " + p.current.Literal + " "
+							}
 						} else if p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_RPAREN {
 							args += p.current.Literal
 						} else {
-							args += p.current.Literal
+							args += p.current.Literal + " "
 						}
 					}
 					p.nextToken()
@@ -1155,6 +1197,17 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 					}
 					winDef = w
 				}
+
+				// Handle potential cast: EXTRACT(YEAR FROM date)::INT
+				for p.current.Type == TOKEN_CAST {
+					p.nextToken() // consume ::
+					exprFull += "::"
+					for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+						exprFull += p.current.Literal
+						p.nextToken()
+					}
+				}
+
 				alias := ""
 				if p.current.Type == TOKEN_AS {
 					p.nextToken()
@@ -1188,6 +1241,15 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 						} else if p.current.Type == TOKEN_RPAREN {
 							depth--
 						}
+						p.nextToken()
+					}
+				}
+				// Handle potential cast: dotted_name::type
+				for p.current.Type == TOKEN_CAST {
+					p.nextToken() // consume ::
+					name += "::"
+					for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+						name += p.current.Literal
 						p.nextToken()
 					}
 				}
@@ -1227,6 +1289,15 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				stmt.Columns = append(stmt.Columns, alias)
 				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: expr, Alias: alias})
 			} else {
+				// Handle potential cast: plain_ident::type
+				for p.current.Type == TOKEN_CAST {
+					p.nextToken() // consume ::
+					name += "::"
+					for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+						name += p.current.Literal
+						p.nextToken()
+					}
+				}
 				alias := ""
 				if p.current.Type == TOKEN_AS {
 					p.nextToken()
@@ -1246,6 +1317,17 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			// Bare string literal e.g. ''
 			expr := "'" + p.current.Literal + "'"
 			p.nextToken()
+
+			// Handle potential cast: '2023-01-01'::DATE
+			for p.current.Type == TOKEN_CAST {
+				p.nextToken() // consume ::
+				expr += "::"
+				for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+					expr += p.current.Literal
+					p.nextToken()
+				}
+			}
+
 			alias := expr
 			if p.current.Type == TOKEN_AS {
 				p.nextToken()
@@ -1326,8 +1408,10 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			// Handle potential cast: false::pg_catalog.bool
 			for p.current.Type == TOKEN_CAST {
 				p.nextToken() // consume ::
+				expr += "::"
 				// Consume type name (may be dotted)
 				for p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_DOT {
+					expr += p.current.Literal
 					p.nextToken()
 				}
 			}
@@ -1350,129 +1434,90 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			p.nextToken()
 		}
 	}
-
-	if p.current.Type != TOKEN_FROM {
-		return nil, fmt.Errorf("expected FROM")
-	}
-	p.nextToken()
-
-	if p.current.Type != TOKEN_IDENT {
-		return nil, fmt.Errorf("expected table name")
-	}
-
-	stmt.TableName = p.current.Literal
-	p.nextToken()
-
-	// Handle schema-qualified table names (e.g. pg_catalog.pg_class)
-	for p.current.Type == TOKEN_DOT {
+	if p.current.Type == TOKEN_FROM {
 		p.nextToken()
+
 		if p.current.Type != TOKEN_IDENT {
-			return nil, fmt.Errorf("expected table name after dot")
+			return nil, fmt.Errorf("expected table name")
 		}
-		stmt.TableName += "." + p.current.Literal
-		p.nextToken()
-	}
 
-	// Check for table alias (AS alias or just alias)
-	if p.current.Type == TOKEN_AS {
+		stmt.TableName = p.current.Literal
 		p.nextToken()
-		if p.current.Type != TOKEN_IDENT {
-			return nil, fmt.Errorf("expected alias after AS")
-		}
-		stmt.TableAlias = p.current.Literal
-		p.nextToken()
-	} else if p.current.Type == TOKEN_IDENT &&
-		p.current.Type != TOKEN_INNER &&
-		p.current.Type != TOKEN_LEFT &&
-		p.current.Type != TOKEN_RIGHT &&
-		p.current.Type != TOKEN_FULL &&
-		p.current.Type != TOKEN_CROSS &&
-		p.current.Type != TOKEN_WHERE &&
-		p.current.Type != TOKEN_ORDER &&
-		p.current.Type != TOKEN_GROUP &&
-		p.current.Type != TOKEN_LIMIT {
-		// Implicit alias (no AS keyword)
-		stmt.TableAlias = p.current.Literal
-		p.nextToken()
-	}
 
-	// Parse optional table alias: FROM documents d or FROM documents AS d
-	switch p.current.Type {
-	case TOKEN_AS:
-		p.nextToken()
-		if p.current.Type != TOKEN_IDENT {
-			return nil, fmt.Errorf("expected alias after AS")
+		// Handle schema-qualified table names (e.g. pg_catalog.pg_class)
+		for p.current.Type == TOKEN_DOT {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected table name after dot")
+			}
+			stmt.TableName += "." + p.current.Literal
+			p.nextToken()
 		}
-		stmt.TableAlias = p.current.Literal
-		p.nextToken()
-	case TOKEN_IDENT:
-		// Check if this is an implicit alias (not a keyword)
-		keyword := strings.ToUpper(p.current.Literal)
-		if keyword != "INNER" && keyword != "LEFT" && keyword != "RIGHT" &&
-			keyword != "FULL" && keyword != "CROSS" && keyword != "JOIN" &&
-			keyword != "WHERE" && keyword != "GROUP" && keyword != "ORDER" &&
-			keyword != "LIMIT" && keyword != "OFFSET" && keyword != "HAVING" {
+
+		// Check for table alias (AS alias or just alias)
+		if p.current.Type == TOKEN_AS {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected alias after AS")
+			}
+			stmt.TableAlias = p.current.Literal
+			p.nextToken()
+		} else if p.current.Type == TOKEN_IDENT && p.current.Type != TOKEN_WHERE && p.current.Type != TOKEN_GROUP && p.current.Type != TOKEN_ORDER && p.current.Type != TOKEN_LIMIT && p.current.Type != TOKEN_OFFSET && p.current.Type != TOKEN_UNION && p.current.Type != TOKEN_INTERSECT && p.current.Type != TOKEN_EXCEPT && p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_SEMICOLON {
 			stmt.TableAlias = p.current.Literal
 			p.nextToken()
 		}
-	}
 
-	// Check for TABLESAMPLE
-	if p.current.Type == TOKEN_TABLESAMPLE {
-		p.nextToken()
-		// Expect method name (BERNOULLI, SYSTEM)
-		if p.current.Type == TOKEN_IDENT {
+		// Parse table sampling: TABLESAMPLE BERNOULLI (10)
+		if p.current.Type == TOKEN_TABLESAMPLE {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected tablesample method")
+			}
 			stmt.TableSampleMethod = strings.ToUpper(p.current.Literal)
 			p.nextToken()
-		}
-		if p.current.Type == TOKEN_LPAREN {
-			p.nextToken()
-			if p.current.Type == TOKEN_NUMBER {
-				pct, _ := strconv.ParseFloat(p.current.Literal, 64)
-				stmt.TableSamplePercent = pct
-				p.nextToken()
-			}
-			if p.current.Type == TOKEN_RPAREN {
-				p.nextToken()
-			}
-		}
-	}
-
-	// Parse JOINs
-	for {
-		joinType := ""
-
-		// Check for join type keywords
-		if p.current.Type == TOKEN_INNER || p.current.Type == TOKEN_LEFT ||
-			p.current.Type == TOKEN_RIGHT || p.current.Type == TOKEN_FULL ||
-			p.current.Type == TOKEN_CROSS {
-			joinType = strings.ToUpper(p.current.Literal)
-			p.nextToken()
-
-			// Handle FULL OUTER JOIN
-			if joinType == "FULL" && p.current.Type == TOKEN_OUTER {
-				p.nextToken()
-			}
-			// Handle LEFT OUTER JOIN, RIGHT OUTER JOIN
-			if (joinType == "LEFT" || joinType == "RIGHT") && p.current.Type == TOKEN_OUTER {
-				p.nextToken()
-			}
-		}
-
-		// Check for JOIN keyword
-		if p.current.Type == TOKEN_JOIN {
-			if joinType == "" {
-				joinType = "INNER" // Default to INNER JOIN
+			if p.current.Type != TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected ( after tablesample method")
 			}
 			p.nextToken()
-
-			join, err := p.parseJoin(joinType)
-			if err != nil {
-				return nil, err
+			if p.current.Type != TOKEN_NUMBER {
+				return nil, fmt.Errorf("expected percentage number in tablesample")
 			}
-			stmt.Joins = append(stmt.Joins, join)
-		} else {
-			break
+			percent, _ := strconv.ParseFloat(p.current.Literal, 64)
+			stmt.TableSamplePercent = percent
+			p.nextToken()
+			if p.current.Type != TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected ) after tablesample percent")
+			}
+			p.nextToken()
+		}
+
+		// Parse JOIN clauses
+		for {
+			joinType := ""
+			if p.current.Type == TOKEN_LEFT || p.current.Type == TOKEN_RIGHT || p.current.Type == TOKEN_INNER || p.current.Type == TOKEN_CROSS || p.current.Type == TOKEN_FULL {
+				joinType = strings.ToUpper(p.current.Literal)
+				p.nextToken()
+				if p.current.Type == TOKEN_OUTER {
+					joinType += " OUTER"
+					p.nextToken()
+				}
+			}
+
+			// Check for JOIN keyword
+			if p.current.Type == TOKEN_JOIN {
+				if joinType == "" {
+					joinType = "INNER" // Default to INNER JOIN
+				}
+				p.nextToken()
+
+				join, err := p.parseJoin(joinType)
+				if err != nil {
+					return nil, err
+				}
+				stmt.Joins = append(stmt.Joins, join)
+			} else {
+				break
+			}
 		}
 	}
 
@@ -2039,6 +2084,17 @@ func (p *Parser) parseLiteralValue() (interface{}, error) {
 			}
 			return val, nil
 		}
+		p.nextToken()
+		// Support dotted identifiers: table.col or schema.table.col
+		for p.current.Type == TOKEN_DOT {
+			p.nextToken() // consume dot
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected identifier after dot in literal value")
+			}
+			val = val.(string) + "." + p.current.Literal
+			p.nextToken()
+		}
+		return val, nil
 	case TOKEN_NULL:
 		val = nil
 	default:
@@ -2332,21 +2388,44 @@ func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
 func (p *Parser) parseJoin(joinType string) (JoinClause, error) {
 	join := JoinClause{Type: joinType}
 
-	// Parse table name
-	if p.current.Type != TOKEN_IDENT {
-		return join, fmt.Errorf("expected table name")
+	if p.current.Type == TOKEN_LATERAL {
+		join.Lateral = true
+		p.nextToken()
 	}
-	join.Table = p.current.Literal
-	p.nextToken()
 
-	// Handle schema-qualified table names (e.g. pg_catalog.pg_namespace)
-	for p.current.Type == TOKEN_DOT {
+	if p.current.Type == TOKEN_LPAREN {
+		// Subquery join
 		p.nextToken()
-		if p.current.Type != TOKEN_IDENT {
-			return join, fmt.Errorf("expected table name after dot in JOIN")
+		if p.current.Type != TOKEN_SELECT {
+			return join, fmt.Errorf("expected SELECT inside join subquery")
 		}
-		join.Table += "." + p.current.Literal
+		subquery, err := p.parseSelect()
+		if err != nil {
+			return join, err
+		}
+		if p.current.Type != TOKEN_RPAREN {
+			return join, fmt.Errorf("expected ) after join subquery")
+		}
+		p.nextToken() // consume )
+		
+		join.Subquery = subquery
+	} else {
+		// Parse table name
+		if p.current.Type != TOKEN_IDENT {
+			return join, fmt.Errorf("expected table name")
+		}
+		join.Table = p.current.Literal
 		p.nextToken()
+
+		// Handle schema-qualified table names (e.g. pg_catalog.pg_namespace)
+		for p.current.Type == TOKEN_DOT {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return join, fmt.Errorf("expected table name after dot in JOIN")
+			}
+			join.Table += "." + p.current.Literal
+			p.nextToken()
+		}
 	}
 
 	// Optional alias
