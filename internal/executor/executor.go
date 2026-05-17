@@ -103,6 +103,22 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return &Result{Message: s.Command}, nil
 	case *parser.DropRoleStmt:
 		return e.executeDropRole(s)
+	case *parser.CreateViewStmt:
+		return e.executeCreateView(s)
+	case *parser.DropViewStmt:
+		return e.executeDropView(s)
+	case *parser.CreateSchemaStmt:
+		return e.executeCreateSchema(s)
+	case *parser.CreateSequenceStmt:
+		return e.executeCreateSequence(s)
+	case *parser.CreateTypeStmt:
+		return e.executeCreateType(s)
+	case *parser.CreateMaterializedViewStmt:
+		return e.executeCreateMaterializedView(s)
+	case *parser.RefreshMaterializedViewStmt:
+		return e.executeRefreshMaterializedView(s)
+	case *parser.MergeStmt:
+		return e.executeMerge(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -262,11 +278,15 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	columns := make([]storage.Column, len(stmt.Columns))
 	for i, colDef := range stmt.Columns {
 		col := storage.Column{
-			Name:      colDef.Name,
-			Type:      colDef.Type,
-			Length:    colDef.Length,
-			Nullable:  colDef.Nullable,
-			IsPrimary: colDef.IsPrimary,
+			Name:        colDef.Name,
+			Type:        colDef.Type,
+			Length:      colDef.Length,
+			Nullable:    colDef.Nullable,
+			IsPrimary:   colDef.IsPrimary,
+			IsUnique:    colDef.IsUnique,
+			DefaultVal:  colDef.DefaultVal,
+			DefaultExpr: colDef.DefaultExpr,
+			CheckExpr:   colDef.CheckExpr,
 		}
 
 		// Add foreign key if specified
@@ -320,52 +340,175 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	for _, values := range stmt.Values {
-		row := make(storage.Row)
-
-		colNames := stmt.Columns
-		if len(colNames) == 0 {
-			colNames = table.GetColumnNames()
+	var sourceRows []storage.Row
+	if stmt.SelectQuery != nil {
+		selectRes, err := e.executeSelect(stmt.SelectQuery)
+		if err != nil {
+			return nil, err
 		}
 
-		if len(colNames) != len(values) {
-			return nil, fmt.Errorf("column count mismatch")
+		targetCols := stmt.Columns
+		if len(targetCols) == 0 {
+			targetCols = table.GetColumnNames()
 		}
 
-		for i, colName := range colNames {
-			val := values[i]
+		for _, sRow := range selectRes.Rows {
+			row := make(storage.Row)
+			for idx, colName := range targetCols {
+				if idx < len(selectRes.Columns) {
+					selectCol := selectRes.Columns[idx]
+					row[colName] = sRow[selectCol]
+				}
+			}
+			sourceRows = append(sourceRows, row)
+		}
+	} else {
+		for _, values := range stmt.Values {
+			row := make(storage.Row)
+			colNames := stmt.Columns
+			if len(colNames) == 0 {
+				colNames = table.GetColumnNames()
+			}
+			if len(colNames) != len(values) {
+				return nil, fmt.Errorf("column count mismatch")
+			}
+			for i, colName := range colNames {
+				row[colName] = values[i]
+			}
+			sourceRows = append(sourceRows, row)
+		}
+	}
 
-			// Find column definition
-			var colDef storage.Column
-			for _, col := range table.Columns {
-				if col.Name == colName {
-					colDef = col
+	insertedCount := 0
+	var lastInsertedRows []storage.Row
+
+	for _, row := range sourceRows {
+		// Fill in missing columns with defaults or sequence values
+		for _, col := range table.Columns {
+			if _, exists := row[col.Name]; !exists || row[col.Name] == nil {
+				var defaultVal interface{}
+				exprUpper := strings.ToUpper(col.DefaultExpr)
+				if exprUpper == "NOW()" || exprUpper == "CURRENT_TIMESTAMP" || exprUpper == "NOW" {
+					defaultVal = "2026-05-17 15:00:00"
+				} else if col.DefaultExpr == "nextval" || strings.HasPrefix(exprUpper, "NEXTVAL") {
+					seqName := col.DefaultExpr
+					if strings.Contains(seqName, "'") || strings.Contains(seqName, "\"") {
+						seqName = strings.TrimPrefix(seqName, "nextval('")
+						seqName = strings.TrimPrefix(seqName, "nextval(\"")
+						seqName = strings.TrimSuffix(seqName, "')")
+						seqName = strings.TrimSuffix(seqName, "\")")
+						seqName = strings.TrimSuffix(seqName, ")")
+						seqName = strings.TrimSpace(seqName)
+					} else {
+						seqName = table.Name + "_" + col.Name + "_seq"
+					}
+
+					seqKey := dbInstance.Name + "." + seqName
+					state, hasSeq := sequenceRegistry[seqKey]
+					if !hasSeq {
+						state = &SequenceState{Current: 1, Start: 1, Increment: 1}
+						sequenceRegistry[seqKey] = state
+					}
+					val := state.Current
+					state.Current += state.Increment
+					defaultVal = val
+				} else if col.DefaultExpr != "" {
+					if strings.HasPrefix(col.DefaultExpr, "'") && strings.HasSuffix(col.DefaultExpr, "'") {
+						defaultVal = strings.Trim(col.DefaultExpr, "'")
+					} else if strings.HasPrefix(col.DefaultExpr, "\"") && strings.HasSuffix(col.DefaultExpr, "\"") {
+						defaultVal = strings.Trim(col.DefaultExpr, "\"")
+					} else if iv, err := strconv.Atoi(col.DefaultExpr); err == nil {
+						defaultVal = iv
+					} else if fv, err := strconv.ParseFloat(col.DefaultExpr, 64); err == nil {
+						defaultVal = fv
+					} else if col.DefaultExpr == "NULL" || col.DefaultExpr == "null" {
+						defaultVal = nil
+					} else {
+						defaultVal = col.DefaultExpr
+					}
+				}
+				row[col.Name] = defaultVal
+			}
+		}
+
+		// Check for conflict
+		hasConflict := false
+		var conflictingRow storage.Row
+		var conflictingIdx = -1
+
+		if stmt.OnConflict != nil {
+			for i, r := range table.Rows {
+				match := false
+				if stmt.OnConflict.TargetColumn != "" {
+					if compareValues(r[stmt.OnConflict.TargetColumn], row[stmt.OnConflict.TargetColumn]) == 0 {
+						match = true
+					}
+				} else {
+					for _, col := range table.Columns {
+						if col.IsPrimary || col.IsUnique {
+							if compareValues(r[col.Name], row[col.Name]) == 0 {
+								match = true
+								break
+							}
+						}
+					}
+				}
+				if match {
+					hasConflict = true
+					conflictingRow = r
+					conflictingIdx = i
 					break
 				}
 			}
+		}
 
-			// Check VARCHAR length
-			if colDef.Type == storage.TypeVarChar && colDef.Length > 0 {
+		if hasConflict {
+			if stmt.OnConflict.DoNothing {
+				continue
+			} else if stmt.OnConflict.DoUpdate {
+				for k, v := range stmt.OnConflict.Updates {
+					finalVal := v
+					if sVal, ok := v.(string); ok && strings.HasPrefix(strings.ToUpper(sVal), "EXCLUDED.") {
+						targetExCol := strings.TrimPrefix(sVal, "EXCLUDED.")
+						for exCol := range row {
+							if strings.EqualFold(exCol, targetExCol) {
+								finalVal = row[exCol]
+								break
+							}
+						}
+					}
+					conflictingRow[k] = finalVal
+				}
+				table.Rows[conflictingIdx] = conflictingRow
+				insertedCount++
+				lastInsertedRows = append(lastInsertedRows, conflictingRow)
+				continue
+			}
+		}
+
+		// Normal validation and insert
+		for _, col := range table.Columns {
+			val := row[col.Name]
+
+			if col.Type == storage.TypeVarChar && col.Length > 0 {
 				if strVal, ok := val.(string); ok {
-					if len(strVal) > colDef.Length {
+					if len(strVal) > col.Length {
 						return nil, fmt.Errorf("value too long for column %s (max %d, got %d)",
-							colName, colDef.Length, len(strVal))
+							col.Name, col.Length, len(strVal))
 					}
 				}
 			}
 
-			// Parse vector if needed
-			if colDef.Type == storage.TypeVector {
+			if col.Type == storage.TypeVector {
 				if strVal, ok := val.(string); ok {
 					vec, err := storage.ParseVector(strVal)
 					if err != nil {
-						return nil, fmt.Errorf("invalid vector format for column %s: %w", colName, err)
+						return nil, fmt.Errorf("invalid vector format for column %s: %w", col.Name, err)
 					}
 					val = vec
 				}
 			}
-
-			row[colName] = val
+			row[col.Name] = val
 		}
 
 		// Validate NOT NULL constraints
@@ -426,6 +569,8 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		if err := table.Insert(row); err != nil {
 			return nil, err
 		}
+		insertedCount++
+		lastInsertedRows = append(lastInsertedRows, row)
 	}
 
 	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
@@ -434,18 +579,11 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 
 	// Handle RETURNING
 	if len(stmt.Returning) > 0 {
-		// Get last inserted rows — re-read the table and take the last N rows
-		allRows, _ := table.Select([]string{"*"}, nil)
-		n := len(stmt.Values)
-		if n > len(allRows) {
-			n = len(allRows)
-		}
-		returnedRows := allRows[len(allRows)-n:]
-		return e.projectReturning(returnedRows, stmt.Returning, table), nil
+		return e.projectReturning(lastInsertedRows, stmt.Returning, table), nil
 	}
 
 	return &Result{
-		Message: fmt.Sprintf("INSERT 0 %d", len(stmt.Values)),
+		Message: fmt.Sprintf("INSERT 0 %d", insertedCount),
 	}, nil
 }
 
@@ -491,10 +629,22 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				return nil, err
 			}
 
-			var exists bool
-			table, exists = dbInstance.GetTable(stmt.TableName)
-			if !exists {
-				return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+			// Check if it's a virtual view
+			dbName := dbInstance.Name
+			viewKey := dbName + "." + stmt.TableName
+			if viewQuery, isView := viewRegistry[viewKey]; isView {
+				res, err := e.executeSelect(viewQuery)
+				if err != nil {
+					return nil, err
+				}
+				rows = res.Rows
+				columns = res.Columns
+			} else {
+				var exists bool
+				table, exists = dbInstance.GetTable(stmt.TableName)
+				if !exists {
+					return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+				}
 			}
 		}
 	}
@@ -847,6 +997,24 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					for _, join := range stmt.Joins {
 						joinTable, ok := dbInstance.GetTable(join.Table)
 						if !ok {
+							viewKey := dbInstance.Name + "." + join.Table
+							if viewQuery, isView := viewRegistry[viewKey]; isView {
+								res, err := e.executeSelect(viewQuery)
+								if err == nil {
+									var cols []storage.Column
+									for _, colName := range res.Columns {
+										cols = append(cols, storage.Column{Name: colName, Type: storage.TypeText, Nullable: true})
+									}
+									joinTable = &storage.Table{
+										Name: join.Table,
+										Columns: cols,
+										Rows: res.Rows,
+									}
+									ok = true
+								}
+							}
+						}
+						if !ok {
 							continue
 						}
 						for _, col := range joinTable.GetColumnNames() {
@@ -952,6 +1120,24 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 			resultRows = mergedResultRows
 		} else {
 			rightTable, exists := dbInstance.GetTable(join.Table)
+			if !exists {
+				viewKey := dbInstance.Name + "." + join.Table
+				if viewQuery, isView := viewRegistry[viewKey]; isView {
+					res, err := e.executeSelect(viewQuery)
+					if err == nil {
+						var cols []storage.Column
+						for _, colName := range res.Columns {
+							cols = append(cols, storage.Column{Name: colName, Type: storage.TypeText, Nullable: true})
+						}
+						rightTable = &storage.Table{
+							Name: join.Table,
+							Columns: cols,
+							Rows: res.Rows,
+						}
+						exists = true
+					}
+				}
+			}
 			if !exists {
 				// Check if it's a CTE
 				if cteRes, ok := e.cteResults[join.Table]; ok {
@@ -1583,6 +1769,67 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		where = e.convertWhereClauseWithSubquery(stmt.Where)
 	}
 
+	if stmt.FromTable != "" {
+		fromTable, ok := dbInstance.GetTable(stmt.FromTable)
+		if !ok {
+			return nil, fmt.Errorf("table %s does not exist", stmt.FromTable)
+		}
+
+		updatedCount := 0
+		var updatedRows []storage.Row
+		for idx, targetRow := range table.Rows {
+			var matchedFromRow storage.Row
+			for _, fromRow := range fromTable.Rows {
+				combined := make(storage.Row)
+				for k, v := range targetRow {
+					combined[k] = v
+					combined[stmt.TableName+"."+k] = v
+				}
+				for k, v := range fromRow {
+					combined[k] = v
+					combined[stmt.FromTable+"."+k] = v
+				}
+
+				if e.evaluateWhereOnRow(combined, where) {
+					matchedFromRow = fromRow
+					break
+				}
+			}
+
+			if matchedFromRow != nil {
+				for colName, vExpr := range stmt.Updates {
+					finalVal := vExpr
+					if sVal, ok := vExpr.(string); ok {
+						if val, exists := matchedFromRow[sVal]; exists {
+							finalVal = val
+						} else if val, exists := matchedFromRow[strings.TrimPrefix(sVal, stmt.FromTable+".")]; exists {
+							finalVal = val
+						} else if val, exists := targetRow[sVal]; exists {
+							finalVal = val
+						} else if val, exists := targetRow[strings.TrimPrefix(sVal, stmt.TableName+".")]; exists {
+							finalVal = val
+						}
+					}
+					table.Rows[idx][colName] = finalVal
+				}
+				updatedCount++
+				updatedRows = append(updatedRows, table.Rows[idx])
+			}
+		}
+
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+
+		if len(stmt.Returning) > 0 {
+			return e.projectReturning(updatedRows, stmt.Returning, table), nil
+		}
+
+		return &Result{
+			Message: fmt.Sprintf("UPDATE %d row(s)", updatedCount),
+		}, nil
+	}
+
 	count, err := table.Update(stmt.Updates, where)
 	if err != nil {
 		return nil, err
@@ -1592,7 +1839,6 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
-	// Handle RETURNING
 	if len(stmt.Returning) > 0 {
 		allRows, _ := table.Select([]string{"*"}, where)
 		return e.projectReturning(allRows, stmt.Returning, table), nil
@@ -1619,7 +1865,58 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		where = e.convertWhereClauseWithSubquery(stmt.Where)
 	}
 
-	// For RETURNING, capture matching rows before deletion
+	if stmt.UsingTable != "" {
+		usingTable, ok := dbInstance.GetTable(stmt.UsingTable)
+		if !ok {
+			return nil, fmt.Errorf("table %s does not exist", stmt.UsingTable)
+		}
+
+		var newRows []storage.Row
+		deletedCount := 0
+		var deletedRows []storage.Row
+
+		for _, targetRow := range table.Rows {
+			matched := false
+			for _, usingRow := range usingTable.Rows {
+				combined := make(storage.Row)
+				for k, v := range targetRow {
+					combined[k] = v
+					combined[stmt.TableName+"."+k] = v
+				}
+				for k, v := range usingRow {
+					combined[k] = v
+					combined[stmt.UsingTable+"."+k] = v
+				}
+
+				if e.evaluateWhereOnRow(combined, where) {
+					matched = true
+					break
+				}
+			}
+
+			if matched {
+				deletedCount++
+				deletedRows = append(deletedRows, targetRow)
+			} else {
+				newRows = append(newRows, targetRow)
+			}
+		}
+
+		table.Rows = newRows
+
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+
+		if len(stmt.Returning) > 0 {
+			return e.projectReturning(deletedRows, stmt.Returning, table), nil
+		}
+
+		return &Result{
+			Message: fmt.Sprintf("DELETE %d row(s)", deletedCount),
+		}, nil
+	}
+
 	var deletedRows []storage.Row
 	if len(stmt.Returning) > 0 {
 		deletedRows, _ = table.Select([]string{"*"}, where)
@@ -1634,7 +1931,6 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
-	// Handle RETURNING
 	if len(stmt.Returning) > 0 {
 		return e.projectReturning(deletedRows, stmt.Returning, table), nil
 	}
@@ -1735,6 +2031,69 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		return &Result{
 			Message: fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", stmt.TableName, stmt.Column.Name),
 		}, nil
+	}
+
+	if stmt.Action == "RENAME_TO" {
+		oldName := table.Name
+		newName := stmt.RenameTo
+		table.Name = newName
+		
+		dbInstance.DeleteTable(oldName)
+		dbInstance.SetTable(newName, table)
+		
+		oldPath := filepath.Join(dbInstance.BasePath, "tables", oldName+".tbl")
+		os.Remove(oldPath)
+
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME TO %s", oldName, newName)}, nil
+	}
+
+	if stmt.Action == "DROP_COLUMN" {
+		if err := table.DropColumn(stmt.DropColumn, stmt.IfExists); err != nil {
+			return nil, err
+		}
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", stmt.TableName, stmt.DropColumn)}, nil
+	}
+
+	if stmt.Action == "RENAME_COLUMN" {
+		if err := table.RenameColumn(stmt.RenameColumnFrom, stmt.RenameColumnTo); err != nil {
+			return nil, err
+		}
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", stmt.TableName, stmt.RenameColumnFrom, stmt.RenameColumnTo)}, nil
+	}
+
+	if stmt.Action == "ALTER_COLUMN_TYPE" {
+		if err := table.AlterColumnType(stmt.AlterColumnName, stmt.AlterColumnType); err != nil {
+			return nil, err
+		}
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %d", stmt.TableName, stmt.AlterColumnName, stmt.AlterColumnType)}, nil
+	}
+
+	if stmt.Action == "ADD_CONSTRAINT" {
+		if len(stmt.AddConstraintUnique) > 0 {
+			for _, colName := range stmt.AddConstraintUnique {
+				for i, col := range table.Columns {
+					if col.Name == colName {
+						table.Columns[i].IsUnique = true
+					}
+				}
+			}
+		}
+		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+			return nil, fmt.Errorf("failed to persist table: %w", err)
+		}
+		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT", stmt.TableName)}, nil
 	}
 
 	if stmt.Action == "ENABLE_RLS" {
@@ -2827,4 +3186,332 @@ func (e *Executor) applySelectOnRows(stmt *parser.SelectStmt, rows []storage.Row
 // when CTE resolution calls back into the executor. The original function handles non-CTE queries.
 func (e *Executor) executeSelectCore(stmt *parser.SelectStmt) (*Result, error) {
 	return e.executeSelect(stmt)
+}
+
+var (
+	viewRegistry             = make(map[string]*parser.SelectStmt)
+	viewList                 = make(map[string][]string)
+	materializedViewRegistry = make(map[string]*parser.SelectStmt)
+	schemaRegistry           = make(map[string]bool)
+	sequenceRegistry         = make(map[string]*SequenceState)
+	typeRegistry             = make(map[string][]string)
+)
+
+type SequenceState struct {
+	Current   int
+	Start     int
+	Increment int
+}
+
+func ResetRegistries() {
+	viewRegistry = make(map[string]*parser.SelectStmt)
+	viewList = make(map[string][]string)
+	materializedViewRegistry = make(map[string]*parser.SelectStmt)
+	schemaRegistry = make(map[string]bool)
+	sequenceRegistry = make(map[string]*SequenceState)
+	typeRegistry = make(map[string][]string)
+}
+
+func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	viewKey := dbName + "." + stmt.ViewName
+
+	if !stmt.OrReplace {
+		if _, exists := viewRegistry[viewKey]; exists {
+			return nil, fmt.Errorf("view %s already exists", stmt.ViewName)
+		}
+	}
+
+	viewRegistry[viewKey] = stmt.Query
+	viewList[dbName] = append(viewList[dbName], stmt.ViewName)
+
+	return &Result{Message: "CREATE VIEW"}, nil
+}
+
+func (e *Executor) executeDropView(stmt *parser.DropViewStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	viewKey := dbName + "." + stmt.ViewName
+
+	if _, exists := viewRegistry[viewKey]; !exists {
+		if stmt.IfExists {
+			return &Result{Message: "DROP VIEW"}, nil
+		}
+		return nil, fmt.Errorf("view %s does not exist", stmt.ViewName)
+	}
+
+	delete(viewRegistry, viewKey)
+
+	list := viewList[dbName]
+	for i, v := range list {
+		if v == stmt.ViewName {
+			viewList[dbName] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+
+	return &Result{Message: "DROP VIEW"}, nil
+}
+
+func (e *Executor) executeCreateSchema(stmt *parser.CreateSchemaStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	schemaKey := dbName + "." + stmt.SchemaName
+
+	if schemaRegistry[schemaKey] {
+		if stmt.IfNotExists {
+			return &Result{Message: "CREATE SCHEMA"}, nil
+		}
+		return nil, fmt.Errorf("schema %s already exists", stmt.SchemaName)
+	}
+
+	schemaRegistry[schemaKey] = true
+	return &Result{Message: "CREATE SCHEMA"}, nil
+}
+
+func (e *Executor) executeCreateSequence(stmt *parser.CreateSequenceStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	seqKey := dbName + "." + stmt.SequenceName
+
+	if _, exists := sequenceRegistry[seqKey]; exists {
+		if stmt.IfNotExists {
+			return &Result{Message: "CREATE SEQUENCE"}, nil
+		}
+		return nil, fmt.Errorf("sequence %s already exists", stmt.SequenceName)
+	}
+
+	sequenceRegistry[seqKey] = &SequenceState{
+		Current:   stmt.Start,
+		Start:     stmt.Start,
+		Increment: stmt.Increment,
+	}
+
+	return &Result{Message: "CREATE SEQUENCE"}, nil
+}
+
+func (e *Executor) executeCreateType(stmt *parser.CreateTypeStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	typeKey := dbName + "." + stmt.TypeName
+
+	if _, exists := typeRegistry[typeKey]; exists {
+		return nil, fmt.Errorf("type %s already exists", stmt.TypeName)
+	}
+
+	typeRegistry[typeKey] = stmt.Values
+	return &Result{Message: "CREATE TYPE"}, nil
+}
+
+func (e *Executor) executeCreateMaterializedView(stmt *parser.CreateMaterializedViewStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	mvKey := dbName + "." + stmt.ViewName
+
+	if _, exists := dbInstance.GetTable(stmt.ViewName); exists {
+		if stmt.IfNotExists {
+			return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
+		}
+		return nil, fmt.Errorf("materialized view %s already exists", stmt.ViewName)
+	}
+
+	res, err := e.executeSelect(stmt.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	var cols []storage.Column
+	for _, colName := range res.Columns {
+		cols = append(cols, storage.Column{
+			Name:     colName,
+			Type:     storage.TypeText,
+			Nullable: true,
+		})
+	}
+
+	table := storage.NewTable(stmt.ViewName, e.session.GetUser(), cols, nil)
+	for _, row := range res.Rows {
+		table.Insert(row)
+	}
+
+	dbInstance.SetTable(stmt.ViewName, table)
+	materializedViewRegistry[mvKey] = stmt.Query
+
+	e.db.SaveTableToDisk(dbInstance, table)
+
+	return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
+}
+
+func (e *Executor) executeRefreshMaterializedView(stmt *parser.RefreshMaterializedViewStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := dbInstance.Name
+	mvKey := dbName + "." + stmt.ViewName
+
+	query, exists := materializedViewRegistry[mvKey]
+	if !exists {
+		return nil, fmt.Errorf("materialized view %s does not exist", stmt.ViewName)
+	}
+
+	table, ok := dbInstance.GetTable(stmt.ViewName)
+	if !ok {
+		return nil, fmt.Errorf("materialized view physical table %s not found", stmt.ViewName)
+	}
+
+	res, err := e.executeSelect(query)
+	if err != nil {
+		return nil, err
+	}
+
+	table.Truncate()
+	for _, row := range res.Rows {
+		table.Insert(row)
+	}
+
+	e.db.SaveTableToDisk(dbInstance, table)
+
+	return &Result{Message: "REFRESH MATERIALIZED VIEW"}, nil
+}
+
+func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+
+	targetTable, exists := dbInstance.GetTable(stmt.TargetTable)
+	if !exists {
+		return nil, fmt.Errorf("target table %s does not exist", stmt.TargetTable)
+	}
+
+	var sourceRows []storage.Row
+	if stmt.SourceQuery != nil {
+		res, err := e.executeSelect(stmt.SourceQuery)
+		if err != nil {
+			return nil, err
+		}
+		sourceRows = res.Rows
+	} else {
+		srcTab, ok := dbInstance.GetTable(stmt.SourceTable)
+		if !ok {
+			return nil, fmt.Errorf("source table %s does not exist", stmt.SourceTable)
+		}
+		sourceRows = srcTab.Rows
+	}
+
+	var onCond *storage.WhereClause
+	if stmt.OnCondition != nil {
+		onCond = e.convertWhereClauseWithSubquery(stmt.OnCondition)
+	}
+
+	matchedCount := 0
+	notMatchedCount := 0
+
+	for _, sourceRow := range sourceRows {
+		matchedIdx := -1
+		for idx, targetRow := range targetTable.Rows {
+			combined := make(storage.Row)
+			for k, v := range targetRow {
+				combined[k] = v
+				combined[stmt.TargetTable+"."+k] = v
+			}
+			for k, v := range sourceRow {
+				combined[k] = v
+				combined[stmt.SourceTable+"."+k] = v
+			}
+
+			if e.evaluateWhereOnRow(combined, onCond) {
+				matchedIdx = idx
+				break
+			}
+		}
+
+		if matchedIdx != -1 {
+			for _, action := range stmt.WhenMatched {
+				if action.Action == "UPDATE" {
+					targetRow := targetTable.Rows[matchedIdx]
+					for k, v := range action.Updates {
+						finalVal := v
+						if sVal, ok := v.(string); ok {
+							if val, exists := sourceRow[sVal]; exists {
+								finalVal = val
+							} else if val, exists := sourceRow[strings.TrimPrefix(sVal, stmt.SourceTable+".")]; exists {
+								finalVal = val
+							} else if val, exists := targetRow[sVal]; exists {
+								finalVal = val
+							} else if val, exists := targetRow[strings.TrimPrefix(sVal, stmt.TargetTable+".")]; exists {
+								finalVal = val
+							}
+						}
+						targetRow[k] = finalVal
+					}
+					targetTable.Rows[matchedIdx] = targetRow
+					matchedCount++
+				} else if action.Action == "DELETE" {
+					targetTable.Rows = append(targetTable.Rows[:matchedIdx], targetTable.Rows[matchedIdx+1:]...)
+					matchedCount++
+				}
+			}
+		} else {
+			for _, action := range stmt.WhenNotMatched {
+				if action.Action == "INSERT" {
+					newRow := make(storage.Row)
+					for _, col := range targetTable.Columns {
+						newRow[col.Name] = nil
+					}
+
+					for idx, colName := range action.Columns {
+						if idx < len(action.Values) {
+							val := action.Values[idx]
+							finalVal := val
+							if sVal, ok := val.(string); ok {
+								if val, exists := sourceRow[sVal]; exists {
+									finalVal = val
+								} else if val, exists := sourceRow[strings.TrimPrefix(sVal, stmt.SourceTable+".")]; exists {
+									finalVal = val
+								}
+							}
+							newRow[colName] = finalVal
+						}
+					}
+					targetTable.Insert(newRow)
+					notMatchedCount++
+				}
+			}
+		}
+	}
+
+	e.db.SaveTableToDisk(dbInstance, targetTable)
+
+	return &Result{
+		Message: fmt.Sprintf("MERGE %d row(s)", matchedCount+notMatchedCount),
+	}, nil
 }

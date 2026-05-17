@@ -154,6 +154,23 @@ const (
 	TOKEN_RECURSIVE
 	TOKEN_LATERAL
 	TOKEN_FILTER
+
+	// New DDL & DML tokens
+	TOKEN_VIEW
+	TOKEN_SEQUENCE
+	TOKEN_SERIAL
+	TOKEN_BIGSERIAL
+	TOKEN_CHECK
+	TOKEN_UNIQUE
+	TOKEN_TYPE
+	TOKEN_ENUM
+	TOKEN_MATERIALIZED
+	TOKEN_REFRESH
+	TOKEN_DEFAULT
+	TOKEN_CONFLICT
+	TOKEN_NOTHING
+	TOKEN_MERGE
+	TOKEN_MATCHED
 )
 
 type Token struct {
@@ -300,6 +317,22 @@ func (t TokenType) String() string {
 		TOKEN_PLUS:         "+",
 		TOKEN_MINUS:        "-",
 		TOKEN_SLASH:        "/",
+
+		TOKEN_VIEW:         "VIEW",
+		TOKEN_SEQUENCE:     "SEQUENCE",
+		TOKEN_SERIAL:       "SERIAL",
+		TOKEN_BIGSERIAL:    "BIGSERIAL",
+		TOKEN_CHECK:        "CHECK",
+		TOKEN_UNIQUE:       "UNIQUE",
+		TOKEN_TYPE:         "TYPE",
+		TOKEN_ENUM:         "ENUM",
+		TOKEN_MATERIALIZED: "MATERIALIZED",
+		TOKEN_REFRESH:      "REFRESH",
+		TOKEN_DEFAULT:      "DEFAULT",
+		TOKEN_CONFLICT:     "CONFLICT",
+		TOKEN_NOTHING:      "NOTHING",
+		TOKEN_MERGE:        "MERGE",
+		TOKEN_MATCHED:      "MATCHED",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -409,8 +442,24 @@ var keywords = map[string]TokenType{
 	"PARTITION":       TOKEN_PARTITION,
 	"TABLESAMPLE":     TOKEN_TABLESAMPLE,
 	"RECURSIVE":       TOKEN_RECURSIVE,
-	"LATERAL":         TOKEN_LATERAL,
 	"FILTER":          TOKEN_FILTER,
+	"LATERAL":         TOKEN_LATERAL,
+
+	"VIEW":            TOKEN_VIEW,
+	"SEQUENCE":        TOKEN_SEQUENCE,
+	"SERIAL":          TOKEN_SERIAL,
+	"BIGSERIAL":       TOKEN_BIGSERIAL,
+	"CHECK":           TOKEN_CHECK,
+	"UNIQUE":          TOKEN_UNIQUE,
+	"TYPE":            TOKEN_TYPE,
+	"ENUM":            TOKEN_ENUM,
+	"MATERIALIZED":    TOKEN_MATERIALIZED,
+	"REFRESH":         TOKEN_REFRESH,
+	"DEFAULT":         TOKEN_DEFAULT,
+	"CONFLICT":        TOKEN_CONFLICT,
+	"NOTHING":         TOKEN_NOTHING,
+	"MERGE":           TOKEN_MERGE,
+	"MATCHED":         TOKEN_MATCHED,
 }
 
 func LookupKeyword(ident string) TokenType {
