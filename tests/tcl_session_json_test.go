@@ -128,3 +128,109 @@ func TestJSONAndJSONBFeatures(t *testing.T) {
 		}
 	})
 }
+
+func TestTCLTransactions(t *testing.T) {
+	dataDir := "test_data_tcl"
+	os.RemoveAll(dataDir)
+	defer os.RemoveAll(dataDir)
+
+	db, err := storage.Initialize(dataDir)
+	if err != nil {
+		t.Fatalf("Failed to initialize storage: %v", err)
+	}
+
+	session1 := db.SessionMgr.CreateSession("session1")
+	session1.SetUser("ghost")
+	session1.SetDatabase("ghostsql")
+
+	session2 := db.SessionMgr.CreateSession("session2")
+	session2.SetUser("ghost")
+	session2.SetDatabase("ghostsql")
+
+	exec1 := executor.NewExecutor(db, session1)
+	exec2 := executor.NewExecutor(db, session2)
+
+	// Helper to execute query and expect success
+	runQuery := func(exec *executor.Executor, q string) *executor.Result {
+		p := parser.NewParser(q)
+		stmt, err := p.Parse()
+		if err != nil {
+			t.Fatalf("Failed to parse query '%s': %v", q, err)
+		}
+		res, err := exec.Execute(stmt)
+		if err != nil {
+			t.Fatalf("Failed to execute query '%s': %v", q, err)
+		}
+		return res
+	}
+
+	// 1. Setup base table
+	runQuery(exec1, "CREATE TABLE accounts (id INT, balance INT)")
+	runQuery(exec1, "INSERT INTO accounts (id, balance) VALUES (1, 100)")
+
+	// 2. Start a transaction on Session 1 and modify data
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "UPDATE accounts SET balance = 200 WHERE id = 1")
+
+	// 3. Verify Session 1 sees the uncommitted update
+	res1 := runQuery(exec1, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res1.Rows) != 1 || (res1.Rows[0]["balance"] != 200 && res1.Rows[0]["balance"] != 200.0) {
+		t.Errorf("Session 1 expected balance 200, got: %v", res1.Rows)
+	}
+
+	// 4. Verify Session 2 does NOT see the uncommitted update (ACID isolation!)
+	res2 := runQuery(exec2, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res2.Rows) != 1 || (res2.Rows[0]["balance"] != 100 && res2.Rows[0]["balance"] != 100.0) {
+		t.Errorf("Session 2 expected balance 100, got: %v", res2.Rows)
+	}
+
+	// 5. Rollback on Session 1
+	runQuery(exec1, "ROLLBACK")
+
+	// 6. Verify Session 1 sees the rolled back state (100)
+	res1 = runQuery(exec1, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res1.Rows) != 1 || (res1.Rows[0]["balance"] != 100 && res1.Rows[0]["balance"] != 100.0) {
+		t.Errorf("Session 1 expected rolled back balance 100, got: %v", res1.Rows)
+	}
+
+	// 7. Start another transaction, update, and COMMIT
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "UPDATE accounts SET balance = 300 WHERE id = 1")
+	runQuery(exec1, "COMMIT")
+
+	// 8. Verify Session 2 now sees the committed update (300)
+	res2 = runQuery(exec2, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res2.Rows) != 1 || (res2.Rows[0]["balance"] != 300 && res2.Rows[0]["balance"] != 300.0) {
+		t.Errorf("Session 2 expected committed balance 300, got: %v", res2.Rows)
+	}
+
+	// 9. Test SAVEPOINT and ROLLBACK TO SAVEPOINT
+	runQuery(exec1, "BEGIN")
+	runQuery(exec1, "UPDATE accounts SET balance = 400 WHERE id = 1")
+	runQuery(exec1, "SAVEPOINT sp1")
+	runQuery(exec1, "UPDATE accounts SET balance = 500 WHERE id = 1")
+
+	// 9.1 Verify balance is 500 inside transaction
+	res1 = runQuery(exec1, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res1.Rows) != 1 || (res1.Rows[0]["balance"] != 500 && res1.Rows[0]["balance"] != 500.0) {
+		t.Errorf("Expected balance 500 before rollback to savepoint, got: %v", res1.Rows)
+	}
+
+	// 9.2 Rollback to savepoint sp1
+	runQuery(exec1, "ROLLBACK TO sp1")
+
+	// 9.3 Verify balance restored to 400 inside transaction
+	res1 = runQuery(exec1, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res1.Rows) != 1 || (res1.Rows[0]["balance"] != 400 && res1.Rows[0]["balance"] != 400.0) {
+		t.Errorf("Expected balance 400 after rollback to savepoint, got: %v", res1.Rows)
+	}
+
+	// 9.4 Commit the transaction
+	runQuery(exec1, "COMMIT")
+
+	// 9.5 Verify balance is committed at 400
+	res2 = runQuery(exec2, "SELECT balance FROM accounts WHERE id = 1")
+	if len(res2.Rows) != 1 || (res2.Rows[0]["balance"] != 400 && res2.Rows[0]["balance"] != 400.0) {
+		t.Errorf("Expected committed balance 400, got: %v", res2.Rows)
+	}
+}

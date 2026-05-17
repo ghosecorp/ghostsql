@@ -100,7 +100,9 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	case *parser.SetStmt:
 		return &Result{Message: "SET"}, nil
 	case *parser.TransactionStmt:
-		return &Result{Message: s.Command}, nil
+		return e.executeTransaction(s)
+	case *parser.SavepointStmt:
+		return e.executeSavepoint(s)
 	case *parser.DropRoleStmt:
 		return e.executeDropRole(s)
 	case *parser.CreateViewStmt:
@@ -139,7 +141,7 @@ func (e *Executor) checkPrivilege(objectType, objectName, privilege string) erro
 	// Owner bypass for TABLE objects (PostgreSQL standard: owner always has access)
 	if objectType == "TABLE" {
 		if dbInstance, err := e.getActiveDatabase(); err == nil {
-			if table, exists := dbInstance.GetTable(objectName); exists && table.Owner == user {
+			if table, exists := e.getTable(dbInstance, objectName); exists && table.Owner == user {
 				return nil
 			}
 		}
@@ -216,8 +218,22 @@ func (e *Executor) executeShowTables() (*Result, error) {
 		return nil, err
 	}
 
-	rows := make([]storage.Row, 0, len(dbInstance.Tables))
-	for tableName := range dbInstance.Tables {
+	tableNames := make(map[string]bool)
+	for k := range dbInstance.Tables {
+		tableNames[k] = true
+	}
+	if e.session != nil && e.session.TxActive {
+		for k, v := range e.session.TxTables {
+			if v == nil {
+				delete(tableNames, k)
+			} else {
+				tableNames[k] = true
+			}
+		}
+	}
+
+	rows := make([]storage.Row, 0, len(tableNames))
+	for tableName := range tableNames {
 		rows = append(rows, storage.Row{
 			"Table": tableName,
 		})
@@ -235,7 +251,7 @@ func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(tableName)
+	table, exists := e.getTable(dbInstance, tableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
@@ -315,9 +331,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// Set owner: the creator is the table owner (PostgreSQL standard)
 	owner := e.session.GetUser()
 	table := storage.NewTable(stmt.TableName, owner, columns, tableMeta)
-	dbInstance.SetTable(stmt.TableName, table)
+	e.setTable(dbInstance, stmt.TableName, table)
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -335,7 +351,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -546,7 +562,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					continue
 				}
 
-				refTable, exists := dbInstance.GetTable(col.ForeignKey.RefTable)
+				refTable, exists := e.getTable(dbInstance, col.ForeignKey.RefTable)
 				if !exists {
 					return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
 				}
@@ -573,7 +589,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		lastInsertedRows = append(lastInsertedRows, row)
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -641,7 +657,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				columns = res.Columns
 			} else {
 				var exists bool
-				table, exists = dbInstance.GetTable(stmt.TableName)
+				table, exists = e.getTable(dbInstance, stmt.TableName)
 				if !exists {
 					return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 				}
@@ -995,7 +1011,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				// Add joined table columns with prefixes
 				if dbInstance != nil {
 					for _, join := range stmt.Joins {
-						joinTable, ok := dbInstance.GetTable(join.Table)
+						joinTable, ok := e.getTable(dbInstance, join.Table)
 						if !ok {
 							viewKey := dbInstance.Name + "." + join.Table
 							if viewQuery, isView := viewRegistry[viewKey]; isView {
@@ -1119,7 +1135,7 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 			}
 			resultRows = mergedResultRows
 		} else {
-			rightTable, exists := dbInstance.GetTable(join.Table)
+			rightTable, exists := e.getTable(dbInstance, join.Table)
 			if !exists {
 				viewKey := dbInstance.Name + "." + join.Table
 				if viewQuery, isView := viewRegistry[viewKey]; isView {
@@ -1761,7 +1777,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1772,7 +1788,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	}
 
 	if stmt.FromTable != "" {
-		fromTable, ok := dbInstance.GetTable(stmt.FromTable)
+		fromTable, ok := e.getTable(dbInstance, stmt.FromTable)
 		if !ok {
 			return nil, fmt.Errorf("table %s does not exist", stmt.FromTable)
 		}
@@ -1819,7 +1835,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 			}
 		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -1837,7 +1853,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1857,7 +1873,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1868,7 +1884,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	}
 
 	if stmt.UsingTable != "" {
-		usingTable, ok := dbInstance.GetTable(stmt.UsingTable)
+		usingTable, ok := e.getTable(dbInstance, stmt.UsingTable)
 		if !ok {
 			return nil, fmt.Errorf("table %s does not exist", stmt.UsingTable)
 		}
@@ -1906,7 +1922,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 		table.Rows = newRows
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -1929,7 +1945,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1948,18 +1964,20 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 		return nil, err
 	}
 
-	if _, exists := dbInstance.GetTable(stmt.TableName); !exists {
+	if _, exists := e.getTable(dbInstance, stmt.TableName); !exists {
 		if stmt.IfExists {
 			return &Result{Message: fmt.Sprintf("NOTICE: table %s does not exist, skipping", stmt.TableName)}, nil
 		}
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	dbInstance.DeleteTable(stmt.TableName)
+	e.deleteTable(dbInstance, stmt.TableName)
 
-	tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
-	if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to remove table file: %w", err)
+	if e.session == nil || !e.session.TxActive {
+		tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
+		if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to remove table file: %w", err)
+		}
 	}
 
 	return &Result{
@@ -1986,7 +2004,7 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1995,7 +2013,7 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2010,7 +2028,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2026,7 +2044,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 			return nil, err
 		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -2040,13 +2058,15 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		newName := stmt.RenameTo
 		table.Name = newName
 		
-		dbInstance.DeleteTable(oldName)
-		dbInstance.SetTable(newName, table)
+		e.deleteTable(dbInstance, oldName)
+		e.setTable(dbInstance, newName, table)
 		
-		oldPath := filepath.Join(dbInstance.BasePath, "tables", oldName+".tbl")
-		os.Remove(oldPath)
+		if e.session == nil || !e.session.TxActive {
+			oldPath := filepath.Join(dbInstance.BasePath, "tables", oldName+".tbl")
+			os.Remove(oldPath)
+		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME TO %s", oldName, newName)}, nil
@@ -2056,7 +2076,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.DropColumn(stmt.DropColumn, stmt.IfExists); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", stmt.TableName, stmt.DropColumn)}, nil
@@ -2066,7 +2086,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.RenameColumn(stmt.RenameColumnFrom, stmt.RenameColumnTo); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", stmt.TableName, stmt.RenameColumnFrom, stmt.RenameColumnTo)}, nil
@@ -2076,7 +2096,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.AlterColumnType(stmt.AlterColumnName, stmt.AlterColumnType); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %d", stmt.TableName, stmt.AlterColumnName, stmt.AlterColumnType)}, nil
@@ -2092,7 +2112,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 				}
 			}
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT", stmt.TableName)}, nil
@@ -2100,7 +2120,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 
 	if stmt.Action == "ENABLE_RLS" {
 		table.RLSEnabled = true
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
@@ -2108,7 +2128,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 
 	if stmt.Action == "DISABLE_RLS" {
 		table.RLSEnabled = false
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DISABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
@@ -2141,7 +2161,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.ObjectName)
+	table, exists := e.getTableForModification(dbInstance, stmt.ObjectName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
 	}
@@ -2159,7 +2179,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 		table.Metadata.Description = stmt.Comment
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2178,7 +2198,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2207,7 +2227,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2299,7 +2319,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2691,7 +2711,7 @@ func (e *Executor) executeCreatePolicy(stmt *parser.CreatePolicyStmt) (*Result, 
 		return nil, err
 	}
 	
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -3335,7 +3355,7 @@ func (e *Executor) executeCreateMaterializedView(stmt *parser.CreateMaterialized
 	dbName := dbInstance.Name
 	mvKey := dbName + "." + stmt.ViewName
 
-	if _, exists := dbInstance.GetTable(stmt.ViewName); exists {
+	if _, exists := e.getTable(dbInstance, stmt.ViewName); exists {
 		if stmt.IfNotExists {
 			return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
 		}
@@ -3361,10 +3381,10 @@ func (e *Executor) executeCreateMaterializedView(stmt *parser.CreateMaterialized
 		table.Insert(row)
 	}
 
-	dbInstance.SetTable(stmt.ViewName, table)
+	e.setTable(dbInstance, stmt.ViewName, table)
 	materializedViewRegistry[mvKey] = stmt.Query
 
-	e.db.SaveTableToDisk(dbInstance, table)
+	e.saveTableToDisk(dbInstance, table)
 
 	return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
 }
@@ -3383,7 +3403,7 @@ func (e *Executor) executeRefreshMaterializedView(stmt *parser.RefreshMaterializ
 		return nil, fmt.Errorf("materialized view %s does not exist", stmt.ViewName)
 	}
 
-	table, ok := dbInstance.GetTable(stmt.ViewName)
+	table, ok := e.getTableForModification(dbInstance, stmt.ViewName)
 	if !ok {
 		return nil, fmt.Errorf("materialized view physical table %s not found", stmt.ViewName)
 	}
@@ -3398,7 +3418,7 @@ func (e *Executor) executeRefreshMaterializedView(stmt *parser.RefreshMaterializ
 		table.Insert(row)
 	}
 
-	e.db.SaveTableToDisk(dbInstance, table)
+	e.saveTableToDisk(dbInstance, table)
 
 	return &Result{Message: "REFRESH MATERIALIZED VIEW"}, nil
 }
@@ -3409,7 +3429,7 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		return nil, err
 	}
 
-	targetTable, exists := dbInstance.GetTable(stmt.TargetTable)
+	targetTable, exists := e.getTableForModification(dbInstance, stmt.TargetTable)
 	if !exists {
 		return nil, fmt.Errorf("target table %s does not exist", stmt.TargetTable)
 	}
@@ -3422,7 +3442,7 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		}
 		sourceRows = res.Rows
 	} else {
-		srcTab, ok := dbInstance.GetTable(stmt.SourceTable)
+		srcTab, ok := e.getTable(dbInstance, stmt.SourceTable)
 		if !ok {
 			return nil, fmt.Errorf("source table %s does not exist", stmt.SourceTable)
 		}
@@ -3511,9 +3531,157 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		}
 	}
 
-	e.db.SaveTableToDisk(dbInstance, targetTable)
+	e.saveTableToDisk(dbInstance, targetTable)
 
 	return &Result{
 		Message: fmt.Sprintf("MERGE %d row(s)", matchedCount+notMatchedCount),
 	}, nil
+}
+
+// --- Transaction and Table Helper Methods ---
+
+func (e *Executor) getTable(dbInstance *storage.DatabaseInstance, name string) (*storage.Table, bool) {
+	if e.session != nil && e.session.TxActive {
+		if t, ok := e.session.TxTables[name]; ok {
+			if t == nil {
+				return nil, false // Deleted in transaction
+			}
+			return t, true
+		}
+	}
+	return dbInstance.GetTable(name)
+}
+
+func (e *Executor) getTableForModification(dbInstance *storage.DatabaseInstance, name string) (*storage.Table, bool) {
+	table, exists := dbInstance.GetTable(name)
+	if !exists {
+		return nil, false
+	}
+	if e.session != nil && e.session.TxActive {
+		if t, ok := e.session.TxTables[name]; ok {
+			if t == nil {
+				return nil, false
+			}
+			return t, true
+		}
+		// Clone and store in TxTables
+		cloned := table.Clone()
+		e.session.TxTables[name] = cloned
+		return cloned, true
+	}
+	return table, true
+}
+
+func (e *Executor) setTable(dbInstance *storage.DatabaseInstance, name string, table *storage.Table) {
+	if e.session != nil && e.session.TxActive {
+		e.session.TxTables[name] = table
+		return
+	}
+	dbInstance.SetTable(name, table)
+}
+
+func (e *Executor) deleteTable(dbInstance *storage.DatabaseInstance, name string) {
+	if e.session != nil && e.session.TxActive {
+		e.session.TxTables[name] = nil
+		return
+	}
+	dbInstance.DeleteTable(name)
+}
+
+func (e *Executor) saveTableToDisk(dbInstance *storage.DatabaseInstance, table *storage.Table) error {
+	if e.session != nil && e.session.TxActive {
+		return nil
+	}
+	return e.db.SaveTableToDisk(dbInstance, table)
+}
+
+func (e *Executor) executeTransaction(stmt *parser.TransactionStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	switch stmt.Command {
+	case "BEGIN":
+		e.session.TxActive = true
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		return &Result{Message: "BEGIN"}, nil
+
+	case "COMMIT":
+		if !e.session.TxActive {
+			return &Result{Message: "COMMIT"}, nil
+		}
+		dbInstance, err := e.getActiveDatabase()
+		if err != nil {
+			return nil, err
+		}
+		for name, t := range e.session.TxTables {
+			if t == nil {
+				dbInstance.DeleteTable(name)
+				tablePath := filepath.Join(dbInstance.BasePath, "tables", name+".tbl")
+				_ = os.Remove(tablePath)
+			} else {
+				dbInstance.SetTable(name, t)
+				if err := e.db.SaveTableToDisk(dbInstance, t); err != nil {
+					return nil, err
+				}
+			}
+		}
+		e.session.TxActive = false
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		return &Result{Message: "COMMIT"}, nil
+
+	case "ROLLBACK":
+		e.session.TxActive = false
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		return &Result{Message: "ROLLBACK"}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown transaction command: %s", stmt.Command)
+	}
+}
+
+func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	if !e.session.TxActive {
+		return nil, fmt.Errorf("no active transaction")
+	}
+
+	switch stmt.Command {
+	case "SAVEPOINT":
+		// Clone all current TxTables to savepoint
+		snapshot := make(map[string]*storage.Table)
+		for name, t := range e.session.TxTables {
+			if t == nil {
+				snapshot[name] = nil
+			} else {
+				snapshot[name] = t.Clone()
+			}
+		}
+		e.session.TxSavepoints[stmt.Name] = snapshot
+		return &Result{Message: "SAVEPOINT"}, nil
+
+	case "ROLLBACK TO":
+		snapshot, exists := e.session.TxSavepoints[stmt.Name]
+		if !exists {
+			return nil, fmt.Errorf("savepoint %s does not exist", stmt.Name)
+		}
+		// Restore e.session.TxTables from snapshot
+		e.session.TxTables = make(map[string]*storage.Table)
+		for name, t := range snapshot {
+			if t == nil {
+				e.session.TxTables[name] = nil
+			} else {
+				e.session.TxTables[name] = t.Clone()
+			}
+		}
+		return &Result{Message: "ROLLBACK TO SAVEPOINT"}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown savepoint command: %s", stmt.Command)
+	}
 }
