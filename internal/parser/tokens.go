@@ -171,6 +171,18 @@ const (
 	TOKEN_NOTHING
 	TOKEN_MERGE
 	TOKEN_MATCHED
+	TOKEN_SAVEPOINT
+	TOKEN_DECLARE
+	TOKEN_CURSOR
+	TOKEN_FETCH
+	TOKEN_MOVE
+	TOKEN_CLOSE
+	TOKEN_RESET
+	TOKEN_LOCK
+	TOKEN_JSONB
+	TOKEN_JSON_ARROW
+	TOKEN_JSON_TEXT_ARROW
+	TOKEN_JSON_CONTAIN
 )
 
 type Token struct {
@@ -333,6 +345,18 @@ func (t TokenType) String() string {
 		TOKEN_NOTHING:      "NOTHING",
 		TOKEN_MERGE:        "MERGE",
 		TOKEN_MATCHED:      "MATCHED",
+		TOKEN_SAVEPOINT:    "SAVEPOINT",
+		TOKEN_DECLARE:      "DECLARE",
+		TOKEN_CURSOR:       "CURSOR",
+		TOKEN_FETCH:        "FETCH",
+		TOKEN_MOVE:         "MOVE",
+		TOKEN_CLOSE:        "CLOSE",
+		TOKEN_RESET:        "RESET",
+		TOKEN_LOCK:         "LOCK",
+		TOKEN_JSONB:        "JSONB",
+		TOKEN_JSON_ARROW:   "->",
+		TOKEN_JSON_TEXT_ARROW: "->>",
+		TOKEN_JSON_CONTAIN: "@>",
 	}
 	if name, ok := names[t]; ok {
 		return name
@@ -460,6 +484,15 @@ var keywords = map[string]TokenType{
 	"NOTHING":         TOKEN_NOTHING,
 	"MERGE":           TOKEN_MERGE,
 	"MATCHED":         TOKEN_MATCHED,
+	"SAVEPOINT":       TOKEN_SAVEPOINT,
+	"DECLARE":         TOKEN_DECLARE,
+	"CURSOR":          TOKEN_CURSOR,
+	"FETCH":           TOKEN_FETCH,
+	"MOVE":            TOKEN_MOVE,
+	"CLOSE":           TOKEN_CLOSE,
+	"RESET":           TOKEN_RESET,
+	"LOCK":            TOKEN_LOCK,
+	"JSONB":           TOKEN_JSONB,
 }
 
 func LookupKeyword(ident string) TokenType {

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
@@ -27,6 +28,40 @@ func EvaluateExpression(expr string, row Row) interface{} {
 	}
 
 	upper := strings.ToUpper(expr)
+
+	// JSON text extraction ->>
+	if pos := findOperatorOutsideParens(expr, "->>"); pos >= 0 {
+		left := strings.TrimSpace(expr[:pos])
+		right := strings.TrimSpace(expr[pos+3:])
+		if strings.HasPrefix(right, "'") && strings.HasSuffix(right, "'") && len(right) >= 2 {
+			right = right[1 : len(right)-1]
+		}
+		lVal := EvaluateExpression(left, row)
+		return evaluateJsonExtract(lVal, right, true)
+	}
+
+	// JSON object extraction ->
+	if pos := findOperatorOutsideParens(expr, "->"); pos >= 0 {
+		left := strings.TrimSpace(expr[:pos])
+		right := strings.TrimSpace(expr[pos+2:])
+		if strings.HasPrefix(right, "'") && strings.HasSuffix(right, "'") && len(right) >= 2 {
+			right = right[1 : len(right)-1]
+		}
+		lVal := EvaluateExpression(left, row)
+		return evaluateJsonExtract(lVal, right, false)
+	}
+
+	// JSON containment @>
+	if pos := findOperatorOutsideParens(expr, "@>"); pos >= 0 {
+		left := strings.TrimSpace(expr[:pos])
+		right := strings.TrimSpace(expr[pos+2:])
+		if strings.HasPrefix(right, "'") && strings.HasSuffix(right, "'") && len(right) >= 2 {
+			right = right[1 : len(right)-1]
+		}
+		lVal := EvaluateExpression(left, row)
+		rVal := EvaluateExpression(right, row)
+		return EvaluateJsonContain(lVal, rVal)
+	}
 
 	// 2. CASE WHEN ... END
 	if strings.HasPrefix(upper, "CASE WHEN") {
@@ -125,6 +160,11 @@ func evaluateFunctionCall(fnName, argsStr string, row Row) interface{} {
 	args := splitArgs(argsStr, row)
 
 	switch fnName {
+	case "JSONB_PATH_QUERY":
+		if len(args) >= 2 {
+			return evaluateJsonPath(args[0], toString(args[1]))
+		}
+
 	// ---- String functions ----
 	case "LOWER":
 		if len(args) == 1 {
@@ -822,4 +862,213 @@ func applyTypeCast(val interface{}, castType string) interface{} {
 
 	// Default fallback: return as string
 	return strVal
+}
+
+func evaluateJsonExtract(lVal interface{}, key string, asText bool) interface{} {
+	if lVal == nil {
+		return nil
+	}
+
+	var data interface{}
+	switch val := lVal.(type) {
+	case string:
+		s := val
+		if strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") && len(s) >= 2 {
+			s = s[1 : len(s)-1]
+		}
+		if err := json.Unmarshal([]byte(s), &data); err != nil {
+			return nil
+		}
+	default:
+		data = val
+	}
+
+	var result interface{}
+	switch m := data.(type) {
+	case map[string]interface{}:
+		result = m[key]
+	case []interface{}:
+		if idx, err := strconv.Atoi(key); err == nil && idx >= 0 && idx < len(m) {
+			result = m[idx]
+		}
+	}
+
+	if result == nil {
+		return nil
+	}
+
+	if asText {
+		switch r := result.(type) {
+		case string:
+			return r
+		case float64:
+			return strconv.FormatFloat(r, 'f', -1, 64)
+		case bool:
+			return strconv.FormatBool(r)
+		default:
+			bytes, _ := json.Marshal(r)
+			return string(bytes)
+		}
+	}
+
+	switch r := result.(type) {
+	case map[string]interface{}, []interface{}:
+		bytes, _ := json.Marshal(r)
+		return string(bytes)
+	default:
+		return r
+	}
+}
+
+func EvaluateJsonContain(lVal, rVal interface{}) bool {
+	if lVal == nil || rVal == nil {
+		return false
+	}
+
+	var left interface{}
+	switch val := lVal.(type) {
+	case string:
+		s := val
+		if strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") && len(s) >= 2 {
+			s = s[1 : len(s)-1]
+		}
+		if err := json.Unmarshal([]byte(s), &left); err != nil {
+			left = s
+		}
+	default:
+		left = val
+	}
+
+	var right interface{}
+	switch val := rVal.(type) {
+	case string:
+		s := val
+		if strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") && len(s) >= 2 {
+			s = s[1 : len(s)-1]
+		}
+		if err := json.Unmarshal([]byte(s), &right); err != nil {
+			right = s
+		}
+	default:
+		right = val
+	}
+
+	return jsonContains(left, right)
+}
+
+func jsonContains(left, right interface{}) bool {
+	if left == nil && right == nil {
+		return true
+	}
+	if left == nil || right == nil {
+		return false
+	}
+
+	switch r := right.(type) {
+	case map[string]interface{}:
+		l, ok := left.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		for k, v := range r {
+			lv, exists := l[k]
+			if !exists || !jsonContains(lv, v) {
+				return false
+			}
+		}
+		return true
+
+	case []interface{}:
+		l, ok := left.([]interface{})
+		if !ok {
+			return false
+		}
+		for _, rv := range r {
+			found := false
+			for _, lv := range l {
+				if jsonContains(lv, rv) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+
+	default:
+		return toString(left) == toString(right)
+	}
+}
+
+func evaluateJsonPath(lVal interface{}, path string) interface{} {
+	if lVal == nil {
+		return nil
+	}
+
+	var data interface{}
+	switch val := lVal.(type) {
+	case string:
+		s := val
+		if strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") && len(s) >= 2 {
+			s = s[1 : len(s)-1]
+		}
+		if err := json.Unmarshal([]byte(s), &data); err != nil {
+			return nil
+		}
+	default:
+		data = val
+	}
+
+	path = strings.TrimSpace(path)
+	if path == "" || path == "$" {
+		return data
+	}
+
+	if strings.HasPrefix(path, "$.") {
+		path = path[2:]
+	} else if strings.HasPrefix(path, "$") {
+		path = path[1:]
+	}
+
+	parts := strings.Split(path, ".")
+	curr := data
+	for _, part := range parts {
+		if curr == nil {
+			return nil
+		}
+
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		arrayIdx := -1
+		if idxStart := strings.Index(part, "["); idxStart > 0 {
+			if idxEnd := strings.Index(part, "]"); idxEnd > idxStart {
+				idxStr := part[idxStart+1 : idxEnd]
+				if idx, err := strconv.Atoi(idxStr); err == nil {
+					arrayIdx = idx
+				}
+				part = part[:idxStart]
+			}
+		}
+
+		m, ok := curr.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		curr = m[part]
+
+		if arrayIdx >= 0 {
+			s, ok := curr.([]interface{})
+			if !ok || arrayIdx >= len(s) {
+				return nil
+			}
+			curr = s[arrayIdx]
+		}
+	}
+
+	return curr
 }

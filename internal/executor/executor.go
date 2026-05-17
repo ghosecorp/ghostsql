@@ -884,7 +884,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			outName := sc.Expression
 			if sc.Alias != "" {
 				outName = sc.Alias
-			} else if strings.Contains(outName, ".") {
+			} else if strings.Contains(outName, ".") && !strings.Contains(outName, "(") && !strings.Contains(outName, " ") && !strings.Contains(outName, "'") && !strings.Contains(outName, "\"") {
 				// Strip table prefix: "c.relname" -> "relname"
 				parts := strings.Split(outName, ".")
 				outName = parts[len(parts)-1]
@@ -1736,6 +1736,8 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 						}
 					}
 				}
+			case "@>":
+				match = storage.EvaluateJsonContain(val, rhsVal)
 			default:
 				match = false
 			}

@@ -5,18 +5,36 @@ import (
 	"sync"
 )
 
+// Cursor represents a declared SQL cursor
+type Cursor struct {
+	Name       string
+	Query      interface{} // AST Select statement
+	Rows       []Row
+	CurrentIdx int
+}
+
 // Session represents a single client connection state
 type Session struct {
 	ID              string
 	CurrentDatabase string
 	User            string
+	SessionUser     string // Initially authenticated user
+	Variables       map[string]string
+	TxActive        bool
+	TxTables        map[string]*Table            // Table copies modified during transaction
+	TxSavepoints    map[string]map[string]*Table // Table copies cloned at savepoints
+	Cursors         map[string]*Cursor
 	mu              sync.RWMutex
 }
 
 // NewSession creates a new client session
 func NewSession(id string) *Session {
 	return &Session{
-		ID: id,
+		ID:           id,
+		Variables:    make(map[string]string),
+		TxTables:     make(map[string]*Table),
+		TxSavepoints: make(map[string]map[string]*Table),
+		Cursors:      make(map[string]*Cursor),
 	}
 }
 
@@ -92,3 +110,18 @@ func (sm *SessionManager) CloseSession(id string) {
 	defer sm.mu.Unlock()
 	delete(sm.sessions, id)
 }
+
+// GetVariable retrieves a session variable
+func (s *Session) GetVariable(name string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Variables[name]
+}
+
+// SetVariable sets a session variable
+func (s *Session) SetVariable(name, val string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Variables[name] = val
+}
+

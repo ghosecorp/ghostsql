@@ -222,6 +222,8 @@ func evaluateWhere(row Row, where *WhereClause) bool {
 				match = compare(val, where.Value) > 0
 			case ">=":
 				match = compare(val, where.Value) >= 0
+			case "@>":
+				match = EvaluateJsonContain(val, where.Value)
 			case "IS NULL":
 				match = val == nil
 			case "IS NOT NULL":
@@ -666,3 +668,36 @@ func (t *Table) AlterColumnType(colName string, newType DataType) error {
 
 	return nil
 }
+
+// Clone returns a deep copy of the Table
+func (t *Table) Clone() *Table {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	clonedCols := make([]Column, len(t.Columns))
+	copy(clonedCols, t.Columns)
+
+	clonedRows := make([]Row, len(t.Rows))
+	for i, r := range t.Rows {
+		clonedRow := make(Row)
+		for k, v := range r {
+			clonedRow[k] = v
+		}
+		clonedRows[i] = clonedRow
+	}
+
+	clonedPolicies := make([]Policy, len(t.Policies))
+	copy(clonedPolicies, t.Policies)
+
+	return &Table{
+		Name:          t.Name,
+		Owner:         t.Owner,
+		Columns:       clonedCols,
+		Rows:          clonedRows,
+		RLSEnabled:    t.RLSEnabled,
+		Policies:      clonedPolicies,
+		Metadata:      t.Metadata,
+		VectorIndexes: t.VectorIndexes,
+	}
+}
+

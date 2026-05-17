@@ -444,3 +444,79 @@ type MergeAction struct {
 	Values  []interface{}
 }
 
+// SavepointStmt represents SAVEPOINT & ROLLBACK TO savepoint
+type SavepointStmt struct {
+	Command string // "SAVEPOINT" or "ROLLBACK TO"
+	Name    string
+}
+
+func (s *SavepointStmt) StatementNode() {}
+
+// ShowVarStmt represents SHOW <var>
+type ShowVarStmt struct {
+	Name string
+}
+
+func (s *ShowVarStmt) StatementNode() {}
+
+// ResetStmt represents RESET <var>
+type ResetStmt struct {
+	Name string
+}
+
+func (s *ResetStmt) StatementNode() {}
+
+// SetRoleStmt represents SET ROLE <role>
+type SetRoleStmt struct {
+	Role string
+}
+
+func (s *SetRoleStmt) StatementNode() {}
+
+// SetSessionAuthorizationStmt represents SET SESSION AUTHORIZATION <user>
+type SetSessionAuthorizationStmt struct {
+	User string
+}
+
+func (s *SetSessionAuthorizationStmt) StatementNode() {}
+
+// LockTableStmt represents LOCK TABLE <name>
+type LockTableStmt struct {
+	TableName string
+	Mode      string
+}
+
+func (s *LockTableStmt) StatementNode() {}
+
+// DeclareCursorStmt represents DECLARE cur CURSOR FOR
+type DeclareCursorStmt struct {
+	Name  string
+	Query *SelectStmt
+}
+
+func (s *DeclareCursorStmt) StatementNode() {}
+
+// FetchCursorStmt represents FETCH FROM cur
+type FetchCursorStmt struct {
+	Name  string
+	Count int
+}
+
+func (s *FetchCursorStmt) StatementNode() {}
+
+// MoveCursorStmt represents MOVE IN cur
+type MoveCursorStmt struct {
+	Name  string
+	Count int
+}
+
+func (s *MoveCursorStmt) StatementNode() {}
+
+// CloseCursorStmt represents CLOSE cur
+type CloseCursorStmt struct {
+	Name string
+}
+
+func (s *CloseCursorStmt) StatementNode() {}
+
+

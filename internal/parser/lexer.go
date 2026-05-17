@@ -154,8 +154,20 @@ func (l *Lexer) NextToken() Token {
 		token.Literal = "~"
 		l.advance()
 	case '-':
-		// Only handle '-' if it's not the start of a number
-		if !unicode.IsDigit(rune(l.peek())) {
+		if l.peek() == '>' {
+			if l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' {
+				token.Type = TOKEN_JSON_TEXT_ARROW
+				token.Literal = "->>"
+				l.advance()
+				l.advance()
+				l.advance()
+			} else {
+				token.Type = TOKEN_JSON_ARROW
+				token.Literal = "->"
+				l.advance()
+				l.advance()
+			}
+		} else if !unicode.IsDigit(rune(l.peek())) {
 			token.Type = TOKEN_MINUS
 			token.Literal = "-"
 			l.advance()
@@ -178,6 +190,17 @@ func (l *Lexer) NextToken() Token {
 		token.Type = TOKEN_DOT
 		token.Literal = "."
 		l.advance()
+	case '@':
+		if l.peek() == '>' {
+			token.Type = TOKEN_JSON_CONTAIN
+			token.Literal = "@>"
+			l.advance()
+			l.advance()
+		} else {
+			token.Type = TOKEN_ILLEGAL
+			token.Literal = "@"
+			l.advance()
+		}
 	default:
 		if unicode.IsLetter(rune(ch)) {
 			token.Literal = l.readIdentifier()
