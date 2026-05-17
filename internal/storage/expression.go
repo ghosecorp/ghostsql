@@ -38,6 +38,15 @@ func EvaluateExpression(expr string, row Row) interface{} {
 		return evaluateCast(expr, row)
 	}
 
+	// 3.5 Type casting using :: syntax
+	// Note: We check if it's outside string literals
+	if castIdx := findOperatorOutsideParens(expr, "::"); castIdx > 0 {
+		baseExpr := expr[:castIdx]
+		castType := strings.ToUpper(strings.TrimSpace(expr[castIdx+2:]))
+		baseVal := EvaluateExpression(baseExpr, row)
+		return applyTypeCast(baseVal, castType)
+	}
+
 	// 4. Function calls: LOWER(), UPPER(), ABS(), NOW(), etc.
 	if idx := strings.Index(expr, "("); idx > 0 && strings.HasSuffix(strings.TrimSpace(expr), ")") {
 		fnName := strings.ToUpper(strings.TrimSpace(expr[:idx]))
@@ -65,6 +74,12 @@ func EvaluateExpression(expr string, row Row) interface{} {
 	// 7. Try to parse as a string literal (single-quoted)
 	if strings.HasPrefix(expr, "'") && strings.HasSuffix(expr, "'") && len(expr) >= 2 {
 		return expr[1 : len(expr)-1]
+	}
+
+	// 7.5 Fallback for bare word date parts
+	u := strings.ToUpper(expr)
+	if u == "YEAR" || u == "MONTH" || u == "DAY" || u == "HOUR" || u == "MINUTE" || u == "SECOND" || u == "EPOCH" || u == "DOW" {
+		return expr
 	}
 
 	return nil
@@ -755,4 +770,56 @@ func EvaluateCondition(cond string, row Row) bool {
 		return b
 	}
 	return false
+}
+
+// applyTypeCast applies PostgreSQL-style :: type casting
+func applyTypeCast(val interface{}, castType string) interface{} {
+	if val == nil {
+		return nil
+	}
+
+	strVal := strings.TrimSpace(toString(val))
+	if strings.HasPrefix(strVal, "'") && strings.HasSuffix(strVal, "'") {
+		strVal = strVal[1 : len(strVal)-1]
+	}
+
+	castType = strings.ToUpper(strings.TrimSpace(castType))
+
+	switch {
+	case strings.Contains(castType, "INT"):
+		if i, err := strconv.ParseInt(strVal, 10, 64); err == nil {
+			return int(i)
+		}
+		if f, err := strconv.ParseFloat(strVal, 64); err == nil {
+			return int(f)
+		}
+		return nil
+	case strings.Contains(castType, "FLOAT") || strings.Contains(castType, "DOUBLE") || strings.Contains(castType, "NUMERIC") || strings.Contains(castType, "DECIMAL"):
+		if f, err := strconv.ParseFloat(strVal, 64); err == nil {
+			return f
+		}
+		return nil
+	case castType == "DATE" || castType == "TIMESTAMP":
+		if t, err := parseTime(strVal); err == nil {
+			if castType == "DATE" {
+				return t.Format("2006-01-02")
+			}
+			return t.Format(time.RFC3339)
+		}
+		return nil
+	case castType == "BOOLEAN" || castType == "BOOL":
+		lower := strings.ToLower(strVal)
+		if lower == "true" || lower == "t" || lower == "1" || lower == "yes" || lower == "y" {
+			return true
+		}
+		if lower == "false" || lower == "f" || lower == "0" || lower == "no" || lower == "n" {
+			return false
+		}
+		return nil
+	case strings.Contains(castType, "CHAR") || strings.Contains(castType, "TEXT"):
+		return strVal
+	}
+
+	// Default fallback: return as string
+	return strVal
 }

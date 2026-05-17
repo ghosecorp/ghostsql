@@ -16,14 +16,18 @@ import (
 )
 
 type Executor struct {
-	db      *storage.Database
-	session *storage.Session
+	db              *storage.Database
+	session         *storage.Session
+	cteResults      map[string]*Result // For CTE virtual tables
+	currentOuterRow storage.Row        // For LATERAL joins correlation
+	currentStmt     *parser.SelectStmt // For WHERE clause alias resolution
 }
 
 func NewExecutor(db *storage.Database, session *storage.Session) *Executor {
 	return &Executor{
-		db:      db,
-		session: session,
+		db:         db,
+		session:    session,
+		cteResults: make(map[string]*Result),
 	}
 }
 
@@ -446,29 +450,60 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	// Set current statement for context (aliases in WHERE, etc.)
+	prevStmt := e.currentStmt
+	e.currentStmt = stmt
+	defer func() { e.currentStmt = prevStmt }()
+
 	// If this is a CTE query, route to CTE executor
 	if len(stmt.CTEs) > 0 {
 		return e.executeSelectWithCTEs(stmt)
 	}
 
-	if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
-		return nil, err
-	}
-	dbInstance, err := e.getActiveDatabase()
-	if err != nil {
-		return nil, err
-	}
+	var rows []storage.Row
+	var columns []string
+	var err error
+	var dbInstance *storage.DatabaseInstance
+	var table *storage.Table
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+	if stmt.TableName == "" {
+		rows = []storage.Row{make(storage.Row)}
+	} else {
+		if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
+			return nil, err
+		}
+
+		// Check if the table is a CTE virtual table
+		if result, ok := e.cteResults[stmt.TableName]; ok {
+			// Use CTE result
+			rows = make([]storage.Row, len(result.Rows))
+			for i, r := range result.Rows {
+				rows[i] = make(storage.Row)
+				for k, v := range r {
+					rows[i][k] = v
+				}
+			}
+			columns = result.Columns
+		} else {
+			// Normal physical table
+			dbInstance, err = e.getActiveDatabase()
+			if err != nil {
+				return nil, err
+			}
+
+			var exists bool
+			table, exists = dbInstance.GetTable(stmt.TableName)
+			if !exists {
+				return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
+			}
+		}
 	}
 
 	var where *storage.WhereClause
 	if stmt.Where != nil {
 		where = e.convertWhereClauseWithSubquery(stmt.Where)
 	}
-	if table.RLSEnabled && e.session.GetUser() != "ghost" {
+	if table != nil && table.RLSEnabled && e.session.GetUser() != "ghost" {
 		user := e.session.GetUser()
 		for _, policy := range table.Policies {
 			if (policy.Action == "SELECT" || policy.Action == "ALL") && (policy.Role == "all" || policy.Role == user) {
@@ -480,31 +515,86 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 	e.resolveWhereClauseVariables(where)
 
-	// Fetch rows from main table
-	initialColumns := stmt.Columns
-	needsAll := len(stmt.Aggregates) > 0 || where != nil
-	if !needsAll {
-		for _, sc := range stmt.SelectColumns {
-			if strings.ContainsAny(sc.Expression, "+-*/%(") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sc.Expression)), "CASE WHEN") {
-				needsAll = true
-				break
+	// Fetch rows from main table if not CTE
+	if table != nil {
+		initialColumns := stmt.Columns
+		needsAll := len(stmt.Aggregates) > 0 || where != nil
+		if !needsAll {
+			for _, sc := range stmt.SelectColumns {
+				if strings.ContainsAny(sc.Expression, "+-*/%(") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sc.Expression)), "CASE WHEN") {
+					needsAll = true
+					break
+				}
 			}
 		}
-	}
 
-	if needsAll {
-		initialColumns = []string{"*"}
-	}
+		if needsAll {
+			initialColumns = []string{"*"}
+		}
 
-	effectiveWhere := where
-	if len(stmt.Joins) > 0 {
-		initialColumns = []string{"*"}
-		effectiveWhere = nil // Delay filtering until after JOINs
-	}
+		effectiveWhere := where
+		hasNonTableCol := false
+		if where != nil {
+			var checkNonTable func(w *storage.WhereClause) bool
+			checkNonTable = func(w *storage.WhereClause) bool {
+				if w.Column != "" && !strings.Contains(w.Column, "(") && !strings.ContainsAny(w.Column, "+-*/%") {
+					colExists := false
+					for _, col := range table.Columns {
+						if col.Name == w.Column {
+							colExists = true
+							break
+						}
+					}
+					if !colExists {
+						return true
+					}
+				}
+				if w.And != nil && checkNonTable(w.And) {
+					return true
+				}
+				if w.Or != nil && checkNonTable(w.Or) {
+					return true
+				}
+				return false
+			}
+			hasNonTableCol = checkNonTable(where)
+		}
 
-	rows, err := table.Select(initialColumns, effectiveWhere)
-	if err != nil {
-		return nil, err
+		if len(stmt.Joins) > 0 || e.currentOuterRow != nil || hasNonTableCol {
+			initialColumns = []string{"*"}
+			effectiveWhere = nil // Delay filtering until after JOINs or executor phase
+		}
+
+
+		rows, err = table.Select(initialColumns, effectiveWhere)
+		if err != nil {
+			return nil, err
+		}
+
+		if (e.currentOuterRow != nil || hasNonTableCol) && where != nil && len(stmt.Joins) == 0 {
+			filteredRows := make([]storage.Row, 0)
+			for _, row := range rows {
+				if e.evaluateWhereOnRow(row, where) {
+					filteredRows = append(filteredRows, row)
+				}
+			}
+			rows = filteredRows
+		}
+	} else {
+		// It's a CTE. Apply WHERE if needed unless we have joins (delayed).
+		effectiveWhere := where
+		if len(stmt.Joins) > 0 {
+			effectiveWhere = nil
+		}
+		if effectiveWhere != nil {
+			filteredRows := make([]storage.Row, 0)
+			for _, row := range rows {
+				if e.evaluateWhereOnRow(row, effectiveWhere) {
+					filteredRows = append(filteredRows, row)
+				}
+			}
+			rows = filteredRows
+		}
 	}
 
 	// Apply TABLESAMPLE if requested
@@ -513,7 +603,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 
 	// Validate columns in WHERE clause (if not a JOIN where columns might be from other tables)
-	if len(stmt.Joins) == 0 && where != nil {
+	if len(stmt.Joins) == 0 && where != nil && table != nil {
 		if err := e.validateWhereColumns(table, where); err != nil {
 			return nil, err
 		}
@@ -636,7 +726,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 
 	// Determine output columns using SelectColumns for alias support
-	var columns []string
+
 	if len(stmt.SelectColumns) > 0 && !(len(stmt.SelectColumns) == 1 && stmt.SelectColumns[0].Expression == "*") {
 		columns = make([]string, len(stmt.SelectColumns))
 		// Rewrite rows to use aliased keys
@@ -672,35 +762,69 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			for j, sc := range stmt.SelectColumns {
 				outName := columns[j]
 				expr := sc.Expression
-				// Try exact key first
-				val, ok := row[expr]
-				if !ok {
-					// Try with table prefix variants
+				var val interface{}
+				var ok bool
+				if sc.Subquery != nil {
+					// Set outer context for scalar subquery (with qualified keys to prevent collisions)
+					qualifiedOuterRow := make(storage.Row)
 					for k, v := range row {
-						if k == expr || strings.HasSuffix(k, "."+expr) ||
-							(strings.Contains(expr, ".") && strings.HasSuffix(expr, "."+strings.Split(k, ".")[len(strings.Split(k, "."))-1])) {
-							val = v
-							ok = true
-							break
+						qualifiedOuterRow[k] = v
+					}
+					if stmt.TableName != "" {
+						for k, v := range row {
+							qualifiedOuterRow[stmt.TableName+"."+k] = v
 						}
 					}
-				}
-				if !ok {
-					// Try evaluate as arithmetic/function expression
-					// Use a sentinel to know it was evaluated (even if result is nil)
-					evaluated := false
-					if strings.Contains(expr, "(") || strings.ContainsAny(expr, "+-*/") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(expr)), "CASE") {
-						val = storage.EvaluateExpression(expr, row)
-						evaluated = true
-					} else {
-						val = storage.EvaluateExpression(expr, row)
-						if val != nil {
-							evaluated = true
+					if stmt.TableAlias != "" {
+						for k, v := range row {
+							qualifiedOuterRow[stmt.TableAlias+"."+k] = v
 						}
 					}
-					if !evaluated {
-						// Unknown column/expression — leave as nil (NULL)
+					e.currentOuterRow = qualifiedOuterRow
+					subqueryResult, err := e.executeSelect(sc.Subquery)
+					e.currentOuterRow = nil // clear
+					
+					if err != nil {
 						val = nil
+					} else if len(subqueryResult.Rows) > 0 {
+						// Get first column of first row
+						firstCol := subqueryResult.Columns[0]
+						val = subqueryResult.Rows[0][firstCol]
+					} else {
+						val = nil
+					}
+					ok = true
+				} else {
+					// Try exact key first
+					val, ok = row[expr]
+					if !ok {
+						// Try with table prefix variants
+						for k, v := range row {
+							if k == expr || strings.HasSuffix(k, "."+expr) ||
+								(strings.Contains(expr, ".") && strings.HasSuffix(expr, "."+strings.Split(k, ".")[len(strings.Split(k, "."))-1])) {
+								val = v
+								ok = true
+								break
+							}
+						}
+					}
+					if !ok {
+						// Try evaluate as arithmetic/function expression
+						// Use a sentinel to know it was evaluated (even if result is nil)
+						evaluated := false
+						if strings.Contains(expr, "(") || strings.ContainsAny(expr, "+-*/") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(expr)), "CASE") {
+							val = storage.EvaluateExpression(expr, row)
+							evaluated = true
+						} else {
+							val = storage.EvaluateExpression(expr, row)
+							if val != nil {
+								evaluated = true
+							}
+						}
+						if !evaluated {
+							// Unknown column/expression — leave as nil (NULL)
+							val = nil
+						}
 					}
 				}
 				newRow[outName] = val
@@ -709,17 +833,31 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 		rows = rewritten
 	} else {
-		columns = stmt.Columns
+		// Only override columns if stmt.Columns has specific columns requested.
+		// For CTEs, the initial columns might already be correctly inferred, 
+		// but if it's explicitly '*', we need to keep it as '*' logic.
+		if len(stmt.Columns) > 0 {
+			columns = stmt.Columns
+		}
 		if len(columns) == 1 && columns[0] == "*" {
-			columns = table.GetColumnNames()
-			// Add joined table columns with prefixes
-			for _, join := range stmt.Joins {
-				joinTable, ok := dbInstance.GetTable(join.Table)
-				if !ok {
-					continue
+			if table != nil {
+				columns = table.GetColumnNames()
+				// Add joined table columns with prefixes
+				if dbInstance != nil {
+					for _, join := range stmt.Joins {
+						joinTable, ok := dbInstance.GetTable(join.Table)
+						if !ok {
+							continue
+						}
+						for _, col := range joinTable.GetColumnNames() {
+							columns = append(columns, join.Table+"."+col)
+						}
+					}
 				}
-				for _, col := range joinTable.GetColumnNames() {
-					columns = append(columns, join.Table+"."+col)
+			} else {
+				// It's a CTE, we already have columns from result.Columns
+				if result, ok := e.cteResults[stmt.TableName]; ok {
+					columns = result.Columns
 				}
 			}
 		}
@@ -745,35 +883,134 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 	resultRows := leftRows
 
 	for _, join := range joins {
-		rightTable, exists := dbInstance.GetTable(join.Table)
-		if !exists {
-			return nil, fmt.Errorf("table %s does not exist", join.Table)
-		}
+		var rightTableRef string
+		var mergedResultRows []storage.Row
 
-		rightRows, err := rightTable.Select([]string{"*"}, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		// Determine effective name for right table (alias or name)
-		rightTableRef := join.Table
-		if join.Alias != "" {
+		if join.Lateral && join.Subquery != nil {
 			rightTableRef = join.Alias
-		}
+			if rightTableRef == "" {
+				rightTableRef = "subquery"
+			}
 
-		switch join.Type {
-		case "INNER":
-			resultRows = e.executeInnerJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
-		case "LEFT":
-			resultRows = e.executeLeftJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
-		case "RIGHT":
-			resultRows = e.executeRightJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
-		case "FULL":
-			resultRows = e.executeFullJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
-		case "CROSS":
-			resultRows = e.executeCrossJoin(leftTable, resultRows, rightTableRef, rightRows)
-		default:
-			return nil, fmt.Errorf("unsupported join type: %s", join.Type)
+			// LATERAL nested loop
+			for _, leftRow := range resultRows {
+				// Set outer context (with qualified keys to prevent collisions)
+				qualifiedOuterRow := make(storage.Row)
+				for k, v := range leftRow {
+					qualifiedOuterRow[k] = v
+				}
+				if leftTable != "" {
+					for k, v := range leftRow {
+						qualifiedOuterRow[leftTable+"."+k] = v
+					}
+				}
+				if e.currentStmt != nil {
+					if e.currentStmt.TableName != "" {
+						for k, v := range leftRow {
+							qualifiedOuterRow[e.currentStmt.TableName+"."+k] = v
+						}
+					}
+					if e.currentStmt.TableAlias != "" {
+						for k, v := range leftRow {
+							qualifiedOuterRow[e.currentStmt.TableAlias+"."+k] = v
+						}
+					}
+				}
+				e.currentOuterRow = qualifiedOuterRow
+				
+				subqueryResult, err := e.executeSelect(join.Subquery)
+				if err != nil {
+					e.currentOuterRow = nil
+					return nil, fmt.Errorf("lateral subquery failed: %w", err)
+				}
+				
+				e.currentOuterRow = nil
+
+				rightRows := subqueryResult.Rows
+				
+				// Execute join for this specific leftRow and its corresponding rightRows
+				// Since we execute per row, we can just use the standard join functions
+				// but passing a single-element slice for the left side
+				var singleRowResult []storage.Row
+				switch join.Type {
+				case "INNER":
+					singleRowResult = e.executeInnerJoin(leftTable, []storage.Row{leftRow}, rightTableRef, rightRows, join.Condition)
+				case "LEFT":
+					singleRowResult = e.executeLeftJoin(leftTable, []storage.Row{leftRow}, rightTableRef, rightRows, join.Condition)
+				case "RIGHT":
+					singleRowResult = e.executeRightJoin(leftTable, []storage.Row{leftRow}, rightTableRef, rightRows, join.Condition)
+				case "FULL":
+					singleRowResult = e.executeFullJoin(leftTable, []storage.Row{leftRow}, rightTableRef, rightRows, join.Condition)
+				case "CROSS":
+					singleRowResult = e.executeCrossJoin(leftTable, []storage.Row{leftRow}, rightTableRef, rightRows)
+				default:
+					return nil, fmt.Errorf("unsupported join type: %s", join.Type)
+				}
+				
+				mergedResultRows = append(mergedResultRows, singleRowResult...)
+			}
+			resultRows = mergedResultRows
+		} else {
+			rightTable, exists := dbInstance.GetTable(join.Table)
+			if !exists {
+				// Check if it's a CTE
+				if cteRes, ok := e.cteResults[join.Table]; ok {
+					rightRows := make([]storage.Row, len(cteRes.Rows))
+					for i, r := range cteRes.Rows {
+						rightRows[i] = make(storage.Row)
+						for k, v := range r {
+							rightRows[i][k] = v
+						}
+					}
+					
+					rightTableRef = join.Table
+					if join.Alias != "" {
+						rightTableRef = join.Alias
+					}
+					
+					switch join.Type {
+					case "INNER":
+						resultRows = e.executeInnerJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+					case "LEFT":
+						resultRows = e.executeLeftJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+					case "RIGHT":
+						resultRows = e.executeRightJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+					case "FULL":
+						resultRows = e.executeFullJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+					case "CROSS":
+						resultRows = e.executeCrossJoin(leftTable, resultRows, rightTableRef, rightRows)
+					default:
+						return nil, fmt.Errorf("unsupported join type: %s", join.Type)
+					}
+				} else {
+					return nil, fmt.Errorf("table %s does not exist", join.Table)
+				}
+			} else {
+				rightRows, err := rightTable.Select([]string{"*"}, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				rightTableRef = join.Table
+				if join.Alias != "" {
+					rightTableRef = join.Alias
+				}
+
+				switch join.Type {
+				case "INNER":
+					resultRows = e.executeInnerJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+				case "LEFT":
+					resultRows = e.executeLeftJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+				case "RIGHT":
+					resultRows = e.executeRightJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+				case "FULL":
+					resultRows = e.executeFullJoin(leftTable, resultRows, rightTableRef, rightRows, join.Condition)
+				case "CROSS":
+					resultRows = e.executeCrossJoin(leftTable, resultRows, rightTableRef, rightRows)
+				default:
+					return nil, fmt.Errorf("unsupported join type: %s", join.Type)
+				}
+			}
 		}
 
 		leftTable = rightTableRef // For chained joins
@@ -1208,8 +1445,19 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 		return match
 	}
 
+	evalRow := row
+	if e.currentOuterRow != nil {
+		evalRow = make(storage.Row)
+		for k, v := range e.currentOuterRow {
+			evalRow[k] = v
+		}
+		for k, v := range row {
+			evalRow[k] = v
+		}
+	}
+
 	// Detect any function-like call (containing parentheses)
-	val, exists := row[where.Column]
+	val, exists := evalRow[where.Column]
 	if !exists && strings.Contains(where.Column, "(") {
 		// If it's a function call NOT in the row, we assume it's a system function
 		// like current_user() that should be handled during variable resolution
@@ -1218,15 +1466,28 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 	} else {
 		if !exists {
 			// Try evaluate as arithmetic expression
-			val = storage.EvaluateExpression(where.Column, row)
+			val = storage.EvaluateExpression(where.Column, evalRow)
 			if val != nil {
 				exists = true
 			}
 		}
 
+		if !exists && e.currentStmt != nil {
+			// Fallback: check if the column is an alias defined in the SELECT list
+			for _, sc := range e.currentStmt.SelectColumns {
+				if sc.Alias == where.Column {
+					val = storage.EvaluateExpression(sc.Expression, evalRow)
+					if val != nil {
+						exists = true
+					}
+					break
+				}
+			}
+		}
+
 		if !exists {
 			// Try fuzzy matching for joined columns (e.g. c.relname)
-			for k, v := range row {
+			for k, v := range evalRow {
 				if strings.HasSuffix(k, "."+where.Column) || strings.HasSuffix(where.Column, "."+k) {
 					val = v
 					exists = true
@@ -1239,36 +1500,49 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 			// If column doesn't exist, it's a mismatch unless we're looking for NULL
 			match = (where.Operator == "=" && where.Value == nil)
 		} else {
+			rhsVal := where.Value
+			if s, ok := where.Value.(string); ok {
+				if rVal, exists := evalRow[s]; exists {
+					rhsVal = rVal
+				} else if strings.Contains(s, ".") {
+					parts := strings.Split(s, ".")
+					lastPart := parts[len(parts)-1]
+					if rVal, exists := evalRow[lastPart]; exists {
+						rhsVal = rVal
+					}
+				}
+			}
+
 			switch where.Operator {
 			case "=":
-				match = compareValues(val, where.Value) == 0
+				match = compareValues(val, rhsVal) == 0
 			case "!=", "<>":
-				match = compareValues(val, where.Value) != 0
+				match = compareValues(val, rhsVal) != 0
 			case "<":
-				match = compareValues(val, where.Value) < 0
+				match = compareValues(val, rhsVal) < 0
 			case "<=":
-				match = compareValues(val, where.Value) <= 0
+				match = compareValues(val, rhsVal) <= 0
 			case ">":
-				match = compareValues(val, where.Value) > 0
+				match = compareValues(val, rhsVal) > 0
 			case ">=":
-				match = compareValues(val, where.Value) >= 0
+				match = compareValues(val, rhsVal) >= 0
 			case "LIKE":
-				pattern := strings.ReplaceAll(fmt.Sprintf("%v", where.Value), "%", ".*")
+				pattern := strings.ReplaceAll(fmt.Sprintf("%v", rhsVal), "%", ".*")
 				pattern = strings.ReplaceAll(pattern, "_", ".")
 				// Map LIKE to a case-insensitive anchored regex
 				match, _ = regexp.MatchString("(?i)^"+pattern+"$", fmt.Sprintf("%v", val))
 			case "~":
-				match, _ = regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match, _ = regexp.MatchString(fmt.Sprintf("%v", rhsVal), fmt.Sprintf("%v", val))
 			case "~*":
-				match, _ = regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				match, _ = regexp.MatchString("(?i)"+fmt.Sprintf("%v", rhsVal), fmt.Sprintf("%v", val))
 			case "!~":
-				matched, _ := regexp.MatchString(fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				matched, _ := regexp.MatchString(fmt.Sprintf("%v", rhsVal), fmt.Sprintf("%v", val))
 				match = !matched
 			case "!~*":
-				matched, _ := regexp.MatchString("(?i)"+fmt.Sprintf("%v", where.Value), fmt.Sprintf("%v", val))
+				matched, _ := regexp.MatchString("(?i)"+fmt.Sprintf("%v", rhsVal), fmt.Sprintf("%v", val))
 				match = !matched
 			case "IN":
-				if list, ok := where.Value.([]interface{}); ok {
+				if list, ok := rhsVal.([]interface{}); ok {
 					for _, item := range list {
 						if compareValues(val, item) == 0 {
 							match = true
@@ -1828,6 +2102,14 @@ func (e *Executor) validateWhereColumns(table *storage.Table, where *storage.Whe
 			if col.Name == where.Column {
 				exists = true
 				break
+			}
+		}
+		if !exists && e.currentStmt != nil {
+			for _, sc := range e.currentStmt.SelectColumns {
+				if sc.Alias == where.Column {
+					exists = true
+					break
+				}
 			}
 		}
 		if !exists {
@@ -2394,17 +2676,76 @@ func (e *Executor) executeSelectWithCTEs(stmt *parser.SelectStmt) (*Result, erro
 	}
 
 	// Build virtual CTE tables in-memory
-	cteResults := make(map[string]*Result)
 	for _, cte := range stmt.CTEs {
-		result, err := e.executeSelect(cte.Query)
-		if err != nil {
-			return nil, fmt.Errorf("CTE %s failed: %w", cte.Name, err)
+		if !cte.Recursive {
+			var result *Result
+			var err error
+			switch q := cte.Query.(type) {
+			case *parser.SelectStmt:
+				result, err = e.executeSelect(q)
+			case *parser.CompoundSelectStmt:
+				result, err = e.executeCompoundSelect(q)
+			default:
+				return nil, fmt.Errorf("unexpected query type in CTE %s", cte.Name)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("CTE %s failed: %w", cte.Name, err)
+			}
+			e.cteResults[cte.Name] = result
+		} else {
+			// Recursive CTE
+			compound, ok := cte.Query.(*parser.CompoundSelectStmt)
+			if !ok {
+				return nil, fmt.Errorf("recursive CTE %s must be a UNION/UNION ALL compound query", cte.Name)
+			}
+
+			// 1. Evaluate base case (Left side of compound SELECT)
+			baseResult, err := e.executeSelect(compound.Left)
+			if err != nil {
+				return nil, fmt.Errorf("recursive CTE %s base query failed: %w", cte.Name, err)
+			}
+
+			allRows := append([]storage.Row{}, baseResult.Rows...)
+			workingRows := baseResult.Rows
+
+			// 2. Iterate up to 1000 times
+			for iter := 0; iter < 1000; iter++ {
+				// The next iteration queries using only the new rows from the previous iteration
+				e.cteResults[cte.Name] = &Result{Rows: workingRows, Columns: baseResult.Columns}
+
+				iterResult, err := e.executeSelect(compound.Right)
+				if err != nil {
+					return nil, fmt.Errorf("recursive CTE %s iteration %d failed: %w", cte.Name, iter, err)
+				}
+
+				if len(iterResult.Rows) == 0 {
+					break
+				}
+
+				// Rewrite iterResult rows to match baseResult column names by index
+				rewrittenRows := make([]storage.Row, len(iterResult.Rows))
+				for rIdx, row := range iterResult.Rows {
+					newRow := make(storage.Row)
+					for cIdx, colName := range baseResult.Columns {
+						if cIdx < len(iterResult.Columns) {
+							origCol := iterResult.Columns[cIdx]
+							newRow[colName] = row[origCol]
+						}
+					}
+					rewrittenRows[rIdx] = newRow
+				}
+
+				allRows = append(allRows, rewrittenRows...)
+				workingRows = rewrittenRows
+			}
+
+			// Store final accumulated result
+			e.cteResults[cte.Name] = &Result{Rows: allRows, Columns: baseResult.Columns}
 		}
-		cteResults[cte.Name] = result
 	}
 
 	// If the main query references a CTE as its table name, resolve it
-	if result, ok := cteResults[stmt.TableName]; ok {
+	if result, ok := e.cteResults[stmt.TableName]; ok {
 		// Filter + project from the CTE result
 		return e.applySelectOnRows(stmt, result.Rows, result.Columns), nil
 	}

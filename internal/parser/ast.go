@@ -103,7 +103,7 @@ type SelectStmt struct {
 type CTEDefinition struct {
 	Name      string
 	Recursive bool
-	Query     *SelectStmt
+	Query     Statement
 }
 
 // WindowDef represents OVER (PARTITION BY ... ORDER BY ...) for window functions
@@ -253,6 +253,8 @@ type JoinClause struct {
 	Table     string // Table to join
 	Alias     string // Optional table alias
 	Condition *JoinCondition
+	Lateral   bool        // True if LATERAL join
+	Subquery  *SelectStmt // For LATERAL (SELECT ...) joins
 }
 
 // JoinCondition represents ON condition
