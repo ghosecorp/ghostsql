@@ -95,12 +95,28 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeGrant(s)
 	case *parser.RevokeStmt:
 		return e.executeRevoke(s)
+	case *parser.AlterDefaultPrivilegesStmt:
+		return e.executeAlterDefaultPrivileges(s)
 	case *parser.CreatePolicyStmt:
 		return e.executeCreatePolicy(s)
 	case *parser.SetStmt:
-		return &Result{Message: "SET"}, nil
+		return e.executeSet(s)
+	case *parser.ShowVarStmt:
+		return e.executeShowVar(s)
+	case *parser.ResetStmt:
+		return e.executeReset(s)
+	case *parser.SetRoleStmt:
+		return e.executeSetRole(s)
+	case *parser.SetSessionAuthorizationStmt:
+		return e.executeSetSessionAuthorization(s)
+	case *parser.SetTransactionIsolationStmt:
+		return e.executeSetTransactionIsolation(s)
+	case *parser.LockTableStmt:
+		return e.executeLockTable(s)
 	case *parser.TransactionStmt:
-		return &Result{Message: s.Command}, nil
+		return e.executeTransaction(s)
+	case *parser.SavepointStmt:
+		return e.executeSavepoint(s)
 	case *parser.DropRoleStmt:
 		return e.executeDropRole(s)
 	case *parser.CreateViewStmt:
@@ -119,6 +135,14 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeRefreshMaterializedView(s)
 	case *parser.MergeStmt:
 		return e.executeMerge(s)
+	case *parser.DeclareCursorStmt:
+		return e.executeDeclareCursor(s)
+	case *parser.FetchCursorStmt:
+		return e.executeFetchCursor(s)
+	case *parser.MoveCursorStmt:
+		return e.executeMoveCursor(s)
+	case *parser.CloseCursorStmt:
+		return e.executeCloseCursor(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -139,7 +163,7 @@ func (e *Executor) checkPrivilege(objectType, objectName, privilege string) erro
 	// Owner bypass for TABLE objects (PostgreSQL standard: owner always has access)
 	if objectType == "TABLE" {
 		if dbInstance, err := e.getActiveDatabase(); err == nil {
-			if table, exists := dbInstance.GetTable(objectName); exists && table.Owner == user {
+			if table, exists := e.getTable(dbInstance, objectName); exists && table.Owner == user {
 				return nil
 			}
 		}
@@ -216,8 +240,22 @@ func (e *Executor) executeShowTables() (*Result, error) {
 		return nil, err
 	}
 
-	rows := make([]storage.Row, 0, len(dbInstance.Tables))
-	for tableName := range dbInstance.Tables {
+	tableNames := make(map[string]bool)
+	for k := range dbInstance.Tables {
+		tableNames[k] = true
+	}
+	if e.session != nil && e.session.TxActive {
+		for k, v := range e.session.TxTables {
+			if v == nil {
+				delete(tableNames, k)
+			} else {
+				tableNames[k] = true
+			}
+		}
+	}
+
+	rows := make([]storage.Row, 0, len(tableNames))
+	for tableName := range tableNames {
 		rows = append(rows, storage.Row{
 			"Table": tableName,
 		})
@@ -235,7 +273,7 @@ func (e *Executor) executeShowColumns(tableName string) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(tableName)
+	table, exists := e.getTable(dbInstance, tableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
@@ -315,9 +353,37 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// Set owner: the creator is the table owner (PostgreSQL standard)
 	owner := e.session.GetUser()
 	table := storage.NewTable(stmt.TableName, owner, columns, tableMeta)
-	dbInstance.SetTable(stmt.TableName, table)
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	// Apply ALTER DEFAULT PRIVILEGES rules
+	for _, rule := range e.db.RoleStore.DefaultPrivileges {
+		// If ForRole is defined, it must match the creator/owner of the new table
+		if rule.ForRole != "" && rule.ForRole != owner {
+			continue
+		}
+		// Match TABLES object type
+		if rule.ObjectType != "" && rule.ObjectType != "TABLES" {
+			continue
+		}
+		objectKey := "TABLE:" + stmt.TableName
+		if rule.IsGrant {
+			for _, priv := range rule.Privileges {
+				_ = e.db.RoleStore.GrantPrivilege(rule.ToFromRole, objectKey, priv)
+			}
+		} else {
+			if targetRole, exists := e.db.RoleStore.GetRole(rule.ToFromRole); exists {
+				if targetRole.Privileges != nil && targetRole.Privileges[objectKey] != nil {
+					for _, priv := range rule.Privileges {
+						delete(targetRole.Privileges[objectKey], priv)
+					}
+				}
+			}
+		}
+	}
+	_ = e.db.RoleStore.Save()
+
+	e.setTable(dbInstance, stmt.TableName, table)
+
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -335,7 +401,11 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -546,7 +616,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					continue
 				}
 
-				refTable, exists := dbInstance.GetTable(col.ForeignKey.RefTable)
+				refTable, exists := e.getTable(dbInstance, col.ForeignKey.RefTable)
 				if !exists {
 					return nil, fmt.Errorf("referenced table %s does not exist", col.ForeignKey.RefTable)
 				}
@@ -573,7 +643,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		lastInsertedRows = append(lastInsertedRows, row)
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -607,7 +677,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if stmt.TableName == "" {
 		rows = []storage.Row{make(storage.Row)}
 	} else {
-		if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
+		if err := e.checkTableOrColumnPrivilege(stmt.TableName, stmt.Columns, "SELECT"); err != nil {
 			return nil, err
 		}
 
@@ -629,6 +699,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				return nil, err
 			}
 
+			if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+				return nil, err
+			}
+			if stmt.ForUpdate {
+				if e.session == nil {
+					return nil, fmt.Errorf("no active session")
+				}
+				dbInstance.SetLock(stmt.TableName, e.session.ID)
+			}
+
 			// Check if it's a virtual view
 			dbName := dbInstance.Name
 			viewKey := dbName + "." + stmt.TableName
@@ -641,7 +721,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				columns = res.Columns
 			} else {
 				var exists bool
-				table, exists = dbInstance.GetTable(stmt.TableName)
+				table, exists = e.getTable(dbInstance, stmt.TableName)
 				if !exists {
 					return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 				}
@@ -884,7 +964,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			outName := sc.Expression
 			if sc.Alias != "" {
 				outName = sc.Alias
-			} else if strings.Contains(outName, ".") {
+			} else if strings.Contains(outName, ".") && !strings.Contains(outName, "(") && !strings.Contains(outName, " ") && !strings.Contains(outName, "'") && !strings.Contains(outName, "\"") {
 				// Strip table prefix: "c.relname" -> "relname"
 				parts := strings.Split(outName, ".")
 				outName = parts[len(parts)-1]
@@ -995,7 +1075,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				// Add joined table columns with prefixes
 				if dbInstance != nil {
 					for _, join := range stmt.Joins {
-						joinTable, ok := dbInstance.GetTable(join.Table)
+						joinTable, ok := e.getTable(dbInstance, join.Table)
 						if !ok {
 							viewKey := dbInstance.Name + "." + join.Table
 							if viewQuery, isView := viewRegistry[viewKey]; isView {
@@ -1119,7 +1199,7 @@ func (e *Executor) executeJoins(leftTable string, leftRows []storage.Row, joins 
 			}
 			resultRows = mergedResultRows
 		} else {
-			rightTable, exists := dbInstance.GetTable(join.Table)
+			rightTable, exists := e.getTable(dbInstance, join.Table)
 			if !exists {
 				viewKey := dbInstance.Name + "." + join.Table
 				if viewQuery, isView := viewRegistry[viewKey]; isView {
@@ -1736,6 +1816,8 @@ func (e *Executor) evaluateWhereOnRow(row storage.Row, where *storage.WhereClaus
 						}
 					}
 				}
+			case "@>":
+				match = storage.EvaluateJsonContain(val, rhsVal)
 			default:
 				match = false
 			}
@@ -1759,7 +1841,11 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1770,7 +1856,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	}
 
 	if stmt.FromTable != "" {
-		fromTable, ok := dbInstance.GetTable(stmt.FromTable)
+		fromTable, ok := e.getTable(dbInstance, stmt.FromTable)
 		if !ok {
 			return nil, fmt.Errorf("table %s does not exist", stmt.FromTable)
 		}
@@ -1817,7 +1903,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 			}
 		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -1835,7 +1921,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1855,7 +1941,11 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1866,7 +1956,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	}
 
 	if stmt.UsingTable != "" {
-		usingTable, ok := dbInstance.GetTable(stmt.UsingTable)
+		usingTable, ok := e.getTable(dbInstance, stmt.UsingTable)
 		if !ok {
 			return nil, fmt.Errorf("table %s does not exist", stmt.UsingTable)
 		}
@@ -1904,7 +1994,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 		table.Rows = newRows
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -1927,7 +2017,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -1946,18 +2036,24 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 		return nil, err
 	}
 
-	if _, exists := dbInstance.GetTable(stmt.TableName); !exists {
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	if _, exists := e.getTable(dbInstance, stmt.TableName); !exists {
 		if stmt.IfExists {
 			return &Result{Message: fmt.Sprintf("NOTICE: table %s does not exist, skipping", stmt.TableName)}, nil
 		}
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
 
-	dbInstance.DeleteTable(stmt.TableName)
+	e.deleteTable(dbInstance, stmt.TableName)
 
-	tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
-	if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to remove table file: %w", err)
+	if e.session == nil || !e.session.TxActive {
+		tablePath := filepath.Join(dbInstance.BasePath, "tables", stmt.TableName+".tbl")
+		if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to remove table file: %w", err)
+		}
 	}
 
 	return &Result{
@@ -1984,7 +2080,11 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -1993,7 +2093,7 @@ func (e *Executor) executeTruncate(stmt *parser.TruncateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2008,7 +2108,11 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	if err := e.checkTableLock(dbInstance, stmt.TableName); err != nil {
+		return nil, err
+	}
+
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2024,7 +2128,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 			return nil, err
 		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 
@@ -2038,13 +2142,15 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		newName := stmt.RenameTo
 		table.Name = newName
 		
-		dbInstance.DeleteTable(oldName)
-		dbInstance.SetTable(newName, table)
+		e.deleteTable(dbInstance, oldName)
+		e.setTable(dbInstance, newName, table)
 		
-		oldPath := filepath.Join(dbInstance.BasePath, "tables", oldName+".tbl")
-		os.Remove(oldPath)
+		if e.session == nil || !e.session.TxActive {
+			oldPath := filepath.Join(dbInstance.BasePath, "tables", oldName+".tbl")
+			os.Remove(oldPath)
+		}
 
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME TO %s", oldName, newName)}, nil
@@ -2054,7 +2160,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.DropColumn(stmt.DropColumn, stmt.IfExists); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", stmt.TableName, stmt.DropColumn)}, nil
@@ -2064,7 +2170,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.RenameColumn(stmt.RenameColumnFrom, stmt.RenameColumnTo); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s", stmt.TableName, stmt.RenameColumnFrom, stmt.RenameColumnTo)}, nil
@@ -2074,7 +2180,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 		if err := table.AlterColumnType(stmt.AlterColumnName, stmt.AlterColumnType); err != nil {
 			return nil, err
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %d", stmt.TableName, stmt.AlterColumnName, stmt.AlterColumnType)}, nil
@@ -2090,7 +2196,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 				}
 			}
 		}
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT", stmt.TableName)}, nil
@@ -2098,7 +2204,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 
 	if stmt.Action == "ENABLE_RLS" {
 		table.RLSEnabled = true
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
@@ -2106,7 +2212,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 
 	if stmt.Action == "DISABLE_RLS" {
 		table.RLSEnabled = false
-		if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+		if err := e.saveTableToDisk(dbInstance, table); err != nil {
 			return nil, fmt.Errorf("failed to persist table: %w", err)
 		}
 		return &Result{Message: fmt.Sprintf("ALTER TABLE %s DISABLE ROW LEVEL SECURITY", stmt.TableName)}, nil
@@ -2139,7 +2245,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.ObjectName)
+	table, exists := e.getTableForModification(dbInstance, stmt.ObjectName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.ObjectName)
 	}
@@ -2157,7 +2263,7 @@ func (e *Executor) executeCommentTable(stmt *parser.CommentStmt) (*Result, error
 		table.Metadata.Description = stmt.Comment
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2176,7 +2282,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column comments require format: COMMENT ON COLUMN table.column IS 'comment'")
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2205,7 +2311,7 @@ func (e *Executor) executeCommentColumn(stmt *parser.CommentStmt) (*Result, erro
 		return nil, fmt.Errorf("column %s not found in table %s", stmt.ObjectName, stmt.TableName)
 	}
 
-	if err := e.db.SaveTableToDisk(dbInstance, table); err != nil {
+	if err := e.saveTableToDisk(dbInstance, table); err != nil {
 		return nil, fmt.Errorf("failed to persist table: %w", err)
 	}
 
@@ -2297,7 +2403,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 		return nil, err
 	}
 
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -2616,19 +2722,58 @@ func (e *Executor) executeGrant(stmt *parser.GrantStmt) (*Result, error) {
 		return nil, fmt.Errorf("only superuser can GRANT privileges")
 	}
 
+	if stmt.ObjectType == "ROLE" {
+		targetRole, exists := e.db.RoleStore.GetRole(stmt.ToRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.ToRole)
+		}
+		// Grant membership: targetRole inherits stmt.ObjectName (parent role)
+		found := false
+		for _, m := range targetRole.MemberOf {
+			if m == stmt.ObjectName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			targetRole.MemberOf = append(targetRole.MemberOf, stmt.ObjectName)
+		}
+		_ = e.db.RoleStore.Save()
+		return &Result{
+			Message: "GRANT ROLE successful",
+		}, nil
+	}
+
 	privs := stmt.Privileges
 	if stmt.All {
 		privs = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
 	}
 
-	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
-	for _, priv := range privs {
-		if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
-			return nil, err
+	if len(stmt.Columns) > 0 {
+		for _, col := range stmt.Columns {
+			objectKey := fmt.Sprintf("%s:%s:%s", stmt.ObjectType, stmt.ObjectName, col)
+			for _, priv := range privs {
+				if stmt.WithGrantOption {
+					_ = e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv+"_GRANT_OPTION")
+				}
+				if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
+					return nil, err
+				}
+			}
+		}
+	} else {
+		objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+		for _, priv := range privs {
+			if stmt.WithGrantOption {
+				_ = e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv+"_GRANT_OPTION")
+			}
+			if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	e.db.RoleStore.Save()
+	_ = e.db.RoleStore.Save()
 	return &Result{
 		Message: "GRANT successful",
 	}, nil
@@ -2640,25 +2785,138 @@ func (e *Executor) executeRevoke(stmt *parser.RevokeStmt) (*Result, error) {
 		return nil, fmt.Errorf("only superuser can REVOKE privileges")
 	}
 
-	role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
-	if !exists {
-		return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+	if stmt.ObjectType == "ROLE" {
+		targetRole, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+		}
+		// Remove membership from MemberOf
+		var newMemberOf []string
+		for _, m := range targetRole.MemberOf {
+			if m != stmt.ObjectName {
+				newMemberOf = append(newMemberOf, m)
+			}
+		}
+		targetRole.MemberOf = newMemberOf
+		_ = e.db.RoleStore.Save()
+		return &Result{
+			Message: "REVOKE ROLE successful",
+		}, nil
 	}
 
-	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
-	if stmt.All {
-		delete(role.Privileges, objectKey)
+	if len(stmt.Columns) > 0 {
+		for _, col := range stmt.Columns {
+			objectKey := fmt.Sprintf("%s:%s:%s", stmt.ObjectType, stmt.ObjectName, col)
+			role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+			if !exists {
+				return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+			}
+			if stmt.GrantOptionOnly {
+				if role.Privileges != nil && role.Privileges[objectKey] != nil {
+					for _, priv := range stmt.Privileges {
+						delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+					}
+				}
+			} else {
+				if stmt.All {
+					delete(role.Privileges, objectKey)
+				} else {
+					if role.Privileges != nil && role.Privileges[objectKey] != nil {
+						for _, priv := range stmt.Privileges {
+							delete(role.Privileges[objectKey], priv)
+							delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+						}
+					}
+				}
+			}
+		}
 	} else {
-		if role.Privileges != nil && role.Privileges[objectKey] != nil {
-			for _, priv := range stmt.Privileges {
-				delete(role.Privileges[objectKey], priv)
+		objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+		role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+		}
+		if stmt.GrantOptionOnly {
+			if role.Privileges != nil && role.Privileges[objectKey] != nil {
+				for _, priv := range stmt.Privileges {
+					delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+				}
+			}
+		} else {
+			if stmt.All {
+				delete(role.Privileges, objectKey)
+			} else {
+				if role.Privileges != nil && role.Privileges[objectKey] != nil {
+					for _, priv := range stmt.Privileges {
+						delete(role.Privileges[objectKey], priv)
+						delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+					}
+				}
 			}
 		}
 	}
 
-	e.db.RoleStore.Save()
+	_ = e.db.RoleStore.Save()
 	return &Result{
 		Message: "REVOKE successful",
+	}, nil
+}
+
+func (e *Executor) executeAlterDefaultPrivileges(stmt *parser.AlterDefaultPrivilegesStmt) (*Result, error) {
+	// Only superuser can run ALTER DEFAULT PRIVILEGES
+	user := e.session.GetUser()
+	if user != "ghost" {
+		return nil, fmt.Errorf("only superuser can ALTER DEFAULT PRIVILEGES")
+	}
+
+	if !stmt.IsGrant {
+		// Clean up matching default privilege rules (REVOKE behavior)
+		var updatedRules []storage.DefaultPrivilegeRule
+		for _, r := range e.db.RoleStore.DefaultPrivileges {
+			if r.ForRole == stmt.ForRole && r.InSchema == stmt.InSchema && r.ObjectType == stmt.ObjectType && r.ToFromRole == stmt.ToFromRole && r.IsGrant {
+				var remainingPrivs []string
+				for _, p := range r.Privileges {
+					revoked := false
+					for _, rp := range stmt.Privileges {
+						if p == rp {
+							revoked = true
+							break
+						}
+					}
+					if !revoked {
+						remainingPrivs = append(remainingPrivs, p)
+					}
+				}
+				if len(remainingPrivs) > 0 {
+					r.Privileges = remainingPrivs
+					updatedRules = append(updatedRules, r)
+				}
+			} else {
+				updatedRules = append(updatedRules, r)
+			}
+		}
+		e.db.RoleStore.DefaultPrivileges = updatedRules
+		_ = e.db.RoleStore.Save()
+
+		return &Result{
+			Message: "ALTER DEFAULT PRIVILEGES successful",
+		}, nil
+	}
+
+	rule := storage.DefaultPrivilegeRule{
+		ForRole:    stmt.ForRole,
+		InSchema:   stmt.InSchema,
+		IsGrant:    stmt.IsGrant,
+		Privileges: stmt.Privileges,
+		ObjectType: stmt.ObjectType,
+		ToFromRole: stmt.ToFromRole,
+	}
+
+	e.db.RoleStore.DefaultPrivileges = append(e.db.RoleStore.DefaultPrivileges, rule)
+	_ = e.db.RoleStore.Save()
+
+	return &Result{
+		Message: "ALTER DEFAULT PRIVILEGES successful",
 	}, nil
 }
 
@@ -2689,7 +2947,7 @@ func (e *Executor) executeCreatePolicy(stmt *parser.CreatePolicyStmt) (*Result, 
 		return nil, err
 	}
 	
-	table, exists := dbInstance.GetTable(stmt.TableName)
+	table, exists := e.getTableForModification(dbInstance, stmt.TableName)
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", stmt.TableName)
 	}
@@ -3333,7 +3591,7 @@ func (e *Executor) executeCreateMaterializedView(stmt *parser.CreateMaterialized
 	dbName := dbInstance.Name
 	mvKey := dbName + "." + stmt.ViewName
 
-	if _, exists := dbInstance.GetTable(stmt.ViewName); exists {
+	if _, exists := e.getTable(dbInstance, stmt.ViewName); exists {
 		if stmt.IfNotExists {
 			return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
 		}
@@ -3359,10 +3617,10 @@ func (e *Executor) executeCreateMaterializedView(stmt *parser.CreateMaterialized
 		table.Insert(row)
 	}
 
-	dbInstance.SetTable(stmt.ViewName, table)
+	e.setTable(dbInstance, stmt.ViewName, table)
 	materializedViewRegistry[mvKey] = stmt.Query
 
-	e.db.SaveTableToDisk(dbInstance, table)
+	e.saveTableToDisk(dbInstance, table)
 
 	return &Result{Message: "CREATE MATERIALIZED VIEW"}, nil
 }
@@ -3381,7 +3639,7 @@ func (e *Executor) executeRefreshMaterializedView(stmt *parser.RefreshMaterializ
 		return nil, fmt.Errorf("materialized view %s does not exist", stmt.ViewName)
 	}
 
-	table, ok := dbInstance.GetTable(stmt.ViewName)
+	table, ok := e.getTableForModification(dbInstance, stmt.ViewName)
 	if !ok {
 		return nil, fmt.Errorf("materialized view physical table %s not found", stmt.ViewName)
 	}
@@ -3396,7 +3654,7 @@ func (e *Executor) executeRefreshMaterializedView(stmt *parser.RefreshMaterializ
 		table.Insert(row)
 	}
 
-	e.db.SaveTableToDisk(dbInstance, table)
+	e.saveTableToDisk(dbInstance, table)
 
 	return &Result{Message: "REFRESH MATERIALIZED VIEW"}, nil
 }
@@ -3407,7 +3665,16 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		return nil, err
 	}
 
-	targetTable, exists := dbInstance.GetTable(stmt.TargetTable)
+	if err := e.checkTableLock(dbInstance, stmt.TargetTable); err != nil {
+		return nil, err
+	}
+	if stmt.SourceTable != "" {
+		if err := e.checkTableLock(dbInstance, stmt.SourceTable); err != nil {
+			return nil, err
+		}
+	}
+
+	targetTable, exists := e.getTableForModification(dbInstance, stmt.TargetTable)
 	if !exists {
 		return nil, fmt.Errorf("target table %s does not exist", stmt.TargetTable)
 	}
@@ -3420,7 +3687,7 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		}
 		sourceRows = res.Rows
 	} else {
-		srcTab, ok := dbInstance.GetTable(stmt.SourceTable)
+		srcTab, ok := e.getTable(dbInstance, stmt.SourceTable)
 		if !ok {
 			return nil, fmt.Errorf("source table %s does not exist", stmt.SourceTable)
 		}
@@ -3509,9 +3776,455 @@ func (e *Executor) executeMerge(stmt *parser.MergeStmt) (*Result, error) {
 		}
 	}
 
-	e.db.SaveTableToDisk(dbInstance, targetTable)
+	e.saveTableToDisk(dbInstance, targetTable)
 
 	return &Result{
 		Message: fmt.Sprintf("MERGE %d row(s)", matchedCount+notMatchedCount),
 	}, nil
 }
+
+func (e *Executor) checkTableLock(dbInstance *storage.DatabaseInstance, name string) error {
+	if e.session == nil {
+		return nil
+	}
+	if lockOwner, locked := dbInstance.GetLock(name); locked {
+		if lockOwner != e.session.ID {
+			return fmt.Errorf("table %s is locked by session %s", name, lockOwner)
+		}
+	}
+	return nil
+}
+
+func (e *Executor) getTable(dbInstance *storage.DatabaseInstance, name string) (*storage.Table, bool) {
+	if e.session != nil && e.session.TxActive {
+		if t, ok := e.session.TxTables[name]; ok {
+			if t == nil {
+				return nil, false // Deleted in transaction
+			}
+			return t, true
+		}
+	}
+	return dbInstance.GetTable(name)
+}
+
+func (e *Executor) getTableForModification(dbInstance *storage.DatabaseInstance, name string) (*storage.Table, bool) {
+	table, exists := dbInstance.GetTable(name)
+	if !exists {
+		return nil, false
+	}
+	if e.session != nil && e.session.TxActive {
+		if t, ok := e.session.TxTables[name]; ok {
+			if t == nil {
+				return nil, false
+			}
+			return t, true
+		}
+		// Clone and store in TxTables
+		cloned := table.Clone()
+		e.session.TxTables[name] = cloned
+		return cloned, true
+	}
+	return table, true
+}
+
+func (e *Executor) setTable(dbInstance *storage.DatabaseInstance, name string, table *storage.Table) {
+	if e.session != nil && e.session.TxActive {
+		e.session.TxTables[name] = table
+		return
+	}
+	dbInstance.SetTable(name, table)
+}
+
+func (e *Executor) deleteTable(dbInstance *storage.DatabaseInstance, name string) {
+	if e.session != nil && e.session.TxActive {
+		e.session.TxTables[name] = nil
+		return
+	}
+	dbInstance.DeleteTable(name)
+}
+
+func (e *Executor) saveTableToDisk(dbInstance *storage.DatabaseInstance, table *storage.Table) error {
+	if e.session != nil && e.session.TxActive {
+		return nil
+	}
+	return e.db.SaveTableToDisk(dbInstance, table)
+}
+
+func (e *Executor) executeTransaction(stmt *parser.TransactionStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	switch stmt.Command {
+	case "BEGIN":
+		e.session.TxActive = true
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		return &Result{Message: "BEGIN"}, nil
+
+	case "COMMIT":
+		if !e.session.TxActive {
+			return &Result{Message: "COMMIT"}, nil
+		}
+		dbInstance, err := e.getActiveDatabase()
+		if err != nil {
+			return nil, err
+		}
+		for name, t := range e.session.TxTables {
+			if t == nil {
+				dbInstance.DeleteTable(name)
+				tablePath := filepath.Join(dbInstance.BasePath, "tables", name+".tbl")
+				_ = os.Remove(tablePath)
+			} else {
+				dbInstance.SetTable(name, t)
+				if err := e.db.SaveTableToDisk(dbInstance, t); err != nil {
+					return nil, err
+				}
+			}
+		}
+		e.session.TxActive = false
+		dbInstance.ReleaseAllSessionLocks(e.session.ID)
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		e.session.TxLocalVariables = make(map[string]string)
+		return &Result{Message: "COMMIT"}, nil
+
+	case "ROLLBACK":
+		e.session.TxActive = false
+		for name, originalVal := range e.session.TxLocalVariables {
+			e.session.Variables[name] = originalVal
+		}
+		if dbInstance, err := e.getActiveDatabase(); err == nil {
+			dbInstance.ReleaseAllSessionLocks(e.session.ID)
+		}
+		e.session.TxTables = make(map[string]*storage.Table)
+		e.session.TxSavepoints = make(map[string]map[string]*storage.Table)
+		e.session.TxLocalVariables = make(map[string]string)
+		return &Result{Message: "ROLLBACK"}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown transaction command: %s", stmt.Command)
+	}
+}
+
+func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	if !e.session.TxActive {
+		return nil, fmt.Errorf("no active transaction")
+	}
+
+	switch stmt.Command {
+	case "SAVEPOINT":
+		// Clone all current TxTables to savepoint
+		snapshot := make(map[string]*storage.Table)
+		for name, t := range e.session.TxTables {
+			if t == nil {
+				snapshot[name] = nil
+			} else {
+				snapshot[name] = t.Clone()
+			}
+		}
+		e.session.TxSavepoints[stmt.Name] = snapshot
+		return &Result{Message: "SAVEPOINT"}, nil
+
+	case "ROLLBACK TO":
+		snapshot, exists := e.session.TxSavepoints[stmt.Name]
+		if !exists {
+			return nil, fmt.Errorf("savepoint %s does not exist", stmt.Name)
+		}
+		// Restore e.session.TxTables from snapshot
+		e.session.TxTables = make(map[string]*storage.Table)
+		for name, t := range snapshot {
+			if t == nil {
+				e.session.TxTables[name] = nil
+			} else {
+				e.session.TxTables[name] = t.Clone()
+			}
+		}
+		return &Result{Message: "ROLLBACK TO SAVEPOINT"}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown savepoint command: %s", stmt.Command)
+	}
+}
+
+func (e *Executor) executeSet(stmt *parser.SetStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	if stmt.IsLocal {
+		e.session.SetLocalVariable(name, stmt.Value)
+	} else {
+		e.session.SetVariable(name, stmt.Value)
+	}
+	return &Result{Message: "SET"}, nil
+}
+
+func (e *Executor) executeShowVar(stmt *parser.ShowVarStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	val := e.session.GetVariable(name)
+	if val == "" {
+		val = storage.DefaultSessionVariables[name]
+	}
+
+	rows := []storage.Row{
+		{name: val},
+	}
+	return &Result{
+		Rows:    rows,
+		Columns: []string{name},
+	}, nil
+}
+
+func (e *Executor) executeReset(stmt *parser.ResetStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := strings.ToLower(stmt.Name)
+	e.session.ResetVariable(name)
+	return &Result{Message: "RESET"}, nil
+}
+
+func (e *Executor) executeSetRole(stmt *parser.SetRoleStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	e.session.SetUser(stmt.Role)
+	return &Result{Message: "SET ROLE"}, nil
+}
+
+func (e *Executor) executeSetSessionAuthorization(stmt *parser.SetSessionAuthorizationStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	e.session.SetSessionUser(stmt.User)
+	e.session.SetUser(stmt.User)
+	return &Result{Message: "SET SESSION AUTHORIZATION"}, nil
+}
+
+func (e *Executor) executeSetTransactionIsolation(stmt *parser.SetTransactionIsolationStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := "transaction_isolation"
+	if stmt.IsLocal {
+		e.session.SetLocalVariable(name, stmt.Level)
+	} else {
+		e.session.SetVariable(name, stmt.Level)
+	}
+	return &Result{Message: "SET TRANSACTION ISOLATION LEVEL"}, nil
+}
+
+func (e *Executor) executeLockTable(stmt *parser.LockTableStmt) (*Result, error) {
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return nil, err
+	}
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	// Check if already locked by another session
+	if owner, locked := dbInstance.GetLock(stmt.TableName); locked && owner != e.session.ID {
+		return nil, fmt.Errorf("table %s is locked by session %s", stmt.TableName, owner)
+	}
+
+	// Lock it for our session
+	dbInstance.SetLock(stmt.TableName, e.session.ID)
+	return &Result{Message: "LOCK TABLE"}, nil
+}
+
+func (e *Executor) executeDeclareCursor(stmt *parser.DeclareCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	// Execute the select query to obtain the full result set
+	res, err := e.executeSelect(stmt.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create and register the cursor in session Cursors
+	cursor := &storage.Cursor{
+		Name:       stmt.Name,
+		Query:      stmt.Query,
+		Rows:       res.Rows,
+		CurrentIdx: 0,
+	}
+
+	e.session.AddCursor(stmt.Name, cursor)
+
+	return &Result{
+		Message: fmt.Sprintf("DECLARE CURSOR %s", stmt.Name),
+	}, nil
+}
+
+func (e *Executor) executeFetchCursor(stmt *parser.FetchCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	cursor, ok := e.session.GetCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	// Determine how many rows to fetch
+	totalRows := len(cursor.Rows)
+	if cursor.CurrentIdx >= totalRows {
+		return &Result{
+			Message: "FETCH 0",
+			Rows:    []storage.Row{},
+		}, nil
+	}
+
+	fetchCount := stmt.Count
+	if fetchCount <= 0 {
+		fetchCount = 1
+	}
+
+	endIdx := cursor.CurrentIdx + fetchCount
+	if endIdx > totalRows {
+		endIdx = totalRows
+	}
+
+	fetchedRows := cursor.Rows[cursor.CurrentIdx:endIdx]
+	cursor.CurrentIdx = endIdx
+
+	// Build column name list to complete columns in Result
+	var cols []string
+	if len(fetchedRows) > 0 {
+		for k := range fetchedRows[0] {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("FETCH %d", len(fetchedRows)),
+		Rows:    fetchedRows,
+		Columns: cols,
+	}, nil
+}
+
+func (e *Executor) executeMoveCursor(stmt *parser.MoveCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	cursor, ok := e.session.GetCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	totalRows := len(cursor.Rows)
+	moveCount := stmt.Count
+	if moveCount <= 0 {
+		moveCount = 1
+	}
+
+	startIdx := cursor.CurrentIdx
+	cursor.CurrentIdx += moveCount
+	if cursor.CurrentIdx > totalRows {
+		cursor.CurrentIdx = totalRows
+	}
+
+	actualMoved := cursor.CurrentIdx - startIdx
+
+	return &Result{
+		Message: fmt.Sprintf("MOVE %d", actualMoved),
+	}, nil
+}
+
+func (e *Executor) executeCloseCursor(stmt *parser.CloseCursorStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+
+	ok := e.session.DeleteCursor(stmt.Name)
+	if !ok {
+		return nil, fmt.Errorf("cursor %s does not exist", stmt.Name)
+	}
+
+	return &Result{
+		Message: fmt.Sprintf("CLOSE CURSOR %s", stmt.Name),
+	}, nil
+}
+
+func (e *Executor) checkTableOrColumnPrivilege(tableName string, columns []string, privilege string) error {
+	// First check table-level privilege
+	if err := e.checkPrivilege("TABLE", tableName, privilege); err == nil {
+		return nil
+	}
+
+	// Table level failed. Let's see if we have column-level privileges for all requested columns!
+	if len(columns) == 0 {
+		return fmt.Errorf("permission denied for %s on TABLE %s", privilege, tableName)
+	}
+
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return err
+	}
+
+	table, exists := e.getTable(dbInstance, tableName)
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// Determine the actual columns being projected
+	var colsToCheck []string
+	isAllColumns := false
+	for _, col := range columns {
+		if col == "*" {
+			isAllColumns = true
+			break
+		} else {
+			colsToCheck = append(colsToCheck, col)
+		}
+	}
+
+	user := e.session.GetUser()
+
+	// Owner check (owner always has column-level SELECT bypass too)
+	if table.Owner == user {
+		return nil
+	}
+	
+	// Superuser check
+	if role, ok := e.db.RoleStore.GetRole(user); ok && role.IsSuperuser {
+		return nil
+	}
+	if user == "ghost" {
+		return nil
+	}
+
+	if isAllColumns {
+		// User must have SELECT privilege on all columns of the table!
+		for _, col := range table.Columns {
+			colKey := fmt.Sprintf("TABLE:%s:%s", tableName, col.Name)
+			if !e.db.RoleStore.HasPrivilege(user, colKey, privilege) {
+				return fmt.Errorf("permission denied for %s on COLUMN %s.%s", privilege, tableName, col.Name)
+			}
+		}
+		return nil
+	}
+
+	// User must have SELECT privilege on each specified column
+	for _, colName := range colsToCheck {
+		colKey := fmt.Sprintf("TABLE:%s:%s", tableName, colName)
+		if !e.db.RoleStore.HasPrivilege(user, colKey, privilege) {
+			return fmt.Errorf("permission denied for %s on COLUMN %s.%s", privilege, tableName, colName)
+		}
+	}
+
+	return nil
+}
+

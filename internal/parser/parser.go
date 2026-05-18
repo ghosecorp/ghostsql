@@ -75,7 +75,34 @@ func (p *Parser) Parse() (Statement, error) {
 		stmt = &TransactionStmt{Command: "COMMIT"}
 	case TOKEN_ROLLBACK:
 		p.nextToken()
-		stmt = &TransactionStmt{Command: "ROLLBACK"}
+		if p.current.Type == TOKEN_TO || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "TO") {
+			p.nextToken()
+			if p.current.Type == TOKEN_SAVEPOINT || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "SAVEPOINT") {
+				p.nextToken()
+			}
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected savepoint name after ROLLBACK TO")
+			}
+			spName := p.current.Literal
+			p.nextToken()
+			stmt = &SavepointStmt{Command: "ROLLBACK TO", Name: spName}
+		} else {
+			stmt = &TransactionStmt{Command: "ROLLBACK"}
+		}
+	case TOKEN_SAVEPOINT:
+		stmt, err = p.parseSavepoint()
+	case TOKEN_RESET:
+		stmt, err = p.parseReset()
+	case TOKEN_LOCK:
+		stmt, err = p.parseLock()
+	case TOKEN_DECLARE:
+		stmt, err = p.parseDeclareCursor()
+	case TOKEN_FETCH:
+		stmt, err = p.parseFetchCursor()
+	case TOKEN_MOVE:
+		stmt, err = p.parseMoveCursor()
+	case TOKEN_CLOSE:
+		stmt, err = p.parseCloseCursor()
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", p.current.Type)
 	}
@@ -582,8 +609,10 @@ func (p *Parser) parseAlter() (Statement, error) {
 		return p.parseAlterTable()
 	case TOKEN_ROLE:
 		return p.parseAlterRole()
+	case TOKEN_DEFAULT:
+		return p.parseAlterDefaultPrivileges()
 	default:
-		return nil, fmt.Errorf("expected TABLE or ROLE after ALTER")
+		return nil, fmt.Errorf("expected TABLE, ROLE or DEFAULT after ALTER")
 	}
 }
 
@@ -842,22 +871,19 @@ func (p *Parser) parseUse() (*UseDatabaseStmt, error) {
 	return stmt, nil
 }
 
-func (p *Parser) parseShow() (*ShowStmt, error) {
-	stmt := &ShowStmt{}
-
+func (p *Parser) parseShow() (Statement, error) {
 	p.nextToken() // consume SHOW
 
 	switch p.current.Type {
 	case TOKEN_DATABASES:
-		stmt.ShowType = "DATABASES"
 		p.nextToken()
+		return &ShowStmt{ShowType: "DATABASES"}, nil
 
 	case TOKEN_TABLES:
-		stmt.ShowType = "TABLES"
 		p.nextToken()
+		return &ShowStmt{ShowType: "TABLES"}, nil
 
 	case TOKEN_COLUMNS:
-		stmt.ShowType = "COLUMNS"
 		p.nextToken()
 
 		if p.current.Type != TOKEN_FROM {
@@ -868,14 +894,18 @@ func (p *Parser) parseShow() (*ShowStmt, error) {
 		if p.current.Type != TOKEN_IDENT {
 			return nil, fmt.Errorf("expected table name")
 		}
-		stmt.TableName = p.current.Literal
+		tableName := p.current.Literal
 		p.nextToken()
+		return &ShowStmt{ShowType: "COLUMNS", TableName: tableName}, nil
+
+	case TOKEN_IDENT:
+		varName := p.current.Literal
+		p.nextToken()
+		return &ShowVarStmt{Name: varName}, nil
 
 	default:
-		return nil, fmt.Errorf("expected DATABASES, TABLES, or COLUMNS after SHOW")
+		return nil, fmt.Errorf("expected DATABASES, TABLES, COLUMNS, or variable name after SHOW")
 	}
-
-	return stmt, nil
 }
 
 func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
@@ -974,7 +1004,7 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	col.Name = p.current.Literal
 	p.nextToken()
 
-	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SERIAL && p.current.Type != TOKEN_BIGSERIAL {
+	if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SERIAL && p.current.Type != TOKEN_BIGSERIAL && p.current.Type != TOKEN_JSONB {
 		return col, fmt.Errorf("expected column type after %s, got %s (literal: '%s')", col.Name, p.current.Type, p.current.Literal)
 	}
 
@@ -1050,6 +1080,10 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 			}
 			p.nextToken()
 		}
+
+	case "JSONB":
+		col.Type = storage.TypeJSONB
+		p.nextToken()
 
 	default:
 		return col, fmt.Errorf("unknown type: %s", typeName)
@@ -1712,11 +1746,15 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 				}
 				stmt.Columns = append(stmt.Columns, name)
 				stmt.SelectColumns = append(stmt.SelectColumns, SelectColumn{Expression: name, Alias: alias})
-			} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
-				// Arithmetic expression starting with identifier
+			} else if p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH || p.current.Type == TOKEN_JSON_ARROW || p.current.Type == TOKEN_JSON_TEXT_ARROW || p.current.Type == TOKEN_JSON_CONTAIN {
+				// Arithmetic or JSON expression starting with identifier
 				expr := name
 				for p.current.Type != TOKEN_COMMA && p.current.Type != TOKEN_FROM && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_AS {
-					expr += p.current.Literal
+					if p.current.Type == TOKEN_STRING {
+						expr += "'" + p.current.Literal + "'"
+					} else {
+						expr += p.current.Literal
+					}
 					p.nextToken()
 				}
 				expr = strings.TrimSpace(expr)
@@ -2112,6 +2150,17 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		p.nextToken()
 	}
 
+	// Parse FOR UPDATE
+	if p.current.Type == TOKEN_FOR || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FOR") {
+		p.nextToken()
+		if p.current.Type == TOKEN_UPDATE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "UPDATE") {
+			stmt.ForUpdate = true
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected UPDATE after FOR")
+		}
+	}
+
 	return stmt, nil
 }
 
@@ -2229,8 +2278,8 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 		}
 		p.nextToken()
 
-		// Handle dots, function calls, and arithmetic operators
-		for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH {
+		// Handle dots, function calls, arithmetic operators, and JSON operators
+		for p.current.Type == TOKEN_DOT || p.current.Type == TOKEN_LPAREN || p.current.Type == TOKEN_PLUS || p.current.Type == TOKEN_MINUS || p.current.Type == TOKEN_ASTERISK || p.current.Type == TOKEN_SLASH || p.current.Type == TOKEN_JSON_ARROW || p.current.Type == TOKEN_JSON_TEXT_ARROW {
 			if p.current.Type == TOKEN_DOT {
 				p.nextToken()
 				lhs += "." + p.current.Literal
@@ -2240,6 +2289,13 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 				p.nextToken()
 				if p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
 					lhs += p.current.Literal
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_JSON_ARROW || p.current.Type == TOKEN_JSON_TEXT_ARROW {
+				lhs += p.current.Literal
+				p.nextToken()
+				if p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
+					lhs += "'" + p.current.Literal + "'"
 					p.nextToken()
 				}
 			} else if p.current.Type == TOKEN_LPAREN {
@@ -2269,6 +2325,8 @@ func (p *Parser) parseWhere() (*WhereClause, error) {
 		switch p.current.Type {
 		case TOKEN_EQUALS:
 			where.Operator = "="
+		case TOKEN_JSON_CONTAIN:
+			where.Operator = "@>"
 		case TOKEN_LT:
 			where.Operator = "<"
 		case TOKEN_GT:
@@ -3039,9 +3097,151 @@ func (p *Parser) parseAlterRole() (*AlterRoleStmt, error) {
 	return stmt, nil
 }
 
+func (p *Parser) parseAlterDefaultPrivileges() (Statement, error) {
+	p.nextToken() // consume DEFAULT
+
+	if p.current.Type != TOKEN_PRIVILEGES {
+		return nil, fmt.Errorf("expected PRIVILEGES after ALTER DEFAULT")
+	}
+	p.nextToken() // consume PRIVILEGES
+
+	stmt := &AlterDefaultPrivilegesStmt{}
+
+	// Optional: FOR ROLE target_role
+	if p.current.Type == TOKEN_FOR || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FOR") {
+		p.nextToken()
+		if p.current.Type == TOKEN_ROLE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ROLE") {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected role name after FOR ROLE")
+			}
+			stmt.ForRole = p.current.Literal
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected ROLE after FOR")
+		}
+	}
+
+	// Optional: IN SCHEMA schema_name
+	if p.current.Type == TOKEN_IN || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IN") {
+		p.nextToken()
+		if p.current.Type == TOKEN_SCHEMA || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "SCHEMA") {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected schema name after IN SCHEMA")
+			}
+			stmt.InSchema = p.current.Literal
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected SCHEMA after IN")
+		}
+	}
+
+	// Expect GRANT or REVOKE
+	if p.current.Type == TOKEN_GRANT {
+		stmt.IsGrant = true
+		p.nextToken() // consume GRANT
+	} else if p.current.Type == TOKEN_REVOKE {
+		stmt.IsGrant = false
+		p.nextToken() // consume REVOKE
+	} else {
+		return nil, fmt.Errorf("expected GRANT or REVOKE in ALTER DEFAULT PRIVILEGES")
+	}
+
+	// Parse privileges: e.g. SELECT, INSERT, etc. or ALL [PRIVILEGES]
+	if p.current.Type == TOKEN_ALL {
+		p.nextToken()
+		if p.current.Type == TOKEN_PRIVILEGES {
+			p.nextToken()
+		}
+		stmt.Privileges = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+	} else {
+		for {
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_SELECT && p.current.Type != TOKEN_INSERT && p.current.Type != TOKEN_UPDATE && p.current.Type != TOKEN_DELETE && p.current.Type != TOKEN_TRUNCATE && p.current.Type != TOKEN_REFERENCES {
+				break
+			}
+			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
+			p.nextToken()
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken()
+			} else {
+				break
+			}
+		}
+	}
+
+	// Expect ON TABLES
+	if p.current.Type == TOKEN_ON || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ON") {
+		p.nextToken()
+		if p.current.Type != TOKEN_TABLES && (p.current.Type != TOKEN_IDENT || (strings.ToUpper(p.current.Literal) != "TABLES" && strings.ToUpper(p.current.Literal) != "SEQUENCES" && strings.ToUpper(p.current.Literal) != "TYPES" && strings.ToUpper(p.current.Literal) != "SCHEMAS")) {
+			return nil, fmt.Errorf("expected TABLES, SEQUENCES, or TYPES after ON")
+		}
+		stmt.ObjectType = strings.ToUpper(p.current.Literal)
+		p.nextToken()
+	} else {
+		return nil, fmt.Errorf("expected ON after privileges")
+	}
+
+	// Expect TO role (if Grant) or FROM role (if Revoke)
+	if stmt.IsGrant {
+		if p.current.Type != TOKEN_TO {
+			return nil, fmt.Errorf("expected TO after ON <object_type>")
+		}
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected role name after TO")
+		}
+		stmt.ToFromRole = p.current.Literal
+		p.nextToken()
+	} else {
+		if p.current.Type == TOKEN_FROM || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FROM") {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				return nil, fmt.Errorf("expected role name after FROM")
+			}
+			stmt.ToFromRole = p.current.Literal
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected FROM after ON <object_type>")
+		}
+	}
+
+	return stmt, nil
+}
+
 func (p *Parser) parseGrant() (*GrantStmt, error) {
 	stmt := &GrantStmt{}
 	p.nextToken() // consume GRANT
+
+	// Check if this is a role-to-role grant: GRANT role TO role
+	if p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_TO || strings.ToUpper(p.peek.Literal) == "TO") {
+		stmt.ObjectType = "ROLE"
+		stmt.ObjectName = p.current.Literal
+		p.nextToken() // consume role name
+		if p.current.Type != TOKEN_TO && strings.ToUpper(p.current.Literal) != "TO" {
+			return nil, fmt.Errorf("expected TO in role grant")
+		}
+		p.nextToken() // consume TO
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected target role name")
+		}
+		stmt.ToRole = p.current.Literal
+		p.nextToken() // consume target role name
+
+		// Parse optional WITH ADMIN OPTION / WITH GRANT OPTION
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "WITH" {
+			p.nextToken()
+			if p.current.Type == TOKEN_IDENT && (strings.ToUpper(p.current.Literal) == "ADMIN" || strings.ToUpper(p.current.Literal) == "GRANT") {
+				p.nextToken()
+				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "OPTION" {
+					p.nextToken()
+					stmt.WithGrantOption = true
+				}
+			}
+		}
+		return stmt, nil
+	}
+
 	if p.current.Type == TOKEN_ALL {
 		stmt.All = true
 		p.nextToken()
@@ -3055,6 +3255,28 @@ func (p *Parser) parseGrant() (*GrantStmt, error) {
 			}
 			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
 			p.nextToken()
+
+			// Check for column-level grant: SELECT (col1, col2)
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken() // consume LPAREN
+				for {
+					if p.current.Type != TOKEN_IDENT {
+						return nil, fmt.Errorf("expected column name inside parenthesis")
+					}
+					stmt.Columns = append(stmt.Columns, p.current.Literal)
+					p.nextToken()
+					if p.current.Type == TOKEN_COMMA {
+						p.nextToken()
+						continue
+					}
+					if p.current.Type == TOKEN_RPAREN {
+						p.nextToken()
+						break
+					}
+					return nil, fmt.Errorf("expected COMMA or RPAREN inside columns list")
+				}
+			}
+
 			if p.current.Type == TOKEN_COMMA {
 				p.nextToken()
 				continue
@@ -3093,12 +3315,53 @@ func (p *Parser) parseGrant() (*GrantStmt, error) {
 	}
 	stmt.ToRole = p.current.Literal
 	p.nextToken()
+
+	// Parse optional WITH GRANT OPTION
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "WITH" {
+		p.nextToken() // consume WITH
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "GRANT" {
+			p.nextToken() // consume GRANT
+			if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "OPTION" {
+				p.nextToken() // consume OPTION
+				stmt.WithGrantOption = true
+			}
+		}
+	}
+
 	return stmt, nil
 }
 
 func (p *Parser) parseRevoke() (*RevokeStmt, error) {
 	stmt := &RevokeStmt{}
 	p.nextToken() // consume REVOKE
+
+	// Check if this is a role-to-role revoke: REVOKE role FROM role
+	if p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_FROM || strings.ToUpper(p.peek.Literal) == "FROM") {
+		stmt.ObjectType = "ROLE"
+		stmt.ObjectName = p.current.Literal
+		p.nextToken() // consume role name
+		if p.current.Type != TOKEN_FROM && strings.ToUpper(p.current.Literal) != "FROM" {
+			return nil, fmt.Errorf("expected FROM in role revoke")
+		}
+		p.nextToken() // consume FROM
+		if p.current.Type != TOKEN_IDENT {
+			return nil, fmt.Errorf("expected target role name")
+		}
+		stmt.FromRole = p.current.Literal
+		p.nextToken() // consume target role name
+		return stmt, nil
+	}
+
+	// Check if we are revoking GRANT OPTION FOR: REVOKE GRANT OPTION FOR ...
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "GRANT" && p.peek.Type == TOKEN_IDENT && strings.ToUpper(p.peek.Literal) == "OPTION" {
+		p.nextToken() // consume GRANT
+		p.nextToken() // consume OPTION
+		if p.current.Type == TOKEN_FOR || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FOR") {
+			p.nextToken() // consume FOR
+		}
+		stmt.GrantOptionOnly = true
+	}
+
 	if p.current.Type == TOKEN_ALL {
 		stmt.All = true
 		p.nextToken()
@@ -3112,6 +3375,28 @@ func (p *Parser) parseRevoke() (*RevokeStmt, error) {
 			}
 			stmt.Privileges = append(stmt.Privileges, strings.ToUpper(p.current.Literal))
 			p.nextToken()
+
+			// Check for column-level revoke: SELECT (col1, col2)
+			if p.current.Type == TOKEN_LPAREN {
+				p.nextToken() // consume LPAREN
+				for {
+					if p.current.Type != TOKEN_IDENT {
+						return nil, fmt.Errorf("expected column name inside parenthesis")
+					}
+					stmt.Columns = append(stmt.Columns, p.current.Literal)
+					p.nextToken()
+					if p.current.Type == TOKEN_COMMA {
+						p.nextToken()
+						continue
+					}
+					if p.current.Type == TOKEN_RPAREN {
+						p.nextToken()
+						break
+					}
+					return nil, fmt.Errorf("expected COMMA or RPAREN inside columns list")
+				}
+			}
+
 			if p.current.Type == TOKEN_COMMA {
 				p.nextToken()
 				continue
@@ -3221,8 +3506,87 @@ func (p *Parser) parseCreatePolicy() (*CreatePolicyStmt, error) {
 	return stmt, nil
 }
 
-func (p *Parser) parseSet() (*SetStmt, error) {
+func (p *Parser) parseSet() (Statement, error) {
 	p.nextToken() // consume SET
+
+	isLocal := false
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "LOCAL" {
+		isLocal = true
+		p.nextToken()
+	}
+
+	// Check SET ROLE
+	if p.current.Type == TOKEN_ROLE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ROLE") {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_STRING {
+			return nil, fmt.Errorf("expected role name after SET ROLE")
+		}
+		roleName := p.current.Literal
+		p.nextToken()
+		return &SetRoleStmt{Role: roleName}, nil
+	}
+
+	// Check SET TRANSACTION ISOLATION LEVEL ...
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "TRANSACTION" {
+		p.nextToken() // consume TRANSACTION
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ISOLATION" {
+			p.nextToken() // consume ISOLATION
+			if p.current.Type == TOKEN_LEVEL || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "LEVEL") {
+				p.nextToken() // consume LEVEL
+				level := ""
+				for p.current.Type == TOKEN_IDENT {
+					if level != "" {
+						level += " "
+					}
+					level += strings.ToUpper(p.current.Literal)
+					p.nextToken()
+				}
+				return &SetTransactionIsolationStmt{Level: level, IsLocal: isLocal}, nil
+			}
+		}
+	}
+
+	// Check SET SESSION AUTHORIZATION or SET SESSION CHARACTERISTICS AS TRANSACTION
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "SESSION" {
+		if p.peek.Type == TOKEN_IDENT && strings.ToUpper(p.peek.Literal) == "CHARACTERISTICS" {
+			p.nextToken() // consume SESSION
+			p.nextToken() // consume CHARACTERISTICS
+			if p.current.Type == TOKEN_AS || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "AS") {
+				p.nextToken() // consume AS
+				if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "TRANSACTION" {
+					p.nextToken() // consume TRANSACTION
+					if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "ISOLATION" {
+						p.nextToken() // consume ISOLATION
+						if p.current.Type == TOKEN_LEVEL || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "LEVEL") {
+							p.nextToken() // consume LEVEL
+							level := ""
+							for p.current.Type == TOKEN_IDENT {
+								if level != "" {
+									level += " "
+								}
+								level += strings.ToUpper(p.current.Literal)
+								p.nextToken()
+							}
+							return &SetTransactionIsolationStmt{Level: level, IsLocal: false}, nil
+						}
+					}
+				}
+			}
+			return nil, fmt.Errorf("expected AS TRANSACTION after SESSION CHARACTERISTICS")
+		}
+
+		p.nextToken()
+		if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "AUTHORIZATION" {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_STRING {
+				return nil, fmt.Errorf("expected user name after SET SESSION AUTHORIZATION")
+			}
+			userName := p.current.Literal
+			p.nextToken()
+			return &SetSessionAuthorizationStmt{User: userName}, nil
+		}
+		return nil, fmt.Errorf("expected AUTHORIZATION after SET SESSION")
+	}
 
 	if p.current.Type != TOKEN_IDENT {
 		return nil, fmt.Errorf("expected variable name after SET")
@@ -3235,12 +3599,24 @@ func (p *Parser) parseSet() (*SetStmt, error) {
 	}
 
 	var value string
-	if p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
-		value = p.current.Literal
-		p.nextToken()
+	for {
+		if p.current.Type == TOKEN_STRING || p.current.Type == TOKEN_IDENT || p.current.Type == TOKEN_NUMBER {
+			if value != "" {
+				value += ", "
+			}
+			value += p.current.Literal
+			p.nextToken()
+		} else {
+			break
+		}
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+		} else {
+			break
+		}
 	}
 
-	return &SetStmt{Name: name, Value: value}, nil
+	return &SetStmt{Name: name, Value: value, IsLocal: isLocal}, nil
 }
 
 func (p *Parser) parseCreateView(orReplace bool) (*CreateViewStmt, error) {
@@ -3715,3 +4091,143 @@ func (p *Parser) parseMerge() (*MergeStmt, error) {
 
 	return stmt, nil
 }
+
+func (p *Parser) parseSavepoint() (*SavepointStmt, error) {
+	p.nextToken() // consume SAVEPOINT
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected savepoint name")
+	}
+	name := p.current.Literal
+	p.nextToken()
+	return &SavepointStmt{Command: "SAVEPOINT", Name: name}, nil
+}
+
+func (p *Parser) parseReset() (*ResetStmt, error) {
+	p.nextToken() // consume RESET
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected variable name after RESET")
+	}
+	name := p.current.Literal
+	p.nextToken()
+	return &ResetStmt{Name: name}, nil
+}
+
+func (p *Parser) parseLock() (*LockTableStmt, error) {
+	p.nextToken() // consume LOCK
+	if p.current.Type == TOKEN_TABLE || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "TABLE") {
+		p.nextToken()
+	}
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected table name to lock")
+	}
+	tableName := p.current.Literal
+	p.nextToken()
+
+	mode := "EXCLUSIVE"
+	if p.current.Type == TOKEN_IN || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IN") {
+		p.nextToken()
+		var modeParts []string
+		for p.current.Type == TOKEN_IDENT {
+			modeParts = append(modeParts, strings.ToUpper(p.current.Literal))
+			p.nextToken()
+		}
+		if len(modeParts) > 0 {
+			mode = strings.Join(modeParts, " ")
+		}
+	}
+	return &LockTableStmt{TableName: tableName, Mode: mode}, nil
+}
+
+func (p *Parser) parseDeclareCursor() (*DeclareCursorStmt, error) {
+	p.nextToken() // consume DECLARE
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected cursor name")
+	}
+	cursorName := p.current.Literal
+	p.nextToken()
+
+	if p.current.Type != TOKEN_CURSOR && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "CURSOR") {
+		return nil, fmt.Errorf("expected CURSOR after cursor name")
+	}
+	p.nextToken()
+
+	if p.current.Type != TOKEN_FOR && (p.current.Type != TOKEN_IDENT || strings.ToUpper(p.current.Literal) != "FOR") {
+		return nil, fmt.Errorf("expected FOR after CURSOR")
+	}
+	p.nextToken()
+
+	query, err := p.parseSelectOrCompound()
+	if err != nil {
+		return nil, err
+	}
+	selectQuery, ok := query.(*SelectStmt)
+	if !ok {
+		return nil, fmt.Errorf("CURSOR declaration only supports SELECT queries")
+	}
+	return &DeclareCursorStmt{Name: cursorName, Query: selectQuery}, nil
+}
+
+func (p *Parser) parseFetchCursor() (*FetchCursorStmt, error) {
+	p.nextToken() // consume FETCH
+
+	count := 1
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "NEXT" {
+		p.nextToken()
+	} else if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FORWARD" {
+		p.nextToken()
+		if p.current.Type == TOKEN_NUMBER {
+			count, _ = strconv.Atoi(p.current.Literal)
+			p.nextToken()
+		}
+	}
+
+	if p.current.Type == TOKEN_FROM || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FROM") {
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected cursor name in FETCH")
+	}
+	cursorName := p.current.Literal
+	p.nextToken()
+
+	return &FetchCursorStmt{Name: cursorName, Count: count}, nil
+}
+
+func (p *Parser) parseMoveCursor() (*MoveCursorStmt, error) {
+	p.nextToken() // consume MOVE
+
+	count := 1
+	if p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "FORWARD" {
+		p.nextToken()
+		if p.current.Type == TOKEN_NUMBER {
+			count, _ = strconv.Atoi(p.current.Literal)
+			p.nextToken()
+		}
+	}
+
+	if p.current.Type == TOKEN_IN || (p.current.Type == TOKEN_IDENT && strings.ToUpper(p.current.Literal) == "IN") {
+		p.nextToken()
+	}
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected cursor name in MOVE")
+	}
+	cursorName := p.current.Literal
+	p.nextToken()
+
+	return &MoveCursorStmt{Name: cursorName, Count: count}, nil
+}
+
+func (p *Parser) parseCloseCursor() (*CloseCursorStmt, error) {
+	p.nextToken() // consume CLOSE
+
+	if p.current.Type != TOKEN_IDENT {
+		return nil, fmt.Errorf("expected cursor name in CLOSE")
+	}
+	cursorName := p.current.Literal
+	p.nextToken()
+
+	return &CloseCursorStmt{Name: cursorName}, nil
+}
+

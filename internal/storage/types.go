@@ -37,6 +37,7 @@ const (
 	TypeFloat            // FLOAT (8 bytes)
 	TypeBoolean          // BOOLEAN (1 byte)
 	TypeVector           // VECTOR(n) (for LLM embeddings)
+	TypeJSONB            // JSONB type
 )
 
 func (dt DataType) String() string {
@@ -55,6 +56,8 @@ func (dt DataType) String() string {
 		return "BOOLEAN"
 	case TypeVector:
 		return "VECTOR"
+	case TypeJSONB:
+		return "JSONB"
 	default:
 		return "INVALID"
 	}

@@ -110,6 +110,7 @@ type SelectStmt struct {
 	CTEs                []CTEDefinition
 	TableSampleMethod   string  // "BERNOULLI", "SYSTEM"
 	TableSamplePercent  float64 // 0-100
+	ForUpdate           bool
 }
 
 // CTEDefinition represents a WITH clause CTE
@@ -312,22 +313,26 @@ func (s *AlterRoleStmt) StatementNode() {}
 
 // GrantStmt represents GRANT privileges
 type GrantStmt struct {
-	Privileges []string // SELECT, INSERT, etc.
-	All        bool
-	ObjectType string   // TABLE, DATABASE, etc.
-	ObjectName string   // employees, my_app, etc.
-	ToRole     string
+	Privileges      []string // SELECT, INSERT, etc.
+	All             bool
+	ObjectType      string   // TABLE, DATABASE, ROLE, etc.
+	ObjectName      string   // employees, my_app, etc.
+	ToRole          string
+	Columns         []string // For column-level GRANT
+	WithGrantOption bool     // For WITH GRANT OPTION
 }
 
 func (s *GrantStmt) StatementNode() {}
 
 // RevokeStmt represents REVOKE privileges
 type RevokeStmt struct {
-	Privileges []string
-	All        bool
-	ObjectType string
-	ObjectName string
-	FromRole   string
+	Privileges      []string
+	All             bool
+	ObjectType      string   // TABLE, DATABASE, ROLE, etc.
+	ObjectName      string
+	FromRole        string
+	Columns         []string // For column-level REVOKE
+	GrantOptionOnly bool     // For REVOKE GRANT OPTION FOR ...
 }
 
 func (s *RevokeStmt) StatementNode() {}
@@ -345,8 +350,9 @@ func (s *CreatePolicyStmt) StatementNode() {}
 
 // SetStmt represents SET commands
 type SetStmt struct {
-	Name  string
-	Value string
+	Name    string
+	Value   string
+	IsLocal bool
 }
 
 func (s *SetStmt) StatementNode() {}
@@ -443,4 +449,100 @@ type MergeAction struct {
 	Columns []string
 	Values  []interface{}
 }
+
+// SavepointStmt represents SAVEPOINT & ROLLBACK TO savepoint
+type SavepointStmt struct {
+	Command string // "SAVEPOINT" or "ROLLBACK TO"
+	Name    string
+}
+
+func (s *SavepointStmt) StatementNode() {}
+
+// ShowVarStmt represents SHOW <var>
+type ShowVarStmt struct {
+	Name string
+}
+
+func (s *ShowVarStmt) StatementNode() {}
+
+// ResetStmt represents RESET <var>
+type ResetStmt struct {
+	Name string
+}
+
+func (s *ResetStmt) StatementNode() {}
+
+// SetRoleStmt represents SET ROLE <role>
+type SetRoleStmt struct {
+	Role string
+}
+
+func (s *SetRoleStmt) StatementNode() {}
+
+// SetSessionAuthorizationStmt represents SET SESSION AUTHORIZATION <user>
+type SetSessionAuthorizationStmt struct {
+	User string
+}
+
+func (s *SetSessionAuthorizationStmt) StatementNode() {}
+
+// SetTransactionIsolationStmt represents SET TRANSACTION ISOLATION LEVEL <level>
+type SetTransactionIsolationStmt struct {
+	Level   string
+	IsLocal bool
+}
+
+func (s *SetTransactionIsolationStmt) StatementNode() {}
+
+// LockTableStmt represents LOCK TABLE <name>
+type LockTableStmt struct {
+	TableName string
+	Mode      string
+}
+
+func (s *LockTableStmt) StatementNode() {}
+
+// AlterDefaultPrivilegesStmt represents ALTER DEFAULT PRIVILEGES ...
+type AlterDefaultPrivilegesStmt struct {
+	ForRole    string
+	InSchema   string
+	IsGrant    bool
+	Privileges []string
+	ObjectType string // e.g. "TABLES"
+	ToFromRole string
+}
+
+func (s *AlterDefaultPrivilegesStmt) StatementNode() {}
+
+// DeclareCursorStmt represents DECLARE cur CURSOR FOR
+type DeclareCursorStmt struct {
+	Name  string
+	Query *SelectStmt
+}
+
+func (s *DeclareCursorStmt) StatementNode() {}
+
+// FetchCursorStmt represents FETCH FROM cur
+type FetchCursorStmt struct {
+	Name  string
+	Count int
+}
+
+func (s *FetchCursorStmt) StatementNode() {}
+
+// MoveCursorStmt represents MOVE IN cur
+type MoveCursorStmt struct {
+	Name  string
+	Count int
+}
+
+func (s *MoveCursorStmt) StatementNode() {}
+
+// CloseCursorStmt represents CLOSE cur
+type CloseCursorStmt struct {
+	Name string
+}
+
+func (s *CloseCursorStmt) StatementNode() {}
+
 
