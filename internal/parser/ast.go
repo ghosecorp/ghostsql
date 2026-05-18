@@ -313,22 +313,26 @@ func (s *AlterRoleStmt) StatementNode() {}
 
 // GrantStmt represents GRANT privileges
 type GrantStmt struct {
-	Privileges []string // SELECT, INSERT, etc.
-	All        bool
-	ObjectType string   // TABLE, DATABASE, etc.
-	ObjectName string   // employees, my_app, etc.
-	ToRole     string
+	Privileges      []string // SELECT, INSERT, etc.
+	All             bool
+	ObjectType      string   // TABLE, DATABASE, ROLE, etc.
+	ObjectName      string   // employees, my_app, etc.
+	ToRole          string
+	Columns         []string // For column-level GRANT
+	WithGrantOption bool     // For WITH GRANT OPTION
 }
 
 func (s *GrantStmt) StatementNode() {}
 
 // RevokeStmt represents REVOKE privileges
 type RevokeStmt struct {
-	Privileges []string
-	All        bool
-	ObjectType string
-	ObjectName string
-	FromRole   string
+	Privileges      []string
+	All             bool
+	ObjectType      string   // TABLE, DATABASE, ROLE, etc.
+	ObjectName      string
+	FromRole        string
+	Columns         []string // For column-level REVOKE
+	GrantOptionOnly bool     // For REVOKE GRANT OPTION FOR ...
 }
 
 func (s *RevokeStmt) StatementNode() {}
@@ -482,6 +486,14 @@ type SetSessionAuthorizationStmt struct {
 
 func (s *SetSessionAuthorizationStmt) StatementNode() {}
 
+// SetTransactionIsolationStmt represents SET TRANSACTION ISOLATION LEVEL <level>
+type SetTransactionIsolationStmt struct {
+	Level   string
+	IsLocal bool
+}
+
+func (s *SetTransactionIsolationStmt) StatementNode() {}
+
 // LockTableStmt represents LOCK TABLE <name>
 type LockTableStmt struct {
 	TableName string
@@ -489,6 +501,18 @@ type LockTableStmt struct {
 }
 
 func (s *LockTableStmt) StatementNode() {}
+
+// AlterDefaultPrivilegesStmt represents ALTER DEFAULT PRIVILEGES ...
+type AlterDefaultPrivilegesStmt struct {
+	ForRole    string
+	InSchema   string
+	IsGrant    bool
+	Privileges []string
+	ObjectType string // e.g. "TABLES"
+	ToFromRole string
+}
+
+func (s *AlterDefaultPrivilegesStmt) StatementNode() {}
 
 // DeclareCursorStmt represents DECLARE cur CURSOR FOR
 type DeclareCursorStmt struct {

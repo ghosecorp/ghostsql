@@ -95,6 +95,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeGrant(s)
 	case *parser.RevokeStmt:
 		return e.executeRevoke(s)
+	case *parser.AlterDefaultPrivilegesStmt:
+		return e.executeAlterDefaultPrivileges(s)
 	case *parser.CreatePolicyStmt:
 		return e.executeCreatePolicy(s)
 	case *parser.SetStmt:
@@ -107,6 +109,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeSetRole(s)
 	case *parser.SetSessionAuthorizationStmt:
 		return e.executeSetSessionAuthorization(s)
+	case *parser.SetTransactionIsolationStmt:
+		return e.executeSetTransactionIsolation(s)
 	case *parser.LockTableStmt:
 		return e.executeLockTable(s)
 	case *parser.TransactionStmt:
@@ -349,6 +353,34 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// Set owner: the creator is the table owner (PostgreSQL standard)
 	owner := e.session.GetUser()
 	table := storage.NewTable(stmt.TableName, owner, columns, tableMeta)
+
+	// Apply ALTER DEFAULT PRIVILEGES rules
+	for _, rule := range e.db.RoleStore.DefaultPrivileges {
+		// If ForRole is defined, it must match the creator/owner of the new table
+		if rule.ForRole != "" && rule.ForRole != owner {
+			continue
+		}
+		// Match TABLES object type
+		if rule.ObjectType != "" && rule.ObjectType != "TABLES" {
+			continue
+		}
+		objectKey := "TABLE:" + stmt.TableName
+		if rule.IsGrant {
+			for _, priv := range rule.Privileges {
+				_ = e.db.RoleStore.GrantPrivilege(rule.ToFromRole, objectKey, priv)
+			}
+		} else {
+			if targetRole, exists := e.db.RoleStore.GetRole(rule.ToFromRole); exists {
+				if targetRole.Privileges != nil && targetRole.Privileges[objectKey] != nil {
+					for _, priv := range rule.Privileges {
+						delete(targetRole.Privileges[objectKey], priv)
+					}
+				}
+			}
+		}
+	}
+	_ = e.db.RoleStore.Save()
+
 	e.setTable(dbInstance, stmt.TableName, table)
 
 	if err := e.saveTableToDisk(dbInstance, table); err != nil {
@@ -645,7 +677,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if stmt.TableName == "" {
 		rows = []storage.Row{make(storage.Row)}
 	} else {
-		if err := e.checkPrivilege("TABLE", stmt.TableName, "SELECT"); err != nil {
+		if err := e.checkTableOrColumnPrivilege(stmt.TableName, stmt.Columns, "SELECT"); err != nil {
 			return nil, err
 		}
 
@@ -2690,19 +2722,58 @@ func (e *Executor) executeGrant(stmt *parser.GrantStmt) (*Result, error) {
 		return nil, fmt.Errorf("only superuser can GRANT privileges")
 	}
 
+	if stmt.ObjectType == "ROLE" {
+		targetRole, exists := e.db.RoleStore.GetRole(stmt.ToRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.ToRole)
+		}
+		// Grant membership: targetRole inherits stmt.ObjectName (parent role)
+		found := false
+		for _, m := range targetRole.MemberOf {
+			if m == stmt.ObjectName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			targetRole.MemberOf = append(targetRole.MemberOf, stmt.ObjectName)
+		}
+		_ = e.db.RoleStore.Save()
+		return &Result{
+			Message: "GRANT ROLE successful",
+		}, nil
+	}
+
 	privs := stmt.Privileges
 	if stmt.All {
 		privs = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
 	}
 
-	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
-	for _, priv := range privs {
-		if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
-			return nil, err
+	if len(stmt.Columns) > 0 {
+		for _, col := range stmt.Columns {
+			objectKey := fmt.Sprintf("%s:%s:%s", stmt.ObjectType, stmt.ObjectName, col)
+			for _, priv := range privs {
+				if stmt.WithGrantOption {
+					_ = e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv+"_GRANT_OPTION")
+				}
+				if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
+					return nil, err
+				}
+			}
+		}
+	} else {
+		objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+		for _, priv := range privs {
+			if stmt.WithGrantOption {
+				_ = e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv+"_GRANT_OPTION")
+			}
+			if err := e.db.RoleStore.GrantPrivilege(stmt.ToRole, objectKey, priv); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	e.db.RoleStore.Save()
+	_ = e.db.RoleStore.Save()
 	return &Result{
 		Message: "GRANT successful",
 	}, nil
@@ -2714,25 +2785,138 @@ func (e *Executor) executeRevoke(stmt *parser.RevokeStmt) (*Result, error) {
 		return nil, fmt.Errorf("only superuser can REVOKE privileges")
 	}
 
-	role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
-	if !exists {
-		return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+	if stmt.ObjectType == "ROLE" {
+		targetRole, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+		}
+		// Remove membership from MemberOf
+		var newMemberOf []string
+		for _, m := range targetRole.MemberOf {
+			if m != stmt.ObjectName {
+				newMemberOf = append(newMemberOf, m)
+			}
+		}
+		targetRole.MemberOf = newMemberOf
+		_ = e.db.RoleStore.Save()
+		return &Result{
+			Message: "REVOKE ROLE successful",
+		}, nil
 	}
 
-	objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
-	if stmt.All {
-		delete(role.Privileges, objectKey)
+	if len(stmt.Columns) > 0 {
+		for _, col := range stmt.Columns {
+			objectKey := fmt.Sprintf("%s:%s:%s", stmt.ObjectType, stmt.ObjectName, col)
+			role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+			if !exists {
+				return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+			}
+			if stmt.GrantOptionOnly {
+				if role.Privileges != nil && role.Privileges[objectKey] != nil {
+					for _, priv := range stmt.Privileges {
+						delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+					}
+				}
+			} else {
+				if stmt.All {
+					delete(role.Privileges, objectKey)
+				} else {
+					if role.Privileges != nil && role.Privileges[objectKey] != nil {
+						for _, priv := range stmt.Privileges {
+							delete(role.Privileges[objectKey], priv)
+							delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+						}
+					}
+				}
+			}
+		}
 	} else {
-		if role.Privileges != nil && role.Privileges[objectKey] != nil {
-			for _, priv := range stmt.Privileges {
-				delete(role.Privileges[objectKey], priv)
+		objectKey := fmt.Sprintf("%s:%s", stmt.ObjectType, stmt.ObjectName)
+		role, exists := e.db.RoleStore.GetRole(stmt.FromRole)
+		if !exists {
+			return nil, fmt.Errorf("role %s does not exist", stmt.FromRole)
+		}
+		if stmt.GrantOptionOnly {
+			if role.Privileges != nil && role.Privileges[objectKey] != nil {
+				for _, priv := range stmt.Privileges {
+					delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+				}
+			}
+		} else {
+			if stmt.All {
+				delete(role.Privileges, objectKey)
+			} else {
+				if role.Privileges != nil && role.Privileges[objectKey] != nil {
+					for _, priv := range stmt.Privileges {
+						delete(role.Privileges[objectKey], priv)
+						delete(role.Privileges[objectKey], priv+"_GRANT_OPTION")
+					}
+				}
 			}
 		}
 	}
 
-	e.db.RoleStore.Save()
+	_ = e.db.RoleStore.Save()
 	return &Result{
 		Message: "REVOKE successful",
+	}, nil
+}
+
+func (e *Executor) executeAlterDefaultPrivileges(stmt *parser.AlterDefaultPrivilegesStmt) (*Result, error) {
+	// Only superuser can run ALTER DEFAULT PRIVILEGES
+	user := e.session.GetUser()
+	if user != "ghost" {
+		return nil, fmt.Errorf("only superuser can ALTER DEFAULT PRIVILEGES")
+	}
+
+	if !stmt.IsGrant {
+		// Clean up matching default privilege rules (REVOKE behavior)
+		var updatedRules []storage.DefaultPrivilegeRule
+		for _, r := range e.db.RoleStore.DefaultPrivileges {
+			if r.ForRole == stmt.ForRole && r.InSchema == stmt.InSchema && r.ObjectType == stmt.ObjectType && r.ToFromRole == stmt.ToFromRole && r.IsGrant {
+				var remainingPrivs []string
+				for _, p := range r.Privileges {
+					revoked := false
+					for _, rp := range stmt.Privileges {
+						if p == rp {
+							revoked = true
+							break
+						}
+					}
+					if !revoked {
+						remainingPrivs = append(remainingPrivs, p)
+					}
+				}
+				if len(remainingPrivs) > 0 {
+					r.Privileges = remainingPrivs
+					updatedRules = append(updatedRules, r)
+				}
+			} else {
+				updatedRules = append(updatedRules, r)
+			}
+		}
+		e.db.RoleStore.DefaultPrivileges = updatedRules
+		_ = e.db.RoleStore.Save()
+
+		return &Result{
+			Message: "ALTER DEFAULT PRIVILEGES successful",
+		}, nil
+	}
+
+	rule := storage.DefaultPrivilegeRule{
+		ForRole:    stmt.ForRole,
+		InSchema:   stmt.InSchema,
+		IsGrant:    stmt.IsGrant,
+		Privileges: stmt.Privileges,
+		ObjectType: stmt.ObjectType,
+		ToFromRole: stmt.ToFromRole,
+	}
+
+	e.db.RoleStore.DefaultPrivileges = append(e.db.RoleStore.DefaultPrivileges, rule)
+	_ = e.db.RoleStore.Save()
+
+	return &Result{
+		Message: "ALTER DEFAULT PRIVILEGES successful",
 	}, nil
 }
 
@@ -3824,6 +4008,19 @@ func (e *Executor) executeSetSessionAuthorization(stmt *parser.SetSessionAuthori
 	return &Result{Message: "SET SESSION AUTHORIZATION"}, nil
 }
 
+func (e *Executor) executeSetTransactionIsolation(stmt *parser.SetTransactionIsolationStmt) (*Result, error) {
+	if e.session == nil {
+		return nil, fmt.Errorf("no active session")
+	}
+	name := "transaction_isolation"
+	if stmt.IsLocal {
+		e.session.SetLocalVariable(name, stmt.Level)
+	} else {
+		e.session.SetVariable(name, stmt.Level)
+	}
+	return &Result{Message: "SET TRANSACTION ISOLATION LEVEL"}, nil
+}
+
 func (e *Executor) executeLockTable(stmt *parser.LockTableStmt) (*Result, error) {
 	dbInstance, err := e.getActiveDatabase()
 	if err != nil {
@@ -3959,5 +4156,75 @@ func (e *Executor) executeCloseCursor(stmt *parser.CloseCursorStmt) (*Result, er
 	return &Result{
 		Message: fmt.Sprintf("CLOSE CURSOR %s", stmt.Name),
 	}, nil
+}
+
+func (e *Executor) checkTableOrColumnPrivilege(tableName string, columns []string, privilege string) error {
+	// First check table-level privilege
+	if err := e.checkPrivilege("TABLE", tableName, privilege); err == nil {
+		return nil
+	}
+
+	// Table level failed. Let's see if we have column-level privileges for all requested columns!
+	if len(columns) == 0 {
+		return fmt.Errorf("permission denied for %s on TABLE %s", privilege, tableName)
+	}
+
+	dbInstance, err := e.getActiveDatabase()
+	if err != nil {
+		return err
+	}
+
+	table, exists := e.getTable(dbInstance, tableName)
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// Determine the actual columns being projected
+	var colsToCheck []string
+	isAllColumns := false
+	for _, col := range columns {
+		if col == "*" {
+			isAllColumns = true
+			break
+		} else {
+			colsToCheck = append(colsToCheck, col)
+		}
+	}
+
+	user := e.session.GetUser()
+
+	// Owner check (owner always has column-level SELECT bypass too)
+	if table.Owner == user {
+		return nil
+	}
+	
+	// Superuser check
+	if role, ok := e.db.RoleStore.GetRole(user); ok && role.IsSuperuser {
+		return nil
+	}
+	if user == "ghost" {
+		return nil
+	}
+
+	if isAllColumns {
+		// User must have SELECT privilege on all columns of the table!
+		for _, col := range table.Columns {
+			colKey := fmt.Sprintf("TABLE:%s:%s", tableName, col.Name)
+			if !e.db.RoleStore.HasPrivilege(user, colKey, privilege) {
+				return fmt.Errorf("permission denied for %s on COLUMN %s.%s", privilege, tableName, col.Name)
+			}
+		}
+		return nil
+	}
+
+	// User must have SELECT privilege on each specified column
+	for _, colName := range colsToCheck {
+		colKey := fmt.Sprintf("TABLE:%s:%s", tableName, colName)
+		if !e.db.RoleStore.HasPrivilege(user, colKey, privilege) {
+			return fmt.Errorf("permission denied for %s on COLUMN %s.%s", privilege, tableName, colName)
+		}
+	}
+
+	return nil
 }
 

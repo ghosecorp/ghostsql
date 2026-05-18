@@ -35,11 +35,22 @@ type Role struct {
 	MemberOf []string `json:"member_of"`
 }
 
+// DefaultPrivilegeRule represents a rule created by ALTER DEFAULT PRIVILEGES
+type DefaultPrivilegeRule struct {
+	ForRole    string   `json:"for_role"`    // optional target creator role
+	InSchema   string   `json:"in_schema"`   // optional target schema
+	IsGrant    bool     `json:"is_grant"`    // true = GRANT, false = REVOKE
+	Privileges []string `json:"privileges"`  // SELECT, INSERT, etc.
+	ObjectType string   `json:"object_type"` // e.g. "TABLES"
+	ToFromRole string   `json:"to_from_role"`
+}
+
 // RoleStore handles persistence of roles
 type RoleStore struct {
-	Roles map[string]*Role
-	mu    sync.RWMutex
-	path  string
+	Roles             map[string]*Role
+	DefaultPrivileges []DefaultPrivilegeRule
+	mu                sync.RWMutex
+	path              string
 }
 
 // NewRoleStore creates a new role store
@@ -64,10 +75,22 @@ func (r *Role) VerifyPassword(password string) bool {
 	return HashPassword(password) == r.PasswordHash
 }
 
-// Load loads roles from disk (binary)
+// Load loads roles and default privileges from disk
 func (rs *RoleStore) Load() error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+
+	// Load default privileges first if exists
+	globalDir := filepath.Dir(rs.path)
+	defaultPrivPath := filepath.Join(globalDir, "pg_default_privileges.json")
+	if _, err := os.Stat(defaultPrivPath); err == nil {
+		if privData, readErr := os.ReadFile(defaultPrivPath); readErr == nil {
+			var rules []DefaultPrivilegeRule
+			if jsonErr := json.Unmarshal(privData, &rules); jsonErr == nil {
+				rs.DefaultPrivileges = rules
+			}
+		}
+	}
 
 	if _, err := os.Stat(rs.path); os.IsNotExist(err) {
 		return nil // Initial boot
@@ -110,7 +133,7 @@ func (rs *RoleStore) Load() error {
 	return nil
 }
 
-// Save saves roles to disk (binary)
+// Save saves roles and default privileges to disk
 func (rs *RoleStore) Save() error {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
@@ -119,6 +142,13 @@ func (rs *RoleStore) Save() error {
 	globalDir := filepath.Dir(rs.path)
 	if err := os.MkdirAll(globalDir, 0755); err != nil {
 		return fmt.Errorf("failed to create global directory: %w", err)
+	}
+
+	// Save default privileges
+	defaultPrivPath := filepath.Join(globalDir, "pg_default_privileges.json")
+	privData, err := json.Marshal(rs.DefaultPrivileges)
+	if err == nil {
+		_ = os.WriteFile(defaultPrivPath, privData, 0644)
 	}
 
 	var buf []byte
